@@ -14,6 +14,12 @@ import { Hub } from './ws/hub.js';
 async function main(): Promise<void> {
   const config = loadConfig();
   const log = createLogger(config.server.logLevel);
+  // A stray rejection must never take the trading process (and its risk controls) down.
+  process.on('unhandledRejection', (reason) => log.error({ err: reason }, 'unhandled promise rejection'));
+  process.on('uncaughtException', (err) => {
+    log.fatal({ err }, 'uncaught exception; exiting');
+    process.exit(1);
+  });
   log.info({ demo: config.okx.demo, rest: config.okx.endpoints.rest, wsTrading: config.okx.wsTrading, instruments: config.instruments, host: config.server.host, port: config.server.port }, 'pegasus api starting');
   if (config.server.token === 'change-me') log.warn('API_TOKEN is the default value; set a real secret in .env before exposing this server');
   if (!config.okx.credentials) log.warn('no OKX credentials configured: running in market-data-only mode (no trading)');
@@ -49,14 +55,34 @@ async function main(): Promise<void> {
   const refreshExposure = () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional());
   account.on('positions', refreshExposure);
   account.on('order', refreshExposure);
+  // Kill switch: cancelling the open orders is latched and retried until it succeeds, including after a restart.
   let killWasOn = risk.state.killSwitch;
+  let cancelPending = risk.state.killSwitch;
+  let cancelling = false;
+  const tryCancelAll = () => {
+    if (!cancelPending || cancelling || !account.ready) return;
+    cancelling = true;
+    orders
+      .cancelAll()
+      .then((n) => {
+        cancelPending = false;
+        log.warn({ canceled: n }, 'open orders cancelled by kill switch');
+      })
+      .catch((err: Error) => log.error({ err: err.message }, 'cancel-all after kill switch failed; will retry'))
+      .finally(() => {
+        cancelling = false;
+      });
+  };
   risk.on('state', (s) => {
-    if (s.killSwitch && !killWasOn && account.ready) {
+    if (s.killSwitch && !killWasOn) {
       log.warn('kill switch engaged: cancelling all open orders');
-      orders.cancelAll().then((n) => log.warn({ canceled: n }, 'open orders cancelled by kill switch')).catch((err: Error) => log.error({ err: err.message }, 'cancel-all after kill switch failed'));
+      cancelPending = true;
     }
     killWasOn = s.killSwitch;
+    tryCancelAll();
   });
+  account.on('status', tryCancelAll);
+  setInterval(tryCancelAll, 5_000).unref();
 
   hub.wire();
   const app = await buildServer(deps);

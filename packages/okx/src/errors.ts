@@ -32,9 +32,15 @@ export class OkxHttpError extends Error {
 }
 
 export class OkxWsError extends Error {
+  /**
+   * @param sent true when the request frame was (or may have been) delivered to the
+   * exchange before the failure, so the operation's outcome is unknown; false when it
+   * was never sent and can safely be retried on another transport.
+   */
   constructor(
     message: string,
     public readonly code?: string,
+    public readonly sent: boolean = false,
   ) {
     super(message);
     this.name = 'OkxWsError';

@@ -117,3 +117,62 @@ describe('OkxWsClient', () => {
     expect(connections).toBeGreaterThanOrEqual(2);
   });
 });
+
+describe('OkxWsClient failure semantics', () => {
+  it('rejects never-sent requests with sent=false and in-flight ones with sent=true', async () => {
+    const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await once(wss, 'listening');
+    const { port } = wss.address() as AddressInfo;
+    const sockets: WebSocket[] = [];
+    wss.on('connection', (s) => {
+      sockets.push(s);
+      s.on('message', (raw) => {
+        if (raw.toString() === 'ping') s.send('pong');
+        // never answer ops
+      });
+    });
+    const client = new OkxWsClient({ url: `ws://127.0.0.1:${port}`, name: 'private', ackTimeoutMs: 300, reconnectMinMs: 50, reconnectMaxMs: 60 });
+    const notReady = await client.request('order', []).catch((e: unknown) => e);
+    expect(notReady).toMatchObject({ name: 'OkxWsError', sent: false });
+    client.connect();
+    await once(client, 'ready');
+    const timedOut = await client.request('order', [{}], { timeoutMs: 100 }).catch((e: unknown) => e);
+    expect(timedOut).toMatchObject({ name: 'OkxWsError', sent: true });
+    const inflight = client.request('order', [{}], { timeoutMs: 5000 }).catch((e: unknown) => e);
+    sockets[0]?.terminate();
+    expect(await inflight).toMatchObject({ name: 'OkxWsError', sent: true });
+    await client.close();
+    await new Promise<void>((r) => wss.close(() => r()));
+  });
+
+  it('does not leave unhandled rejections when the socket closes during a subscribe', async () => {
+    const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await once(wss, 'listening');
+    const { port } = wss.address() as AddressInfo;
+    const sockets: WebSocket[] = [];
+    wss.on('connection', (s) => {
+      sockets.push(s);
+      s.on('message', (raw) => {
+        if (raw.toString() === 'ping') s.send('pong');
+      });
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => unhandled.push(e);
+    process.on('unhandledRejection', onUnhandled);
+    const client = new OkxWsClient({ url: `ws://127.0.0.1:${port}`, name: 'public', ackTimeoutMs: 200, reconnectMinMs: 50, reconnectMaxMs: 60 });
+    client.connect();
+    await once(client, 'ready');
+    // Subscribe while the server never acks, then drop the socket: the pending subs are rejected.
+    const sub = client.subscribe([{ channel: 'tickers', instId: 'A' }, { channel: 'tickers', instId: 'B' }]).catch((e: unknown) => e);
+    sockets[0]?.terminate();
+    const err = await sub;
+    expect(err).toMatchObject({ name: 'OkxWsError' });
+    await new Promise((r) => setTimeout(r, 300));
+    process.off('unhandledRejection', onUnhandled);
+    expect(unhandled).toHaveLength(0);
+    // the desired set survives for the resubscribe after reconnect
+    expect(client.subscriptions).toHaveLength(2);
+    await client.close();
+    await new Promise<void>((r) => wss.close(() => r()));
+  });
+});

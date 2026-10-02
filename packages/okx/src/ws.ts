@@ -130,7 +130,7 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
   async close(): Promise<void> {
     this.closing = true;
     this.clearTimers();
-    this.failPending(new OkxWsError('client closed'));
+    this.failPending(new OkxWsError('client closed', undefined, true));
     const ws = this.ws;
     this.ws = null;
     if (ws) {
@@ -162,7 +162,11 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
       }
     }
     if (fresh.length === 0) return;
-    if (this.readyFlag) await this.sendSubscribe(fresh);
+    if (this.readyFlag && this.socketOpen()) await this.sendSubscribe(fresh);
+  }
+
+  private socketOpen(): boolean {
+    return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
   }
 
   async unsubscribe(args: OkxWsArg[]): Promise<void> {
@@ -171,23 +175,35 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
       const key = argKey(arg);
       if (this.desired.delete(key)) present.push(arg);
     }
-    if (present.length === 0 || !this.readyFlag) return;
+    if (present.length === 0 || !this.readyFlag || !this.socketOpen()) return;
     for (let i = 0; i < present.length; i += this.opts.subscribeBatchSize) {
       this.sendRaw({ op: 'unsubscribe', args: present.slice(i, i + this.opts.subscribeBatchSize) });
     }
   }
 
   /** Send a trade operation (order / cancel-order / amend-order / batch-*) and await its response. */
+  /**
+   * Send a trade operation (order / cancel-order / amend-order / batch-*) and await its response.
+   * Rejects with an OkxWsError whose `sent` flag says whether the frame reached the socket:
+   * `sent === false` means the operation can be retried elsewhere; `sent === true` (timeout or
+   * socket loss after sending) means the outcome is unknown and must be looked up, never resent blindly.
+   */
   request<T = unknown>(op: string, args: unknown[], opts: { timeoutMs?: number } = {}): Promise<OkxWsOpResponse<T>> {
-    if (!this.readyFlag) return Promise.reject(new OkxWsError(`${this.opts.name} socket not ready`));
+    if (!this.readyFlag || !this.socketOpen()) return Promise.reject(new OkxWsError(`${this.opts.name} socket not ready`, undefined, false));
     const id = `${Date.now().toString(36)}${(++this.opSeq).toString(36)}`.slice(-32);
     return new Promise<OkxWsOpResponse<T>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingOps.delete(id);
-        reject(new OkxWsError(`${op} timed out after ${opts.timeoutMs ?? this.opts.ackTimeoutMs}ms`));
+        reject(new OkxWsError(`${op} timed out after ${opts.timeoutMs ?? this.opts.ackTimeoutMs}ms`, undefined, true));
       }, opts.timeoutMs ?? this.opts.ackTimeoutMs);
       this.pendingOps.set(id, { resolve: (r) => resolve(r as OkxWsOpResponse<T>), reject, timer });
-      this.sendRaw({ id, op, args });
+      try {
+        this.sendRaw({ id, op, args });
+      } catch (err) {
+        clearTimeout(timer);
+        this.pendingOps.delete(id);
+        reject(new OkxWsError((err as Error).message, undefined, false));
+      }
     });
   }
 
@@ -229,7 +245,7 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
       this.readyFlag = false;
       this.loggedIn = false;
       this.clearTimers();
-      this.failPending(new OkxWsError(`${this.opts.name} socket closed (${code})`));
+      this.failPending(new OkxWsError(`${this.opts.name} socket closed (${code})`, undefined, true));
       this.setStatus('disconnected', `${code} ${reason.toString()}`);
       this.opts.logger.warn(`${this.opts.name} ws closed`, { code, reason: reason.toString() });
       if (!this.closing) this.scheduleReconnect();
@@ -267,25 +283,57 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
     });
   }
 
+  /**
+   * Send subscribe frames and resolve once every arg is acknowledged. Every promise
+   * registered in pendingSubs gets a handler before anything can reject it, so a
+   * socket closing mid-call can never surface as an unhandled rejection.
+   */
   private sendSubscribe(args: OkxWsArg[]): Promise<void> {
+    if (!this.socketOpen()) return Promise.reject(new OkxWsError(`${this.opts.name} socket not open`));
     const waits: Promise<void>[] = [];
     for (let i = 0; i < args.length; i += this.opts.subscribeBatchSize) {
       const batch = args.slice(i, i + this.opts.subscribeBatchSize);
+      const created: string[] = [];
       for (const arg of batch) {
         const key = argKey(arg);
-        waits.push(
-          new Promise<void>((resolve, reject) => {
-            const existing = this.pendingSubs.get(key);
-            if (existing) clearTimeout(existing.timer);
-            const timer = setTimeout(() => {
-              this.pendingSubs.delete(key);
-              reject(new OkxWsError(`subscribe ${key} not acknowledged within ${this.opts.ackTimeoutMs}ms`));
-            }, this.opts.ackTimeoutMs);
-            this.pendingSubs.set(key, { resolve, reject, timer });
-          }),
-        );
+        const p = new Promise<void>((resolve, reject) => {
+          // A previous waiter for the same key is settled together with this one instead of dangling.
+          const existing = this.pendingSubs.get(key);
+          if (existing) clearTimeout(existing.timer);
+          const timer = setTimeout(() => {
+            this.pendingSubs.delete(key);
+            const err = new OkxWsError(`subscribe ${key} not acknowledged within ${this.opts.ackTimeoutMs}ms`);
+            existing?.reject(err);
+            reject(err);
+          }, this.opts.ackTimeoutMs);
+          this.pendingSubs.set(key, {
+            resolve: () => {
+              existing?.resolve();
+              resolve();
+            },
+            reject: (e) => {
+              existing?.reject(e);
+              reject(e);
+            },
+            timer,
+          });
+        });
+        p.catch(() => undefined); // handled: callers observe the outcome through Promise.all below
+        waits.push(p);
+        created.push(key);
       }
-      this.sendRaw({ op: 'subscribe', args: batch });
+      try {
+        this.sendRaw({ op: 'subscribe', args: batch });
+      } catch (err) {
+        for (const key of created) {
+          const entry = this.pendingSubs.get(key);
+          if (!entry) continue;
+          clearTimeout(entry.timer);
+          this.pendingSubs.delete(key);
+          entry.reject(err as Error);
+        }
+        return Promise.all(waits).then(() => undefined);
+      }
     }
     return Promise.all(waits).then(() => undefined);
   }

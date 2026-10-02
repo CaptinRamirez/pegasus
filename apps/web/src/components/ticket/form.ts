@@ -64,7 +64,8 @@ export function buildRequest(form: TicketForm, instId: string | null, posMode: P
     ordType: form.ordType,
     tdMode: form.tdMode,
     size: { unit: form.sizeUnit, value: form.sizeValue.trim() },
-    reduceOnly: form.reduceOnly,
+    // OKX only honours reduce-only in net mode; in long/short mode closing is expressed by posSide.
+    reduceOnly: posMode === 'long_short_mode' ? false : form.reduceOnly,
   };
   if (needsPrice(form.ordType)) candidate['px'] = form.px.trim();
   if (posMode === 'long_short_mode') candidate['posSide'] = form.posSide;

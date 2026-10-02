@@ -57,6 +57,7 @@ export function applyHello(state: TerminalState, data: HelloPayload): Partial<Te
   const selectedInstId = stillTracked ? state.selectedInstId : (data.instruments[0]?.instId ?? null);
 
   return {
+    helloSeq: state.helloSeq + 1,
     demo: data.demo,
     instruments: data.instruments,
     account: data.account,

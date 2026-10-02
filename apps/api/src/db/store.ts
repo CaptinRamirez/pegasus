@@ -37,6 +37,8 @@ export class MemoryStore implements Store {
   readonly riskEvents: Array<{ ts: number; type: string; detail: Record<string, unknown> }> = [];
 
   async upsertOrder(order: Order): Promise<void> {
+    const prev = this.orders.get(order.ordId);
+    if (prev && prev.uTime > order.uTime) return; // never regress to an older snapshot
     this.orders.set(order.ordId, order);
     if (this.orders.size > 5_000) {
       const oldest = [...this.orders.values()].sort((a, b) => a.uTime - b.uTime).slice(0, 1_000);

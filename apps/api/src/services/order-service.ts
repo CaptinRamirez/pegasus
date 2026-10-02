@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { OkxApiError, type OkxCancelOrderParams, type OkxOrderAck, type OkxPlaceOrderParams } from '@pegasus/okx';
+import { OkxApiError, OkxWsError, type OkxCancelOrderParams, type OkxOrder, type OkxOrderAck, type OkxPlaceOrderParams } from '@pegasus/okx';
 import {
   D,
   normalizePrice,
@@ -58,7 +58,10 @@ export class OrderService {
     const inst = this.market.requireInstrument(req.instId);
     const tdMode = req.tdMode ?? this.opts.defaultTdMode;
     const posSide = this.resolvePosSide(req);
-    const reduceOnly = req.reduceOnly ?? false;
+    // OKX only honours reduceOnly in net mode; in long/short mode the flag is not forwarded, so the
+    // risk engine must not trust it either (closing orders are recognised there by side + posSide).
+    const longShort = this.account.config.posMode === 'long_short_mode';
+    const reduceOnly = !longShort && (req.reduceOnly ?? false);
 
     let px = '';
     let refPrice: string | undefined;
@@ -82,18 +85,28 @@ export class OrderService {
     let estSlippagePct = '';
     if (req.ordType === 'market') {
       const est = this.market.estimateMarketFill(req.instId, req.side, sized.sz);
-      if (est) {
-        estSlippagePct = est.slippagePct;
-        refPrice = est.avgPx;
-        if (!est.complete) estSlippagePct = D(estSlippagePct).plus(1).toFixed(); // force a rejection: book too thin
-      }
+      // Fail closed: without a synced book the slippage rule cannot run, so a market order is refused.
+      if (!est) throw new AppError('NO_BOOK', `order book for ${req.instId} is not synced yet; retry shortly`, 503);
+      estSlippagePct = est.slippagePct;
+      refPrice = est.avgPx;
+      if (!est.complete) estSlippagePct = D(estSlippagePct).plus(1).toFixed(); // force a rejection: book too thin
     }
     const notional = notionalQuote(sized.sz, refPrice, inst).toFixed();
-    const lever = this.account.enabled ? await this.account.leverageFor(req.instId, tdMode, posSide).catch(() => '1') : '1';
-    const markRef = this.market.refPrice(req.instId) ?? refPrice;
+    let lever = '1';
+    if (this.account.enabled) {
+      try {
+        lever = await this.account.leverageFor(req.instId, tdMode, posSide);
+      } catch (err) {
+        // Fail closed: the leverage rule must not pass on an unknown value.
+        throw new AppError('LEVERAGE_UNAVAILABLE', `could not read the leverage for ${req.instId}: ${(err as Error).message}`, 503);
+      }
+    }
+    const markRef = this.market.refPrice(req.instId);
+    if (markRef === undefined) throw new AppError('NO_PRICE', `no reference price available yet for ${req.instId}`, 503);
     const risk = this.risk.check({
       inst,
       side: req.side,
+      posSide,
       ordType: req.ordType,
       contracts: sized.sz,
       notional,
@@ -103,7 +116,8 @@ export class OrderService {
       estSlippagePct,
       reduceOnly,
       positions: this.account.positionList(),
-      openOrders: this.account.openOrders.size,
+      openOrders: this.account.openOrderList(),
+      instrumentOf: (id) => this.market.getInstrument(id),
     });
     return { instId: req.instId, side: req.side, ordType: req.ordType, tdMode, posSide, sz: sized.sz, coin: sized.coin.toFixed(), px, refPrice, notionalQuote: notional, estSlippagePct, lever, risk };
   }
@@ -160,11 +174,17 @@ export class OrderService {
       cTime: t0,
       uTime: t0,
     };
-    this.account.noteLocalOrder(order);
-    void this.store.upsertOrder(order).catch(() => undefined);
+    // Journal the synthetic 'live' row only when the fill push has not already recorded a newer state.
+    if (this.account.noteLocalOrder(order)) void this.store.upsertOrder(order).catch(() => undefined);
     return { order, preview };
   }
 
+  /**
+   * Submit the order. A request that provably never left this process is retried on
+   * the other transport; one whose outcome is unknown (timeout, socket lost after the
+   * frame was sent) is NEVER resent: the order is looked up by clOrdId instead, so a
+   * single click can never turn into two executions.
+   */
   private async submit(params: OkxPlaceOrderParams): Promise<OkxOrderAck> {
     const ws = this.clients.wsPrivate;
     if (this.opts.wsTrading && ws?.isReady) {
@@ -176,10 +196,52 @@ export class OrderService {
         return ack;
       } catch (err) {
         if (err instanceof OkxApiError) throw err;
-        this.log.warn({ err: (err as Error).message }, 'ws order op failed; falling back to REST');
+        if (err instanceof OkxWsError && !err.sent) {
+          this.log.warn({ err: err.message }, 'ws order op not sent; falling back to REST');
+          return this.submitRest(params);
+        }
+        this.log.warn({ err: (err as Error).message, clOrdId: params.clOrdId }, 'ws order op outcome unknown; looking the order up');
+        return this.resolveUnknownOutcome(params);
       }
     }
-    return this.clients.rest.placeOrder(params);
+    return this.submitRest(params);
+  }
+
+  private async submitRest(params: OkxPlaceOrderParams): Promise<OkxOrderAck> {
+    try {
+      return await this.clients.rest.placeOrder(params);
+    } catch (err) {
+      if (err instanceof OkxApiError) throw err;
+      // transport failure (timeout, reset): the exchange may or may not have the order
+      this.log.warn({ err: (err as Error).message, clOrdId: params.clOrdId }, 'REST order outcome unknown; looking the order up');
+      return this.resolveUnknownOutcome(params);
+    }
+  }
+
+  private async resolveUnknownOutcome(params: OkxPlaceOrderParams): Promise<OkxOrderAck> {
+    const clOrdId = params.clOrdId;
+    if (clOrdId) {
+      const found = await this.lookupByClOrdId(params.instId, clOrdId);
+      if (found) return { ordId: found.ordId, clOrdId: found.clOrdId, tag: found.tag ?? '', sCode: '0', sMsg: '' };
+    }
+    throw new AppError('ORDER_STATUS_UNKNOWN', 'the exchange did not acknowledge the order; it may still be live. Check open orders before retrying', 504, { clOrdId: clOrdId ?? '' });
+  }
+
+  /** Poll GET /trade/order by clOrdId for a few seconds; null when OKX reports it does not exist. */
+  private async lookupByClOrdId(instId: string, clOrdId: string): Promise<OkxOrder | null> {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        return await this.clients.rest.getOrder({ instId, clOrdId });
+      } catch (err) {
+        if (err instanceof OkxApiError && (err.code === '51603' || err.code === '51000')) {
+          await new Promise((r) => setTimeout(r, 500));
+          continue;
+        }
+        this.log.warn({ err: (err as Error).message }, 'order lookup failed');
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+    return null;
   }
 
   async cancel(req: CancelOrderRequest): Promise<OkxOrderAck> {

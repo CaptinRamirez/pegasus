@@ -17,6 +17,8 @@ export interface AccountEvents {
 
 const OPEN_STATES = new Set<Order['state']>(['live', 'partially_filled']);
 const RECONCILE_MS = 60_000;
+/** Leverage can be changed outside this process (OKX app, other clients); cached values expire quickly. */
+const LEVERAGE_TTL_MS = 30_000;
 
 /**
  * Mirrors the exchange account: balance, positions and open orders, kept in
@@ -30,7 +32,7 @@ export class AccountService extends EventEmitter<AccountEvents> {
   private readonly seenFills = new Set<string>();
   /** Orders already seen in a terminal state; guards against a late local insert after the fill push raced the order ack. */
   private readonly closedOrders = new Set<string>();
-  private readonly leverageCache = new Map<string, OkxLeverageInfo[]>();
+  private readonly leverageCache = new Map<string, { info: OkxLeverageInfo[]; fetchedAt: number }>();
   private reconcileTimer: NodeJS.Timeout | null = null;
   private reconciling = false;
   private started = false;
@@ -59,11 +61,12 @@ export class AccountService extends EventEmitter<AccountEvents> {
 
   async start(): Promise<void> {
     if (this.started || !this.enabled) return;
-    this.started = true;
     const ws = this.clients.wsPrivate;
     if (!ws) return;
+    // Nothing is marked started until the REST bootstrap succeeded, so a transient failure can be retried.
     this.config = await this.loadConfig();
-    await this.reconcile();
+    await this.reconcile(true);
+    this.started = true;
     ws.on('data', (msg) => this.onPrivateData(msg));
     ws.on('status', (status, detail) => {
       this.log.info({ ws: 'private', status, detail }, 'okx socket status');
@@ -115,9 +118,9 @@ export class AccountService extends EventEmitter<AccountEvents> {
   async getLeverage(instId: string, mgnMode: TdMode): Promise<OkxLeverageInfo[]> {
     const key = `${instId}:${mgnMode}`;
     const cached = this.leverageCache.get(key);
-    if (cached) return cached;
+    if (cached && Date.now() - cached.fetchedAt < LEVERAGE_TTL_MS) return cached.info;
     const info = await this.clients.rest.getLeverageInfo(instId, mgnMode);
-    this.leverageCache.set(key, info);
+    this.leverageCache.set(key, { info, fetchedAt: Date.now() });
     return info;
   }
 
@@ -143,42 +146,70 @@ export class AccountService extends EventEmitter<AccountEvents> {
     return cfg;
   }
 
-  async reconcile(): Promise<void> {
+  /**
+   * Pull balance, positions and open orders over REST and merge them into the
+   * local state without reverting anything a WebSocket push updated in the
+   * meantime: entries are only replaced by newer data (uTime) and only orders
+   * known before the call went out can be evicted.
+   */
+  async reconcile(force = false): Promise<void> {
     if (this.reconciling || !this.enabled) return;
+    if (!force && !this.started) return;
     this.reconciling = true;
+    const t0 = Date.now();
+    const knownBefore = [...this.openOrders.keys()];
     try {
       const [balance, positions, pending] = await Promise.all([
         this.clients.rest.getBalance(),
         this.clients.rest.getPositions('SWAP'),
         this.clients.rest.getOrdersPending({ instType: 'SWAP' }),
       ]);
-      this.applyBalance(balance);
-      this.positions.clear();
-      for (const p of positions) this.applyPosition(p);
+      this.leverageCache.clear();
+      if (!this.balance || this.balance.ts <= Number(balance.uTime || '0')) this.applyBalance(balance);
+
+      const restKeys = new Set<string>();
+      for (const raw of positions) {
+        const pos = mapPosition(raw);
+        const key = positionKey(pos);
+        restKeys.add(key);
+        const local = this.positions.get(key);
+        if (local && local.uTime > pos.uTime) continue; // a push during the round trip is newer
+        if (D(pos.pos).isZero()) this.positions.delete(key);
+        else this.positions.set(key, pos);
+      }
+      for (const [key, local] of this.positions) {
+        if (!restKeys.has(key) && local.uTime < t0) this.positions.delete(key);
+      }
       this.emit('positions', this.positionList());
+
       const seen = new Set<string>();
       for (const o of pending) {
         const order = mapOrder(o);
         seen.add(order.ordId);
+        if (this.closedOrders.has(order.ordId)) continue; // closed by a push while the snapshot was in flight
         const prev = this.openOrders.get(order.ordId);
-        if (!prev || prev.uTime <= order.uTime) {
-          this.openOrders.set(order.ordId, order);
-          if (!prev || prev.state !== order.state || prev.accFillSz !== order.accFillSz) this.emit('order', order);
-          void this.store.upsertOrder(order).catch((err: Error) => this.log.warn({ err: err.message }, 'store.upsertOrder failed'));
-        }
+        if (prev && prev.uTime > order.uTime) continue;
+        this.openOrders.set(order.ordId, order);
+        if (!prev || prev.state !== order.state || prev.accFillSz !== order.accFillSz) this.emit('order', order);
+        void this.store.upsertOrder(order).catch((err: Error) => this.log.warn({ err: err.message }, 'store.upsertOrder failed'));
       }
-      for (const [ordId, order] of this.openOrders) {
+      for (const ordId of knownBefore) {
         if (seen.has(ordId)) continue;
-        // The exchange no longer lists it as open; fetch the final state so the UI and journal agree.
-        this.openOrders.delete(ordId);
-        this.rememberClosed(ordId);
+        const order = this.openOrders.get(ordId);
+        if (!order) continue;
+        // The exchange no longer lists it as open; confirm its final state before dropping it.
         try {
           const final = mapOrder(await this.clients.rest.getOrder({ instId: order.instId, ordId }));
+          if (OPEN_STATES.has(final.state)) {
+            if (order.uTime <= final.uTime) this.openOrders.set(ordId, final);
+            continue;
+          }
+          this.openOrders.delete(ordId);
+          this.rememberClosed(ordId);
           this.emit('order', final);
           void this.store.upsertOrder(final).catch(() => undefined);
         } catch (err) {
-          this.log.warn({ ordId, err: (err as Error).message }, 'could not fetch final state of vanished order');
-          this.emit('order', { ...order, state: 'canceled', uTime: Date.now() });
+          this.log.warn({ ordId, err: (err as Error).message }, 'could not confirm state of vanished order; keeping it until the next reconcile');
         }
       }
     } catch (err) {
@@ -228,10 +259,11 @@ export class AccountService extends EventEmitter<AccountEvents> {
    * its fill before the placement ack arrived, in which case it is already
    * closed and must not be re-inserted as open.
    */
-  noteLocalOrder(order: Order): void {
-    if (this.closedOrders.has(order.ordId) || this.openOrders.has(order.ordId)) return;
+  noteLocalOrder(order: Order): boolean {
+    if (this.closedOrders.has(order.ordId) || this.openOrders.has(order.ordId)) return false;
     this.openOrders.set(order.ordId, order);
     this.emit('order', order);
+    return true;
   }
 
   private rememberClosed(ordId: string): void {
@@ -250,8 +282,9 @@ export class AccountService extends EventEmitter<AccountEvents> {
     this.emit('order', order);
     void this.store.upsertOrder(order).catch((err: Error) => this.log.warn({ err: err.message }, 'store.upsertOrder failed'));
     const fill = fillFromOrderPush(raw);
-    if (fill && !this.seenFills.has(fill.tradeId)) {
-      this.seenFills.add(fill.tradeId);
+    const fillKey = fill ? `${fill.instId}:${fill.tradeId}` : '';
+    if (fill && !this.seenFills.has(fillKey)) {
+      this.seenFills.add(fillKey);
       if (this.seenFills.size > 10_000) this.seenFills.delete(this.seenFills.values().next().value as string);
       this.emit('fill', fill);
       void this.store.upsertFill(fill).catch((err: Error) => this.log.warn({ err: err.message }, 'store.upsertFill failed'));

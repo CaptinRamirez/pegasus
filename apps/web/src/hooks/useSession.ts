@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
 import { isApiError } from '../lib/http';
 import { signOut, startSession } from '../store/session';
@@ -14,11 +14,22 @@ export function useSession(token: string | null): void {
   }, [token]);
 }
 
-/** Seeds order history and fills from REST once; live pushes keep them fresh afterwards. */
+/**
+ * Seeds order history and fills from REST; live pushes keep them fresh afterwards and
+ * every new hello (a reconnect) re-fetches so orders completed during an outage appear.
+ */
 export function useHistorySeed(): void {
   const seedOrderHistory = useStore((s) => s.seedOrderHistory);
   const seedFills = useStore((s) => s.seedFills);
   const pushToast = useStore((s) => s.pushToast);
+  const helloSeq = useStore((s) => s.helloSeq);
+  const qc = useQueryClient();
+
+  useEffect(() => {
+    if (helloSeq < 2) return; // the first hello is covered by the initial fetch
+    void qc.invalidateQueries({ queryKey: ['orders', 'history'] });
+    void qc.invalidateQueries({ queryKey: ['fills'] });
+  }, [helloSeq, qc]);
 
   const history = useQuery({
     queryKey: ['orders', 'history'],

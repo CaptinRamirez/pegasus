@@ -32,7 +32,8 @@ export class MarketSim {
   private mid: Dec;
   private last: Dec;
   private lastSz: Dec = ZERO;
-  private tradeSeq = 0;
+  /** Shared across instruments: real exchange trade ids are globally unique. */
+  private static tradeSeq = 0;
   private readonly tick: Dec;
   private readonly lot: Dec;
   private readonly ctVal: Dec;
@@ -106,10 +107,10 @@ export class MarketSim {
   recordTrade(px: Dec, sz: Dec, side: OkxSide, now: number): { trade: OkxTrade; closed: Map<Bar, OkxCandleRow> } {
     this.last = px;
     this.lastSz = sz;
-    this.tradeSeq += 1;
+    MarketSim.tradeSeq += 1;
     const trade: OkxTrade = {
       instId: this.inst.instId,
-      tradeId: String(this.tradeSeq),
+      tradeId: String(MarketSim.tradeSeq),
       px: fmtStep(px, this.tick),
       sz: fmt(sz),
       side,

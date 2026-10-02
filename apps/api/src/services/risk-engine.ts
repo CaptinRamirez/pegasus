@@ -1,11 +1,13 @@
 import { EventEmitter } from 'node:events';
-import { D, ZERO, notionalQuote, utcDayStart, type Instrument, type OrdType, type Position, type RiskCheckResult, type RiskConfig, type RiskState, type Side } from '@pegasus/shared';
+import { D, Decimal, ZERO, notionalQuote, utcDayStart, type Instrument, type Order, type OrdType, type PosSide, type Position, type RiskCheckResult, type RiskConfig, type RiskState, type Side } from '@pegasus/shared';
 import type { Store } from '../db/store.js';
 import type { Logger } from '../logger.js';
 
 export interface RiskCheckInput {
   inst: Instrument;
   side: Side;
+  /** Resolved position side: 'net' in net mode, 'long' | 'short' in long/short mode */
+  posSide: PosSide;
   ordType: OrdType;
   /** Exchange contracts of the new order */
   contracts: string;
@@ -19,10 +21,13 @@ export interface RiskCheckInput {
   lever: string;
   /** Estimated slippage for market orders ('' when unknown) */
   estSlippagePct: string;
+  /** True only when the exchange will actually enforce reduce-only (net mode) */
   reduceOnly: boolean;
   /** Current positions (all instruments) */
   positions: Position[];
-  openOrders: number;
+  /** Resting orders (all instruments); their unfilled size counts as exposure */
+  openOrders: Order[];
+  instrumentOf: (instId: string) => Instrument | undefined;
 }
 
 interface PersistedRiskState {
@@ -138,8 +143,8 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
     if (D(input.lever).gt(c.maxLeverage)) {
       return fail('MAX_LEVERAGE', `leverage ${input.lever}x exceeds the limit ${c.maxLeverage}x`, { lever: input.lever, limit: c.maxLeverage });
     }
-    if (input.openOrders + 1 > c.maxOpenOrders && input.ordType !== 'market') {
-      return fail('MAX_OPEN_ORDERS', `already ${input.openOrders} open orders (limit ${c.maxOpenOrders})`, { openOrders: input.openOrders, limit: c.maxOpenOrders });
+    if (input.openOrders.length + 1 > c.maxOpenOrders && input.ordType !== 'market') {
+      return fail('MAX_OPEN_ORDERS', `already ${input.openOrders.length} open orders (limit ${c.maxOpenOrders})`, { openOrders: input.openOrders.length, limit: c.maxOpenOrders });
     }
     const ref = D(input.refPrice);
     if (input.ordType !== 'market' && input.px !== '' && ref.gt(0)) {
@@ -153,27 +158,18 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
       }
     if (input.reduceOnly) return pass();
 
-    // Projected exposure after this order fills.
-    const signedOrder = input.side === 'buy' ? notional : notional.neg();
-    let instrumentSigned = ZERO;
-    let othersAbs = ZERO;
-    for (const p of input.positions) {
-      const n = positionSignedNotional(p, input.inst);
-      if (p.instId === input.inst.instId) instrumentSigned = instrumentSigned.plus(n);
-      else othersAbs = othersAbs.plus(n.abs());
-    }
-    const projectedInstrument = instrumentSigned.plus(signedOrder).abs();
-    if (projectedInstrument.gt(c.maxPositionNotionalPerInstrument)) {
-      return fail('MAX_POSITION_NOTIONAL', `projected ${input.inst.instId} exposure ${projectedInstrument.toFixed(2)} exceeds the per-instrument limit ${c.maxPositionNotionalPerInstrument}`, {
-        current: instrumentSigned.toFixed(2),
-        projected: projectedInstrument.toFixed(2),
+    // Projected exposure after this order and every resting order fill.
+    const exposure = projectExposure(input);
+    if (exposure.instrument.gt(c.maxPositionNotionalPerInstrument)) {
+      return fail('MAX_POSITION_NOTIONAL', `projected ${input.inst.instId} exposure ${exposure.instrument.toFixed(2)} exceeds the per-instrument limit ${c.maxPositionNotionalPerInstrument}`, {
+        current: exposure.currentInstrument.toFixed(2),
+        projected: exposure.instrument.toFixed(2),
         limit: c.maxPositionNotionalPerInstrument,
       });
     }
-    const projectedTotal = othersAbs.plus(projectedInstrument);
-    if (projectedTotal.gt(c.maxTotalPositionNotional)) {
-      return fail('MAX_TOTAL_NOTIONAL', `projected total exposure ${projectedTotal.toFixed(2)} exceeds the limit ${c.maxTotalPositionNotional}`, {
-        projected: projectedTotal.toFixed(2),
+    if (exposure.total.gt(c.maxTotalPositionNotional)) {
+      return fail('MAX_TOTAL_NOTIONAL', `projected total exposure ${exposure.total.toFixed(2)} exceeds the limit ${c.maxTotalPositionNotional}`, {
+        projected: exposure.total.toFixed(2),
         limit: c.maxTotalPositionNotional,
       });
     }
@@ -200,4 +196,79 @@ export function positionSignedNotional(p: Position, inst?: Instrument): ReturnTy
   }
   const isShort = p.posSide === 'short' || (p.posSide === 'net' && pos.lt(0));
   return isShort ? abs.neg() : abs;
+}
+
+/** Unfilled notional of a resting order, or null for orders without a price (market remainders). */
+function restingNotional(o: Order, inst: Instrument | undefined): Decimal | null {
+  if (!inst || o.px === '' || o.ordType === 'market') return null;
+  const remaining = D(o.sz).minus(o.accFillSz || '0');
+  if (remaining.lte(0)) return null;
+  return notionalQuote(remaining, o.px, inst);
+}
+
+interface Exposure {
+  /** Absolute notional of the instrument before the order (positions + resting orders) */
+  currentInstrument: Decimal;
+  /** Projected absolute notional of the instrument after the order */
+  instrument: Decimal;
+  /** Projected total across instruments */
+  total: Decimal;
+}
+
+/**
+ * Exposure accounting:
+ *  - net mode: positions and resting orders are signed (long/buy +, short/sell −) and net out;
+ *  - long/short mode: the long and short legs are independent, so exposure is their gross sum
+ *    and an order only ever adds to its own leg or reduces it (never below zero).
+ */
+export function projectExposure(input: RiskCheckInput): Exposure {
+  const notional = D(input.notional);
+  const hedged = input.posSide === 'long' || input.posSide === 'short';
+  let othersAbs = ZERO;
+  // per-instrument accumulators
+  let signed = ZERO;
+  let longLeg = ZERO;
+  let shortLeg = ZERO;
+
+  for (const p of input.positions) {
+    const n = positionSignedNotional(p, input.inst);
+    if (p.instId !== input.inst.instId) {
+      othersAbs = othersAbs.plus(n.abs());
+      continue;
+    }
+    signed = signed.plus(n);
+    if (p.posSide === 'short') shortLeg = shortLeg.plus(n.abs());
+    else if (p.posSide === 'long') longLeg = longLeg.plus(n.abs());
+  }
+  for (const o of input.openOrders) {
+    if (o.reduceOnly) continue;
+    const n = restingNotional(o, o.instId === input.inst.instId ? input.inst : input.instrumentOf(o.instId));
+    if (n === null) continue;
+    if (o.instId !== input.inst.instId) {
+      othersAbs = othersAbs.plus(n);
+      continue;
+    }
+    if (hedged) {
+      // only opening orders add to a leg; closing orders cannot increase exposure
+      if (o.posSide === 'long' && o.side === 'buy') longLeg = longLeg.plus(n);
+      else if (o.posSide === 'short' && o.side === 'sell') shortLeg = shortLeg.plus(n);
+    } else {
+      signed = signed.plus(o.side === 'buy' ? n : n.neg());
+    }
+  }
+
+  let current: Decimal;
+  let projected: Decimal;
+  if (hedged) {
+    current = longLeg.plus(shortLeg);
+    const opening = (input.side === 'buy') === (input.posSide === 'long');
+    const same = input.posSide === 'long' ? longLeg : shortLeg;
+    const other = input.posSide === 'long' ? shortLeg : longLeg;
+    const projectedSame = opening ? same.plus(notional) : Decimal.max(same.minus(notional), ZERO);
+    projected = projectedSame.plus(other);
+  } else {
+    current = signed.abs();
+    projected = signed.plus(input.side === 'buy' ? notional : notional.neg()).abs();
+  }
+  return { currentInstrument: current, instrument: projected, total: othersAbs.plus(projected) };
 }

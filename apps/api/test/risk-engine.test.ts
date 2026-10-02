@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { pino } from 'pino';
-import type { Instrument, Position, RiskConfig } from '@pegasus/shared';
+import type { Instrument, Order, Position, RiskConfig } from '@pegasus/shared';
 import { MemoryStore } from '../src/db/store.js';
 import { RiskEngine, type RiskCheckInput } from '../src/services/risk-engine.js';
 
@@ -27,10 +27,20 @@ function position(instId: string, notionalUsd: string, posSide: Position['posSid
   return { instId, posSide, mgnMode: 'cross', pos, avgPx: '50000', markPx: '50000', upl: '0', uplRatio: '0', lever: '5', liqPx: '', margin: '0', notionalUsd, cTime: 0, uTime: 0 };
 }
 
+const ETH: Instrument = { ...BTC, instId: 'ETH-USDT-SWAP', uly: 'ETH-USDT', baseCcy: 'ETH', ctVal: '0.1', ctValCcy: 'ETH', tickSz: '0.01' };
+const INSTRUMENTS = new Map([[BTC.instId, BTC], [ETH.instId, ETH]]);
+
+function resting(instId: string, side: Order['side'], px: string, sz: string, overrides: Partial<Order> = {}): Order {
+  return {
+    ordId: `o-${instId}-${px}-${side}`, clOrdId: '', instId, side, posSide: 'net', tdMode: 'cross', ordType: 'limit', px, sz, accFillSz: '0', avgPx: '',
+    state: 'live', reduceOnly: false, lever: '5', fee: '0', feeCcy: '', pnl: '0', cTime: 0, uTime: 0, ...overrides,
+  };
+}
+
 function input(overrides: Partial<RiskCheckInput> = {}): RiskCheckInput {
   return {
-    inst: BTC, side: 'buy', ordType: 'limit', contracts: '2', notional: '1000', px: '50000', refPrice: '50000', lever: '5',
-    estSlippagePct: '', reduceOnly: false, positions: [], openOrders: 0, ...overrides,
+    inst: BTC, side: 'buy', posSide: 'net', ordType: 'limit', contracts: '2', notional: '1000', px: '50000', refPrice: '50000', lever: '5',
+    estSlippagePct: '', reduceOnly: false, positions: [], openOrders: [], instrumentOf: (id) => INSTRUMENTS.get(id), ...overrides,
   };
 }
 
@@ -55,8 +65,41 @@ describe('RiskEngine.check', () => {
     expect(engine().check(input({ lever: '20' })).code).toBe('MAX_LEVERAGE');
   });
   it('enforces open order count for resting orders only', () => {
-    expect(engine().check(input({ openOrders: 3 })).code).toBe('MAX_OPEN_ORDERS');
-    expect(engine().check(input({ openOrders: 3, ordType: 'market', px: '' })).ok).toBe(true);
+    const three = [resting('BTC-USDT-SWAP', 'buy', '49000', '0.1'), resting('BTC-USDT-SWAP', 'buy', '48000', '0.1'), resting('BTC-USDT-SWAP', 'buy', '47000', '0.1')];
+    expect(engine().check(input({ openOrders: three })).code).toBe('MAX_OPEN_ORDERS');
+    expect(engine().check(input({ openOrders: three, ordType: 'market', px: '' })).ok).toBe(true);
+  });
+  it('counts the unfilled size of resting orders as exposure', () => {
+    // 19,000 USD of resting buys + 1,000 USD of positions + this 1,000 USD order -> 21,000 > 20,000
+    const orders = [resting('BTC-USDT-SWAP', 'buy', '50000', '38')]; // 38 contracts * 0.01 BTC * 50,000 = 19,000
+    const positions = [position('BTC-USDT-SWAP', '1000')];
+    expect(engine().check(input({ notional: '1000', openOrders: orders, positions })).code).toBe('MAX_POSITION_NOTIONAL');
+    // half filled: 19 contracts remain -> 9,500 + 1,000 + 1,000 = 11,500 -> ok
+    const half = [resting('BTC-USDT-SWAP', 'buy', '50000', '38', { accFillSz: '19' })];
+    expect(engine().check(input({ notional: '1000', openOrders: half, positions })).ok).toBe(true);
+    // resting sells net against a long in net mode
+    const sells = [resting('BTC-USDT-SWAP', 'sell', '50000', '38')];
+    expect(engine().check(input({ notional: '1000', openOrders: sells, positions: [position('BTC-USDT-SWAP', '19500')] })).ok).toBe(true);
+    // other instruments count towards the total with their own contract value
+    const ethOrders = [resting('ETH-USDT-SWAP', 'buy', '3000', '95')]; // 95 * 0.1 ETH * 3000 = 28,500
+    expect(engine().check(input({ notional: '1000', openOrders: ethOrders, positions: [position('BTC-USDT-SWAP', '1000')] })).code).toBe('MAX_TOTAL_NOTIONAL');
+  });
+  it('long/short mode: legs are gross, opening adds to a leg, closing never reduces the other leg', () => {
+    const hedged = [position('BTC-USDT-SWAP', '12000', 'long', '24'), position('BTC-USDT-SWAP', '7500', 'short', '15')];
+    // gross 19,500 + opening long 1,000 -> 20,500 > 20,000
+    expect(engine().check(input({ notional: '1000', side: 'buy', posSide: 'long', positions: hedged })).code).toBe('MAX_POSITION_NOTIONAL');
+    // opening a short of 1,000 also grows gross exposure
+    expect(engine().check(input({ notional: '1000', side: 'sell', posSide: 'short', positions: hedged })).code).toBe('MAX_POSITION_NOTIONAL');
+    // closing part of the long reduces it: 11,000 + 7,500 -> ok
+    expect(engine().check(input({ notional: '1000', side: 'sell', posSide: 'long', positions: hedged })).ok).toBe(true);
+    // over-closing clamps at zero rather than going negative (order stays under the per-order cap)
+    const smallLong = [position('BTC-USDT-SWAP', '3000', 'long', '6'), position('BTC-USDT-SWAP', '7500', 'short', '15')];
+    expect(engine().check(input({ notional: '4000', side: 'sell', posSide: 'long', positions: smallLong })).ok).toBe(true);
+    // resting opening orders on a leg count; closing orders do not
+    const restingOpen = [resting('BTC-USDT-SWAP', 'buy', '50000', '2', { posSide: 'long' })]; // 1,000
+    expect(engine().check(input({ notional: '500', side: 'buy', posSide: 'long', positions: hedged, openOrders: restingOpen })).code).toBe('MAX_POSITION_NOTIONAL');
+    const restingClose = [resting('BTC-USDT-SWAP', 'sell', '50000', '2', { posSide: 'long' })];
+    expect(engine().check(input({ notional: '400', side: 'buy', posSide: 'long', positions: hedged, openOrders: restingClose })).ok).toBe(true);
   });
   it('enforces the price band against the reference price', () => {
     expect(engine().check(input({ px: '52600', refPrice: '50000' })).code).toBe('PRICE_BAND');

@@ -125,10 +125,12 @@ export function OrderTicket() {
           </div>
         </div>
 
-        <label className="check">
-          <input type="checkbox" checked={form.reduceOnly} onChange={(e) => patch({ reduceOnly: e.target.checked })} />
-          Reduce only
-        </label>
+        {!longShort && (
+          <label className="check">
+            <input type="checkbox" checked={form.reduceOnly} onChange={(e) => patch({ reduceOnly: e.target.checked })} />
+            Reduce only
+          </label>
+        )}
 
         <LeverageControl inst={inst} tdMode={form.tdMode} posSide={form.posSide} longShort={longShort} />
 

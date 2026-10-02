@@ -190,4 +190,5 @@ export function mapBalance(b: OkxBalance): Balance {
   };
 }
 
-export const positionKey = (p: { instId: string; posSide: PosSide; mgnMode?: string }): string => `${p.instId}:${p.posSide}`;
+/** OKX keeps separate positions per instrument, margin mode and side; the key must carry all three. */
+export const positionKey = (p: { instId: string; mgnMode: string; posSide: PosSide }): string => `${p.instId}:${p.mgnMode}:${p.posSide}`;

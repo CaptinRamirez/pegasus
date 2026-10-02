@@ -101,7 +101,8 @@ export class MarketDataService extends EventEmitter<MarketEvents> {
     for (const ws of [pub, biz]) {
       ws.on('status', (status, detail) => {
         this.log.info({ ws: ws === pub ? 'public' : 'business', status, detail }, 'okx socket status');
-        if (status !== 'connected') for (const s of this.state.values()) s.book.reset();
+        // Books are fed by the public socket only; a business (candles) reconnect must not wipe them.
+        if (ws === pub && status !== 'connected') for (const s of this.state.values()) s.book.reset();
         this.emit('status');
       });
       ws.on('ready', () => this.emit('status'));

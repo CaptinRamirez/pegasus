@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import type { Fill, Order, OrderState } from '@pegasus/shared';
@@ -123,6 +123,8 @@ export class PgStore implements Store {
       .onConflictDoUpdate({
         target: orders.ordId,
         set: { clOrdId: o.clOrdId, px: o.px, sz: o.sz, accFillSz: o.accFillSz, avgPx: o.avgPx, state: o.state, lever: o.lever, fee: o.fee, feeCcy: o.feeCcy, pnl: o.pnl, uTime: o.uTime },
+        // writes are fire-and-forget across a pool; an older snapshot must never overwrite a newer row
+        setWhere: sql`${orders.uTime} <= excluded.u_time`,
       });
   }
 

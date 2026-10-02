@@ -52,6 +52,8 @@ export interface TerminalState {
   account: AccountConfig | null;
   riskConfig: RiskConfig | null;
   serverTime: number | null;
+  /** Incremented on every hello (initial connect and each reconnect) */
+  helloSeq: number;
   selectedInstId: InstId | null;
   bar: CandleBar;
   market: Record<InstId, MarketData>;
@@ -93,6 +95,7 @@ export function initialState(token: string | null): TerminalState {
     account: null,
     riskConfig: null,
     serverTime: null,
+    helloSeq: 0,
     selectedInstId: null,
     bar: DEFAULT_BAR,
     market: {},
