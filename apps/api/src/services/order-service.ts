@@ -160,7 +160,7 @@ export class OrderService {
       cTime: t0,
       uTime: t0,
     };
-    if (!this.account.openOrders.has(order.ordId)) this.account.openOrders.set(order.ordId, order);
+    this.account.noteLocalOrder(order);
     void this.store.upsertOrder(order).catch(() => undefined);
     return { order, preview };
   }
@@ -210,7 +210,8 @@ export class OrderService {
       try {
         const acks = await this.clients.rest.cancelBatchOrders(batch);
         canceled += acks.filter((a) => a.sCode === '0').length;
-        for (const a of acks) if (a.sCode !== '0') this.log.warn({ ordId: a.ordId, sCode: a.sCode, sMsg: a.sMsg }, 'cancel failed');
+        // An order that is no longer live (filled or already cancelled) is reported per item; that is not a failure of the sweep.
+        for (const a of acks) if (a.sCode !== '0') this.log.info({ ordId: a.ordId, sCode: a.sCode, sMsg: a.sMsg }, 'cancel skipped');
       } catch (err) {
         throw exchangeError(err);
       }

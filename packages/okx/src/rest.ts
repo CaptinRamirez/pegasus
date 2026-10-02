@@ -73,7 +73,13 @@ export class OkxRestClient {
     return this.creds !== undefined;
   }
 
-  async request<T>(method: 'GET' | 'POST', path: string, opts: { query?: Query; body?: unknown; auth?: boolean } = {}): Promise<OkxResponse<T>> {
+  /**
+   * Low-level request. Throws OkxApiError when `code` is not '0', except for
+   * batch endpoints (`batch: true`) where code '1' (all failed) and '2'
+   * (partially succeeded) still carry per-item `sCode`/`sMsg` results that the
+   * caller inspects.
+   */
+  async request<T>(method: 'GET' | 'POST', path: string, opts: { query?: Query; body?: unknown; auth?: boolean; batch?: boolean } = {}): Promise<OkxResponse<T>> {
     const requestPath = `${path}${buildQuery(opts.query)}`;
     const bodyText = method === 'POST' && opts.body !== undefined ? JSON.stringify(opts.body) : '';
     const headers: Record<string, string> = {
@@ -105,7 +111,8 @@ export class OkxRestClient {
     if (typeof json !== 'object' || json === null || typeof json.code !== 'string') {
       throw new OkxHttpError(res.status, requestPath, text);
     }
-    if (json.code !== '0') {
+    const perItem = Array.isArray(json.data) && json.data.length > 0 && typeof (json.data[0] as { sCode?: unknown }).sCode === 'string';
+    if (json.code !== '0' && !(opts.batch && perItem && (json.code === '1' || json.code === '2'))) {
       // Order endpoints return code '1' with per-item sCode/sMsg; surface the first item's message.
       const first = Array.isArray(json.data) ? (json.data[0] as { sCode?: string; sMsg?: string } | undefined) : undefined;
       const code = first?.sCode && first.sCode !== '0' ? first.sCode : json.code;
@@ -122,8 +129,8 @@ export class OkxRestClient {
     return (await this.request<T>('GET', path, q)).data;
   }
 
-  private async postData<T>(path: string, body: unknown): Promise<T[]> {
-    return (await this.request<T>('POST', path, { body, auth: true })).data;
+  private async postData<T>(path: string, body: unknown, batch = false): Promise<T[]> {
+    return (await this.request<T>('POST', path, { body, auth: true, batch })).data;
   }
 
   // ---- public ----
@@ -216,9 +223,14 @@ export class OkxRestClient {
     return ack;
   }
 
-  /** Up to 20 orders per call. Per-item results are returned; items with sCode != '0' failed. */
+  /** Up to 20 orders per call. Per-item results are returned; items with sCode != '0' failed (never throws on partial failure). */
   cancelBatchOrders(params: OkxCancelOrderParams[]): Promise<OkxOrderAck[]> {
-    return this.postData<OkxOrderAck>('/api/v5/trade/cancel-batch-orders', params);
+    return this.postData<OkxOrderAck>('/api/v5/trade/cancel-batch-orders', params, true);
+  }
+
+  /** Up to 20 orders per call. Per-item results are returned; items with sCode != '0' were rejected. */
+  placeBatchOrders(params: OkxPlaceOrderParams[]): Promise<OkxOrderAck[]> {
+    return this.postData<OkxOrderAck>('/api/v5/trade/batch-orders', params, true);
   }
 
   async amendOrder(params: OkxAmendOrderParams): Promise<OkxOrderAck> {

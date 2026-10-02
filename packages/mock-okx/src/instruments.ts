@@ -7,7 +7,6 @@ function swap(partial: Partial<OkxInstrument> & { instId: string }): OkxInstrume
   const uly = `${base}-${quote}`;
   return {
     instType: 'SWAP',
-    instId: partial.instId,
     uly,
     instFamily: uly,
     // OKX reports empty base/quote currencies for swaps.

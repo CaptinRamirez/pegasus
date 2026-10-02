@@ -1,4 +1,4 @@
-import Decimal from 'decimal.js';
+import { Decimal } from 'decimal.js';
 
 /**
  * A private Decimal constructor so the mock never touches the global

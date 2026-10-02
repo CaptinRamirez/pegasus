@@ -97,18 +97,18 @@ export class Account {
     return flip.gt(0) ? flip : ZERO;
   }
 
-  applyFill(instId: string, mgnMode: OkxMgnMode, side: OkxSide, posSide: OkxPosSide, px: Dec, sz: Dec, feeRate: Dec, tradeId: string, now: number): FillOutcome {
+  applyFill(instId: string, mgnMode: OkxMgnMode, side: OkxSide, posSide: OkxPosSide, px: Dec, sz: Dec, feeRate: Dec, markPx: Dec, tradeId: string, now: number): FillOutcome {
     const key = posKey(instId, mgnMode, posSide);
     const dir = this.fillDir(side, posSide);
     let p = this.positions.get(key);
     if (!p) {
       this.posSeq += 1;
-      p = { instId, mgnMode, posId: String(POS_ID_BASE + this.posSeq), posSide, dir, qty: ZERO, avgPx: ZERO, lever: this.leverFor(instId, mgnMode, posSide), markPx: px, cTime: now, uTime: now, tradeId, realizedPnl: ZERO, fee: ZERO };
+      p = { instId, mgnMode, posId: String(POS_ID_BASE + this.posSeq), posSide, dir, qty: ZERO, avgPx: ZERO, lever: this.leverFor(instId, mgnMode, posSide), markPx, cTime: now, uTime: now, tradeId, realizedPnl: ZERO, fee: ZERO };
       this.positions.set(key, p);
     }
     const ctVal = this.ctVal(instId);
     let pnl = ZERO;
-    if (p.qty.isZero() || p.dir === dir) {
+    if (p.qty.isZero() || this.isOpening(side, posSide, p)) {
       p.avgPx = p.qty.mul(p.avgPx).add(sz.mul(px)).div(p.qty.add(sz));
       p.qty = p.qty.add(sz);
       p.dir = dir;
@@ -117,7 +117,8 @@ export class Account {
       pnl = px.sub(p.avgPx).mul(closed).mul(ctVal).mul(p.dir);
       p.qty = p.qty.sub(closed);
       const remaining = sz.sub(closed);
-      if (remaining.gt(0)) {
+      // Only net mode can flip through zero; long/short mode orders never exceed the position.
+      if (remaining.gt(0) && this.posMode === 'net_mode') {
         p.dir = dir;
         p.qty = remaining;
         p.avgPx = px;
@@ -129,7 +130,7 @@ export class Account {
     p.fee = p.fee.add(fee);
     p.uTime = now;
     p.tradeId = tradeId;
-    p.markPx = px;
+    p.markPx = markPx;
     const wire = this.positionWire(p, now);
     if (p.qty.isZero()) this.positions.delete(key);
     return { pnl, fee, position: wire };

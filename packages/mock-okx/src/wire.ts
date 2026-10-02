@@ -338,6 +338,7 @@ export interface OkxOrderAck {
   sCode: string;
   sMsg: string;
   ts: string;
+  reqId?: string;
 }
 
 export interface OkxPlaceOrderParams {

@@ -28,6 +28,8 @@ export class AccountService extends EventEmitter<AccountEvents> {
   readonly positions = new Map<string, Position>();
   readonly openOrders = new Map<string, Order>();
   private readonly seenFills = new Set<string>();
+  /** Orders already seen in a terminal state; guards against a late local insert after the fill push raced the order ack. */
+  private readonly closedOrders = new Set<string>();
   private readonly leverageCache = new Map<string, OkxLeverageInfo[]>();
   private reconcileTimer: NodeJS.Timeout | null = null;
   private reconciling = false;
@@ -169,6 +171,7 @@ export class AccountService extends EventEmitter<AccountEvents> {
         if (seen.has(ordId)) continue;
         // The exchange no longer lists it as open; fetch the final state so the UI and journal agree.
         this.openOrders.delete(ordId);
+        this.rememberClosed(ordId);
         try {
           const final = mapOrder(await this.clients.rest.getOrder({ instId: order.instId, ordId }));
           this.emit('order', final);
@@ -220,10 +223,30 @@ export class AccountService extends EventEmitter<AccountEvents> {
     }
   }
 
+  /**
+   * Record an order this process just submitted. The exchange may have pushed
+   * its fill before the placement ack arrived, in which case it is already
+   * closed and must not be re-inserted as open.
+   */
+  noteLocalOrder(order: Order): void {
+    if (this.closedOrders.has(order.ordId) || this.openOrders.has(order.ordId)) return;
+    this.openOrders.set(order.ordId, order);
+    this.emit('order', order);
+  }
+
+  private rememberClosed(ordId: string): void {
+    this.closedOrders.add(ordId);
+    if (this.closedOrders.size > 10_000) this.closedOrders.delete(this.closedOrders.values().next().value as string);
+  }
+
   private applyOrderPush(raw: OkxOrder): void {
     const order = mapOrder(raw);
-    if (OPEN_STATES.has(order.state)) this.openOrders.set(order.ordId, order);
-    else this.openOrders.delete(order.ordId);
+    if (OPEN_STATES.has(order.state)) {
+      this.openOrders.set(order.ordId, order);
+    } else {
+      this.openOrders.delete(order.ordId);
+      this.rememberClosed(order.ordId);
+    }
     this.emit('order', order);
     void this.store.upsertOrder(order).catch((err: Error) => this.log.warn({ err: err.message }, 'store.upsertOrder failed'));
     const fill = fillFromOrderPush(raw);

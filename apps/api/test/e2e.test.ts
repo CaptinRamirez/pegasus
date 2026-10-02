@@ -64,7 +64,6 @@ beforeAll(async () => {
     OKX_WS_PRIVATE_URL: mock.wsPrivateUrl,
     OKX_WS_BUSINESS_URL: mock.wsBusinessUrl,
     API_TOKEN: TOKEN,
-    API_PORT: '0',
     INSTRUMENTS: 'BTC-USDT-SWAP,ETH-USDT-SWAP',
     RISK_MAX_ORDER_NOTIONAL: '20000',
     RISK_MAX_POSITION_NOTIONAL_PER_INSTRUMENT: '30000',
@@ -199,12 +198,18 @@ describe('api e2e against mock OKX', () => {
 
   it('streams hello, market data and private updates over /ws', async () => {
     const unauth = new WebSocket(`ws://${baseUrl}/ws?token=wrong`);
-    await Promise.race([once(unauth, 'error'), once(unauth, 'close')]);
+    const unauthResult = await Promise.race([
+      once(unauth, 'open').then(() => 'open'),
+      new Promise<string>((resolve) => unauth.once('error', (e) => resolve(`error:${e.message}`))),
+      new Promise<string>((resolve) => unauth.once('close', (code) => resolve(`close:${code}`))),
+    ]);
+    expect(unauthResult).not.toBe('open');
 
     const ws = new WebSocket(`ws://${baseUrl}/ws?token=${TOKEN}`);
-    await once(ws, 'open');
     const received: ServerMessage[] = [];
+    // Register before 'open': the server sends `hello` immediately and ws may deliver it in the same tick.
     ws.on('message', (raw) => received.push(decodeServerMessage(raw.toString())));
+    await once(ws, 'open');
     const hello = await waitFor(() => received.find((m) => m.type === 'hello'), 5000, 'hello');
     expect(hello.type === 'hello' && hello.data.instruments.length).toBe(2);
     ws.send(JSON.stringify({ type: 'subscribe', instId: 'BTC-USDT-SWAP', bar: '1m' }));
@@ -214,10 +219,10 @@ describe('api e2e against mock OKX', () => {
     ws.send(JSON.stringify({ type: 'ping' }));
     await waitFor(() => received.some((m) => m.type === 'pong'), 2000, 'pong');
     // a private update reaches the terminal
-    const placed = data(await api<{ order: Order }>('POST', '/api/orders', { instId: 'BTC-USDT-SWAP', side: 'buy', ordType: 'limit', px: '47500', size: { unit: 'contracts', value: '1' } }));
+    const placed = data(await api<{ order: Order }>('POST', '/api/orders', { instId: 'BTC-USDT-SWAP', side: 'buy', ordType: 'limit', px: '48500', size: { unit: 'contracts', value: '1' } }));
     await waitFor(() => received.some((m) => m.type === 'order' && m.data.ordId === placed.order.ordId), 5000, 'order push');
     data(await api<unknown>('POST', '/api/orders/cancel-all', {}));
     await waitFor(() => received.some((m) => m.type === 'order' && m.data.ordId === placed.order.ordId && m.data.state === 'canceled'), 5000, 'cancel push');
     ws.close();
-  });
+  }, 20_000);
 });

@@ -5,6 +5,7 @@ import { SyntheticBook, type BooksPush } from './book.js';
 import { BAR_MS, BARS, barStart, CandleSeries, candleRow, type Bar } from './candles.js';
 
 const HISTORY_BARS = 300;
+const HISTORY_VOL_PER_MINUTE = 0.0005;
 const FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000;
 
 export interface CandlePush {
@@ -51,7 +52,8 @@ export class MarketSim {
     this.book = new SyntheticBook(inst);
     for (const bar of BARS) {
       const series = new CandleSeries(bar, this.ctVal, this.tick);
-      const perBar = Math.min(0.08, Math.max(0.0005, opts.volatility * Math.sqrt(BAR_MS[bar] / Math.max(opts.tickIntervalMs, 1))));
+      // Back-history uses a realistic ~0.05%/minute scale regardless of the live tick volatility.
+      const perBar = HISTORY_VOL_PER_MINUTE * Math.sqrt(BAR_MS[bar] / 60_000);
       series.seedHistory(now, this.last, rng, perBar, HISTORY_BARS);
       this.candles.set(bar, series);
     }
