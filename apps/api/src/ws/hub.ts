@@ -45,7 +45,8 @@ export class Hub {
 
   /** Subscribe to service events; call once at startup. */
   wire(): void {
-    this.market.on('ticker', (t) => this.sendToInstrument(t.instId, { type: 'ticker', data: t }));
+    // Tickers go to every client so the instrument list shows prices for all tracked instruments.
+    this.market.on('ticker', (t) => this.broadcast({ type: 'ticker', data: t }));
     this.market.on('book', (b) => this.sendToInstrument(b.instId, { type: 'book', data: b }));
     this.market.on('trades', (trades) => {
       const instId = trades[0]?.instId;
@@ -100,6 +101,10 @@ export class Hub {
     this.clients.add(ctx);
     this.log.info({ clients: this.clients.size }, 'terminal client connected');
     this.send(ctx, { type: 'hello', data: this.hello() });
+    for (const instId of this.market.instruments.keys()) {
+      const t = this.market.ticker(instId);
+      if (t) this.send(ctx, { type: 'ticker', data: t });
+    }
     socket.on('message', (raw) => {
       ctx.lastSeen = Date.now();
       void this.onMessage(ctx, raw.toString());

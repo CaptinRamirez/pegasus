@@ -61,6 +61,8 @@ export function useCandleChart(
     const el = container.current;
     if (el === null) return;
     const chart = createChart(el, {
+      // Pin the locale: the default (navigator.language) can be an invalid BCP 47 tag on some systems and makes Intl throw.
+      localization: { locale: 'en-US' },
       layout: {
         background: { type: ColorType.Solid, color: '#10141c' },
         textColor: '#8a93a3',
