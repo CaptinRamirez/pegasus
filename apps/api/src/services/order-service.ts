@@ -51,12 +51,12 @@ export class OrderService {
     private readonly risk: RiskEngine,
     private readonly store: Store,
     private readonly log: Logger,
-    private readonly defaultTdMode: TdMode,
+    private readonly opts: { defaultTdMode: TdMode; wsTrading: boolean },
   ) {}
 
   async preview(req: PlaceOrderRequest): Promise<OrderPreview> {
     const inst = this.market.requireInstrument(req.instId);
-    const tdMode = req.tdMode ?? this.defaultTdMode;
+    const tdMode = req.tdMode ?? this.opts.defaultTdMode;
     const posSide = this.resolvePosSide(req);
     const reduceOnly = req.reduceOnly ?? false;
 
@@ -167,7 +167,7 @@ export class OrderService {
 
   private async submit(params: OkxPlaceOrderParams): Promise<OkxOrderAck> {
     const ws = this.clients.wsPrivate;
-    if (ws?.isReady) {
+    if (this.opts.wsTrading && ws?.isReady) {
       try {
         const res = await ws.request<OkxOrderAck>('order', [params], { timeoutMs: 5_000 });
         const ack = res.data[0];
@@ -189,7 +189,7 @@ export class OrderService {
     else if (req.clOrdId !== undefined) params.clOrdId = req.clOrdId;
     try {
       const ws = this.clients.wsPrivate;
-      if (ws?.isReady) {
+      if (this.opts.wsTrading && ws?.isReady) {
         const res = await ws.request<OkxOrderAck>('cancel-order', [params], { timeoutMs: 5_000 });
         const ack = res.data[0];
         if (ack && ack.sCode === '0') return ack;

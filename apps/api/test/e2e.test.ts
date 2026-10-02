@@ -82,7 +82,7 @@ beforeAll(async () => {
   const account = new AccountService(clients, store, log);
   const risk = new RiskEngine(config.risk, store, log);
   await risk.init();
-  const orders = new OrderService(clients, market, account, risk, store, log, config.defaultTdMode);
+  const orders = new OrderService(clients, market, account, risk, store, log, { defaultTdMode: config.defaultTdMode, wsTrading: true });
   const hub = new Hub(config, market, account, risk, log);
   deps = { config, log, clients, store, market, account, risk, orders, hub };
   account.on('balance', (b) => risk.updateEquity(b.totalEq));

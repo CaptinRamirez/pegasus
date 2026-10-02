@@ -85,6 +85,7 @@ pnpm db:migrate
 | `OKX_DEMO` | `1` 模拟盘，`0` 实盘 |
 | `INSTRUMENTS` | 启动时跟踪的合约，逗号分隔，例如 `BTC-USDT-SWAP,ETH-USDT-SWAP` |
 | `DEFAULT_TD_MODE` | 默认保证金模式 `cross` / `isolated` |
+| `OKX_WS_TRADING` | `1` 用私有 WebSocket 下单撤单（延迟更低），`0` 用 REST（默认） |
 | `API_TOKEN` | 前端访问后端的共享密钥 |
 | `RISK_MAX_ORDER_NOTIONAL` | 单笔最大名义（USD） |
 | `RISK_MAX_POSITION_NOTIONAL_PER_INSTRUMENT` | 单品种最大持仓名义 |

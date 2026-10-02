@@ -13,6 +13,8 @@ const envSchema = z.object({
   OKX_WS_PUBLIC_URL: z.string().optional(),
   OKX_WS_PRIVATE_URL: z.string().optional(),
   OKX_WS_BUSINESS_URL: z.string().optional(),
+  /** '1' submits/cancels orders over the private WebSocket (lower latency); '0' uses REST. */
+  OKX_WS_TRADING: z.enum(['0', '1']).default('0'),
 
   API_HOST: z.string().default('127.0.0.1'),
   API_PORT: z.coerce.number().int().min(1).max(65535).default(8787),
@@ -37,6 +39,8 @@ export interface AppConfig {
     credentials: OkxCredentials | undefined;
     demo: boolean;
     endpoints: OkxEndpoints;
+    /** Submit and cancel orders over the private WebSocket instead of REST. */
+    wsTrading: boolean;
   };
   server: {
     host: string;
@@ -66,6 +70,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     okx: {
       credentials: hasCreds ? { apiKey: e.OKX_API_KEY, apiSecret: e.OKX_API_SECRET, passphrase: e.OKX_API_PASSPHRASE } : undefined,
       demo,
+      wsTrading: e.OKX_WS_TRADING === '1',
       endpoints: {
         rest: e.OKX_REST_URL ?? defaults.rest,
         wsPublic: e.OKX_WS_PUBLIC_URL ?? defaults.wsPublic,

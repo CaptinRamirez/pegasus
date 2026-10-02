@@ -14,7 +14,7 @@ import { Hub } from './ws/hub.js';
 async function main(): Promise<void> {
   const config = loadConfig();
   const log = createLogger(config.server.logLevel);
-  log.info({ demo: config.okx.demo, rest: config.okx.endpoints.rest, instruments: config.instruments, host: config.server.host, port: config.server.port }, 'pegasus api starting');
+  log.info({ demo: config.okx.demo, rest: config.okx.endpoints.rest, wsTrading: config.okx.wsTrading, instruments: config.instruments, host: config.server.host, port: config.server.port }, 'pegasus api starting');
   if (config.server.token === 'change-me') log.warn('API_TOKEN is the default value; set a real secret in .env before exposing this server');
   if (!config.okx.credentials) log.warn('no OKX credentials configured: running in market-data-only mode (no trading)');
   if (!config.okx.demo && config.okx.credentials) log.warn('LIVE TRADING MODE: orders will use real funds');
@@ -40,7 +40,7 @@ async function main(): Promise<void> {
   const account = new AccountService(clients, store, log);
   const risk = new RiskEngine(config.risk, store, log);
   await risk.init();
-  const orders = new OrderService(clients, market, account, risk, store, log, config.defaultTdMode);
+  const orders = new OrderService(clients, market, account, risk, store, log, { defaultTdMode: config.defaultTdMode, wsTrading: config.okx.wsTrading });
   const hub = new Hub(config, market, account, risk, log);
   const deps: Deps = { config, log, clients, store, market, account, risk, orders, hub };
 
