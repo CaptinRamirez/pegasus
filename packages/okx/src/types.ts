@@ -1,0 +1,330 @@
+/**
+ * OKX v5 wire types. Field names mirror the exchange exactly; all numbers are
+ * strings as sent by OKX. Only the fields this project consumes are listed,
+ * but objects may carry more keys at runtime.
+ */
+
+export interface OkxResponse<T> {
+  code: string;
+  msg: string;
+  data: T[];
+}
+
+export type OkxInstType = 'SPOT' | 'MARGIN' | 'SWAP' | 'FUTURES' | 'OPTION';
+export type OkxTdMode = 'cross' | 'isolated' | 'cash';
+export type OkxSide = 'buy' | 'sell';
+export type OkxPosSide = 'long' | 'short' | 'net';
+export type OkxOrdType = 'market' | 'limit' | 'post_only' | 'fok' | 'ioc' | 'optimal_limit_ioc';
+export type OkxOrderState = 'live' | 'partially_filled' | 'filled' | 'canceled' | 'mmp_canceled';
+export type OkxPosMode = 'net_mode' | 'long_short_mode';
+
+export interface OkxInstrument {
+  instType: OkxInstType;
+  instId: string;
+  uly: string;
+  instFamily: string;
+  baseCcy: string;
+  quoteCcy: string;
+  settleCcy: string;
+  ctVal: string;
+  ctMult: string;
+  ctValCcy: string;
+  ctType: 'linear' | 'inverse' | '';
+  lotSz: string;
+  minSz: string;
+  tickSz: string;
+  maxLmtSz: string;
+  maxMktSz: string;
+  lever: string;
+  state: 'live' | 'suspend' | 'preopen' | 'test';
+  listTime: string;
+  expTime: string;
+}
+
+export interface OkxTicker {
+  instType: OkxInstType;
+  instId: string;
+  last: string;
+  lastSz: string;
+  askPx: string;
+  askSz: string;
+  bidPx: string;
+  bidSz: string;
+  open24h: string;
+  high24h: string;
+  low24h: string;
+  volCcy24h: string;
+  vol24h: string;
+  sodUtc0: string;
+  sodUtc8: string;
+  ts: string;
+}
+
+/** [price, size, deprecated liquidated-orders count, order count] */
+export type OkxBookLevel = [string, string, string, string];
+
+export interface OkxBookData {
+  asks: OkxBookLevel[];
+  bids: OkxBookLevel[];
+  ts: string;
+  checksum?: number;
+  seqId?: number;
+  prevSeqId?: number;
+}
+
+export interface OkxTrade {
+  instId: string;
+  tradeId: string;
+  px: string;
+  sz: string;
+  side: OkxSide;
+  ts: string;
+}
+
+/** [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm] */
+export type OkxCandleRow = [string, string, string, string, string, string, string, string, string];
+
+export interface OkxMarkPrice {
+  instType: OkxInstType;
+  instId: string;
+  markPx: string;
+  ts: string;
+}
+
+export interface OkxFundingRate {
+  instType: OkxInstType;
+  instId: string;
+  fundingRate: string;
+  nextFundingRate: string;
+  fundingTime: string;
+  nextFundingTime: string;
+  ts?: string;
+}
+
+export interface OkxTime {
+  ts: string;
+}
+
+export interface OkxAccountConfig {
+  uid: string;
+  acctLv: string;
+  posMode: OkxPosMode;
+  autoLoan: boolean;
+  level: string;
+  label?: string;
+}
+
+export interface OkxBalanceDetail {
+  ccy: string;
+  eq: string;
+  availEq: string;
+  cashBal: string;
+  availBal: string;
+  upl: string;
+  frozenBal: string;
+  ordFrozen: string;
+  isoEq: string;
+}
+
+export interface OkxBalance {
+  totalEq: string;
+  adjEq: string;
+  isoEq: string;
+  ordFroz: string;
+  imr: string;
+  mmr: string;
+  notionalUsd: string;
+  uTime: string;
+  details: OkxBalanceDetail[];
+}
+
+export interface OkxPosition {
+  instType: OkxInstType;
+  instId: string;
+  mgnMode: 'cross' | 'isolated';
+  posId: string;
+  posSide: OkxPosSide;
+  pos: string;
+  availPos: string;
+  avgPx: string;
+  markPx: string;
+  upl: string;
+  uplRatio: string;
+  lever: string;
+  liqPx: string;
+  margin: string;
+  notionalUsd: string;
+  ccy: string;
+  cTime: string;
+  uTime: string;
+  pTime?: string;
+}
+
+export interface OkxLeverageInfo {
+  instId: string;
+  mgnMode: 'cross' | 'isolated';
+  posSide: OkxPosSide;
+  lever: string;
+}
+
+export interface OkxOrder {
+  instType: OkxInstType;
+  instId: string;
+  ordId: string;
+  clOrdId: string;
+  tag: string;
+  tdMode: OkxTdMode;
+  side: OkxSide;
+  posSide: OkxPosSide;
+  ordType: OkxOrdType;
+  px: string;
+  sz: string;
+  accFillSz: string;
+  fillPx: string;
+  fillSz: string;
+  fillTime: string;
+  tradeId: string;
+  avgPx: string;
+  state: OkxOrderState;
+  lever: string;
+  reduceOnly: string;
+  fee: string;
+  feeCcy: string;
+  pnl: string;
+  category: string;
+  cTime: string;
+  uTime: string;
+  /** Present on the private `orders` channel pushes */
+  execType?: 'T' | 'M' | '';
+  fillFee?: string;
+  fillFeeCcy?: string;
+  fillPnl?: string;
+  amendResult?: string;
+  code?: string;
+  msg?: string;
+}
+
+export interface OkxFill {
+  instType: OkxInstType;
+  instId: string;
+  tradeId: string;
+  ordId: string;
+  clOrdId: string;
+  billId: string;
+  tag: string;
+  fillPx: string;
+  fillSz: string;
+  side: OkxSide;
+  posSide: OkxPosSide;
+  execType: 'T' | 'M' | '';
+  feeCcy: string;
+  fee: string;
+  fillPnl?: string;
+  ts: string;
+}
+
+export interface OkxPlaceOrderParams {
+  instId: string;
+  tdMode: OkxTdMode;
+  side: OkxSide;
+  ordType: OkxOrdType;
+  sz: string;
+  px?: string;
+  posSide?: OkxPosSide;
+  clOrdId?: string;
+  tag?: string;
+  reduceOnly?: boolean;
+  /** For SWAP: 'base_ccy' | 'quote_ccy' is spot-only; omit for swaps */
+  tgtCcy?: string;
+}
+
+export interface OkxOrderAck {
+  ordId: string;
+  clOrdId: string;
+  tag: string;
+  sCode: string;
+  sMsg: string;
+  ts?: string;
+}
+
+export interface OkxCancelOrderParams {
+  instId: string;
+  ordId?: string;
+  clOrdId?: string;
+}
+
+export interface OkxAmendOrderParams {
+  instId: string;
+  ordId?: string;
+  clOrdId?: string;
+  newSz?: string;
+  newPx?: string;
+  cxlOnFail?: boolean;
+  reqId?: string;
+}
+
+export interface OkxClosePositionParams {
+  instId: string;
+  mgnMode: 'cross' | 'isolated';
+  posSide?: OkxPosSide;
+  ccy?: string;
+  autoCxl?: boolean;
+  clOrdId?: string;
+}
+
+export interface OkxSetLeverageParams {
+  instId?: string;
+  ccy?: string;
+  lever: string;
+  mgnMode: 'cross' | 'isolated';
+  posSide?: 'long' | 'short';
+}
+
+export interface OkxWsArg {
+  channel: string;
+  instId?: string;
+  instType?: string;
+  instFamily?: string;
+  ccy?: string;
+  [k: string]: string | undefined;
+}
+
+export interface OkxWsEvent {
+  event: 'subscribe' | 'unsubscribe' | 'login' | 'error' | 'channel-conn-count' | 'channel-conn-count-error' | 'notice';
+  arg?: OkxWsArg;
+  code?: string;
+  msg?: string;
+  connId?: string;
+  channel?: string;
+  connCount?: string;
+}
+
+export interface OkxWsData<T = unknown> {
+  arg: OkxWsArg;
+  action?: 'snapshot' | 'update';
+  data: T[];
+}
+
+export interface OkxWsOpResponse<T = unknown> {
+  id: string;
+  op: string;
+  code: string;
+  msg: string;
+  data: T[];
+  inTime?: string;
+  outTime?: string;
+}
+
+export type OkxWsMessage = OkxWsEvent | OkxWsData | OkxWsOpResponse;
+
+export function isWsEvent(m: OkxWsMessage): m is OkxWsEvent {
+  return typeof (m as OkxWsEvent).event === 'string';
+}
+
+export function isWsData(m: OkxWsMessage): m is OkxWsData {
+  return (m as OkxWsData).arg !== undefined && Array.isArray((m as OkxWsData).data) && (m as OkxWsEvent).event === undefined;
+}
+
+export function isWsOpResponse(m: OkxWsMessage): m is OkxWsOpResponse {
+  return typeof (m as OkxWsOpResponse).op === 'string' && typeof (m as OkxWsOpResponse).id === 'string';
+}
