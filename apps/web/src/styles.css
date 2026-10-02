@@ -224,6 +224,7 @@ a:hover { text-decoration: underline; }
 .tape-row.sell .px { color: var(--down); }
 
 /* ---------- chart ---------- */
+.panel-chart > .panel-body { display: flex; flex-direction: column; overflow: hidden; }
 .chart-wrap { position: relative; flex: 1 1 auto; min-height: 0; }
 .chart-wrap > div { position: absolute; inset: 0; }
 .chart-info { display: flex; justify-content: flex-end; gap: 14px; font-weight: 400; text-transform: none; letter-spacing: 0; }
