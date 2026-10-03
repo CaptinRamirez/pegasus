@@ -158,6 +158,25 @@ export class RestRouter {
       const f = e.fundingRate(instId);
       return f ? ok([f]) : err('51001', 'Instrument ID does not exist.');
     });
+    this.get('/api/v5/public/open-interest', false, (q) => {
+      const instType = q.get('instType');
+      if (!instType) return err('50014', 'Parameter instType cannot be empty.');
+      if (instType !== 'SWAP') return ok([]);
+      const instId = q.get('instId') ?? undefined;
+      const insts = e.instrumentList(instId);
+      if (instId && insts.length === 0) return err('51001', 'Instrument ID does not exist.');
+      const now = String(e.now());
+      return ok(insts.map((inst) => {
+        // Synthetic open interest: a fixed base per instrument plus whatever the user holds.
+        const base = inst.instId.startsWith('BTC') ? 250000 : 400000;
+        const held = e.positions(inst.instId).reduce((acc, p) => acc + Math.abs(Number(p.pos)), 0);
+        const oi = base + held;
+        const ticker = e.ticker(inst.instId);
+        const px = ticker ? Number(ticker.last) : 0;
+        const ctVal = Number(inst.ctVal);
+        return { instType: 'SWAP', instId: inst.instId, oi: String(oi), oiCcy: String(oi * ctVal), oiUsd: String(oi * ctVal * px), ts: now };
+      }));
+    });
     // Settled records, newest first, at the regular 8h cadence ending with the last settlement before now.
     this.get('/api/v5/public/funding-rate-history', false, (q) => {
       const instId = q.get('instId');

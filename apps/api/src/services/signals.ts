@@ -1,5 +1,17 @@
 import { OkxApiError } from '@pegasus/okx';
-import { buildSignalReport, DEFAULT_SIZING, DEFAULT_TREND_PARAMS, type FundingRecord, type InstrumentSignalReport, type SizingParams, type TrendParams } from '@pegasus/shared';
+import {
+  buildSignalReport,
+  computeBookMetrics,
+  computeOpenInterestMetrics,
+  DEFAULT_SIZING,
+  DEFAULT_TREND_PARAMS,
+  type FundingRecord,
+  type InstrumentSignalReport,
+  type MarketStructure,
+  type OpenInterestPoint,
+  type SizingParams,
+  type TrendParams,
+} from '@pegasus/shared';
 import type { Logger } from '../logger.js';
 import type { OkxClients } from '../okx/clients.js';
 import { mapCandle } from '../okx/mappers.js';
@@ -23,6 +35,8 @@ interface CacheEntry {
   at: number;
   candles: ReturnType<typeof mapCandle>[];
   funding: FundingRecord[] | null;
+  /** Daily open interest history in USD for the base currency (OKX aggregate), oldest first */
+  oiHistory: OpenInterestPoint[] | null;
 }
 
 const CANDLE_CACHE_MS = 5 * 60_000;
@@ -56,7 +70,9 @@ export class SignalsService {
         try {
           const inst = this.market.requireInstrument(instId);
           const data = await this.load(instId, now);
-          return buildSignalReport(instId, data.candles, data.funding, now, inst, equity, this.params, sizing);
+          const report = buildSignalReport(instId, data.candles, data.funding, now, inst, equity, this.params, sizing);
+          report.structure = await this.structure(instId, data);
+          return report;
         } catch (err) {
           const code = err instanceof OkxApiError ? 'EXCHANGE' : ((err as { code?: string }).code ?? 'INTERNAL');
           this.log.warn({ instId, err: (err as Error).message }, 'signal report failed');
@@ -80,8 +96,33 @@ export class SignalsService {
     } catch (err) {
       this.log.warn({ instId, err: (err as Error).message }, 'funding history unavailable; signals computed without the funding filter');
     }
-    const entry: CacheEntry = { at: now, candles, funding };
+    let oiHistory: OpenInterestPoint[] | null = null;
+    try {
+      const inst = this.market.requireInstrument(instId);
+      const rows = await this.clients.rest.getOpenInterestVolume(inst.baseCcy, '1D');
+      oiHistory = rows.map((r) => ({ ts: Number(r[0]), value: r[1] })).sort((a, b) => a.ts - b.ts);
+    } catch (err) {
+      this.log.debug({ instId, err: (err as Error).message }, 'open interest history unavailable');
+    }
+    const entry: CacheEntry = { at: now, candles, funding, oiHistory };
     this.cache.set(instId, entry);
     return entry;
+  }
+
+  /** Live execution context: visible book depth and open interest. Never fails the report. */
+  private async structure(instId: string, data: CacheEntry): Promise<MarketStructure> {
+    const inst = this.market.requireInstrument(instId);
+    const book = this.market.book(instId, 20);
+    const bookMetrics = book ? computeBookMetrics(book, inst, 20) : null;
+    let openInterest = data.oiHistory && data.oiHistory.length > 0 ? computeOpenInterestMetrics(data.oiHistory, 'usd') : null;
+    if (!openInterest) {
+      try {
+        const [cur] = await this.clients.rest.getOpenInterest('SWAP', instId);
+        if (cur) openInterest = computeOpenInterestMetrics([{ ts: Number(cur.ts), value: cur.oiUsd && cur.oiUsd !== '' ? cur.oiUsd : cur.oi }], cur.oiUsd && cur.oiUsd !== '' ? 'usd' : 'contracts');
+      } catch (err) {
+        this.log.debug({ instId, err: (err as Error).message }, 'open interest unavailable');
+      }
+    }
+    return { book: bookMetrics, openInterest };
   }
 }

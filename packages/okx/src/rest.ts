@@ -16,6 +16,7 @@ import type {
   OkxLeverageInfo,
   OkxMarkPrice,
   OkxOpenInterest,
+  OkxOpenInterestVolumeRow,
   OkxOrder,
   OkxOrderAck,
   OkxPlaceOrderParams,
@@ -190,6 +191,14 @@ export class OkxRestClient {
 
   getOpenInterest(instType: OkxInstType, instId?: string): Promise<OkxOpenInterest[]> {
     return this.getData<OkxOpenInterest>('/api/v5/public/open-interest', { instType, instId });
+  }
+
+  /**
+   * Aggregated open interest and volume history for a currency across OKX
+   * contracts (trading statistics), newest first. `period` is 5m, 1H or 1D.
+   */
+  getOpenInterestVolume(ccy: string, period: '5m' | '1H' | '1D' = '1D', opts: { begin?: number; end?: number } = {}): Promise<OkxOpenInterestVolumeRow[]> {
+    return this.getData<OkxOpenInterestVolumeRow>('/api/v5/rubik/stat/contracts/open-interest-volume', { ccy, period, begin: opts.begin, end: opts.end });
   }
 
   // ---- account ----

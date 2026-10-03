@@ -181,3 +181,35 @@ describe('buildSignalReport', () => {
     expect(report.signals.longEntry).toBe(true);
   });
 });
+
+describe('market structure', () => {
+  it('measures spread, depth notional and imbalance over the top levels', async () => {
+    const { computeBookMetrics, computeOpenInterestMetrics } = await import('../src/index.js');
+    const book = {
+      bids: [['50000', '10'], ['49990', '20'], ['49980', '30']] as Array<[string, string]>,
+      asks: [['50010', '5'], ['50020', '5'], ['50030', '5']] as Array<[string, string]>,
+      ts: 1,
+    };
+    const m = computeBookMetrics(book, BTC, 2)!;
+    // mid 50005, spread 10 -> 10 / 50005
+    expect(Number(m.spreadPct)).toBeCloseTo(10 / 50005, 9);
+    // bid notional: 10*0.01*50000 + 20*0.01*49990 = 5000 + 9998 = 14998; ask: 5*0.01*50010 + 5*0.01*50020 = 2500.5 + 2501 = 5001.5
+    expect(m.bidNotional).toBe('14998.00');
+    expect(m.askNotional).toBe('5001.50');
+    expect(Number(m.imbalance)).toBeCloseTo((14998 - 5001.5) / (14998 + 5001.5), 3);
+    expect(m.levels).toBe(2);
+    expect(computeBookMetrics({ bids: [], asks: [], ts: 1 }, BTC)).toBeNull();
+  });
+  it('computes open interest changes and percentile from a daily history', async () => {
+    const { computeOpenInterestMetrics } = await import('../src/index.js');
+    const hist = Array.from({ length: 30 }, (_, i) => ({ ts: i, value: String(1000 + i * 10) }));
+    const m = computeOpenInterestMetrics(hist)!;
+    expect(m.current).toBe('1290');
+    expect(Number(m.change1d)).toBeCloseTo(10 / 1280, 5);
+    expect(Number(m.change10d)).toBeCloseTo(100 / 1190, 5);
+    expect(m.percentile30d).toBe('1.000');
+    expect(m.points).toBe(30);
+    expect(computeOpenInterestMetrics([{ ts: 1, value: '5' }])!.change1d).toBe('');
+    expect(computeOpenInterestMetrics([])).toBeNull();
+  });
+});

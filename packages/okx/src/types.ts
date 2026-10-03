@@ -114,6 +114,9 @@ export interface OkxFundingRateHistory {
   method?: string;
 }
 
+/** [ts, open interest (USD), volume (USD)] from /rubik/stat/contracts/open-interest-volume */
+export type OkxOpenInterestVolumeRow = [string, string, string];
+
 export interface OkxOpenInterest {
   instType: OkxInstType;
   instId: string;

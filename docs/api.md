@@ -32,7 +32,7 @@ Request bodies are validated with the zod schemas in `packages/shared/src/schema
 | GET | `/api/book` | `?instId` | `OrderBook` (top 50 each side) |
 | GET | `/api/ticker` | `?instId` | `Ticker` |
 | GET | `/api/risk` | – | `{ config: RiskConfig, state: RiskState }` |
-| GET | `/api/signals` | `?instId&equity&riskPct&maxNotionalPct` (all optional) | `{ generatedAt, equity, reports: InstrumentSignalReport[] }` — daily trend-framework signals from confirmed 1D candles and recent funding; see `packages/shared/src/signals.ts` |
+| GET | `/api/signals` | `?instId&equity&riskPct&maxNotionalPct` (all optional) | `{ generatedAt, equity, reports: InstrumentSignalReport[] }` — daily trend-framework signals from confirmed 1D candles and recent funding, plus `structure` (visible book depth/imbalance over 20 levels, open interest level and 1d/10d change); see `packages/shared/src/signals.ts` |
 | POST | `/api/risk/kill-switch` | `KillSwitchRequest` | `RiskState` |
 
 `OrderPreview` (exported from `@pegasus/shared`):

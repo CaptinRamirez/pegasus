@@ -144,6 +144,12 @@ describe('api e2e against mock OKX', () => {
       expect(r.sizing).not.toBeNull();
       expect(D(r.sizing!.riskQuote).lte('750')).toBe(true); // 0.75% of 100k at most
       expect(r.signals!.reasons.length).toBeGreaterThan(3);
+      const st = (r as { structure?: { book: { imbalance: string; levels: number } | null; openInterest: { current: string; points: number } | null } }).structure;
+      expect(st?.book).not.toBeNull();
+      expect(st!.book!.levels).toBeGreaterThan(5);
+      expect(Math.abs(Number(st!.book!.imbalance))).toBeLessThanOrEqual(1);
+      expect(st?.openInterest).not.toBeNull();
+      expect(D(st!.openInterest!.current).gt(0)).toBe(true);
     }
     const one = data(await api<{ reports: Array<{ instId: string }> }>('GET', '/api/signals?instId=ETH-USDT-SWAP'));
     expect(one.reports.map((r) => r.instId)).toEqual(['ETH-USDT-SWAP']);

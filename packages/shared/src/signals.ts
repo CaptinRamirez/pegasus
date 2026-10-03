@@ -415,6 +415,8 @@ export interface InstrumentSignalReport {
   funding: FundingSummary | null;
   signals: TrendSignals;
   sizing: SizingPlan | null;
+  /** Execution context (book depth/imbalance, open interest); filled in by the API, null when unavailable */
+  structure: MarketStructure | null;
   params: TrendParams;
 }
 
@@ -434,5 +436,100 @@ export function buildSignalReport(
   const fundingSummary = funding ? summarizeFunding(funding, now, p.fundingWindowHours) : null;
   const signals = evaluateTrendSignals(indicators, regime, fundingSummary, p);
   const sizing = inst && equity !== null && D(equity).gt(0) ? planSize(equity, indicators.close, indicators.atr, inst, { ...s, atrStopMultiple: p.atrStopMultiple }) : null;
-  return { instId, indicators, regime, funding: fundingSummary, signals, sizing, params: p };
+  return { instId, indicators, regime, funding: fundingSummary, signals, sizing, structure: null, params: p };
+}
+
+// ---- market structure (execution context, not direction) ----
+
+export interface BookMetrics {
+  /** (best ask − best bid) / mid */
+  spreadPct: string;
+  /** Quote notional resting on the bid side within the measured depth */
+  bidNotional: string;
+  askNotional: string;
+  /** (bid − ask) / (bid + ask) over the measured depth: +1 all bids, −1 all asks */
+  imbalance: string;
+  /** Number of levels per side that were measured */
+  levels: number;
+  /** Book timestamp */
+  ts: number;
+}
+
+/**
+ * Depth and imbalance of the visible book. At a daily horizon this says
+ * nothing about direction; it is for execution (how much can be filled
+ * without walking the book) and for noticing abnormally thin markets.
+ */
+export function computeBookMetrics(
+  book: { bids: ReadonlyArray<readonly [string, string]>; asks: ReadonlyArray<readonly [string, string]>; ts: number },
+  inst: Instrument,
+  levels = 20,
+): BookMetrics | null {
+  const bestBid = book.bids[0];
+  const bestAsk = book.asks[0];
+  if (!bestBid || !bestAsk) return null;
+  const mid = D(bestBid[0]).plus(bestAsk[0]).div(2);
+  if (mid.lte(0)) return null;
+  const sumSide = (side: ReadonlyArray<readonly [string, string]>): Decimal => {
+    let acc = ZERO;
+    for (const lvl of side.slice(0, levels)) acc = acc.plus(notionalQuote(lvl[1], lvl[0], inst));
+    return acc;
+  };
+  const bid = sumSide(book.bids);
+  const ask = sumSide(book.asks);
+  const total = bid.plus(ask);
+  return {
+    spreadPct: D(bestAsk[0]).minus(bestBid[0]).div(mid).toFixed(),
+    bidNotional: bid.toFixed(2),
+    askNotional: ask.toFixed(2),
+    imbalance: total.isZero() ? '0' : bid.minus(ask).div(total).toFixed(4),
+    levels: Math.min(levels, book.bids.length, book.asks.length),
+    ts: book.ts,
+  };
+}
+
+export interface OpenInterestPoint {
+  ts: number;
+  /** Open interest in USD (or in contracts when `unit` says so) */
+  value: string;
+}
+
+export interface OpenInterestMetrics {
+  /** Latest open interest */
+  current: string;
+  unit: 'usd' | 'contracts';
+  /** Fractional change vs. 1 point back, '' when unavailable */
+  change1d: string;
+  /** Fractional change vs. 10 points back, '' when unavailable */
+  change10d: string;
+  /** Percentile of the current value within the supplied history (0..1), '' when < 10 points */
+  percentile30d: string;
+  points: number;
+}
+
+/**
+ * Open interest level and changes from a daily history (oldest first).
+ * Rising OI with rising price = new positions (fuel and fragility);
+ * falling OI on a sharp move = deleveraging (the move is being forced).
+ */
+export function computeOpenInterestMetrics(history: readonly OpenInterestPoint[], unit: 'usd' | 'contracts' = 'usd'): OpenInterestMetrics | null {
+  const pts = [...history].filter((p) => p.value !== '' && D(p.value).gt(0)).sort((a, b) => a.ts - b.ts);
+  const last = pts[pts.length - 1];
+  if (!last) return null;
+  const change = (back: number): string => {
+    const ref = pts[pts.length - 1 - back];
+    return ref ? D(last.value).div(ref.value).minus(1).toFixed(6) : '';
+  };
+  const window = pts.slice(-30);
+  let percentile = '';
+  if (window.length >= 10) {
+    const below = window.filter((p) => D(p.value).lt(last.value)).length;
+    percentile = D(below).div(window.length - 1).toFixed(3);
+  }
+  return { current: D(last.value).toFixed(), unit, change1d: change(1), change10d: change(10), percentile30d: percentile, points: pts.length };
+}
+
+export interface MarketStructure {
+  book: BookMetrics | null;
+  openInterest: OpenInterestMetrics | null;
 }
