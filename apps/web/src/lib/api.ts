@@ -10,6 +10,7 @@ import type {
   Fill,
   FillsQuery,
   Instrument,
+  InstrumentSignalReport,
   KillSwitchRequest,
   OrdType,
   Order,
@@ -60,6 +61,32 @@ export interface RiskResponse {
   state: RiskState;
 }
 
+/** Type alias (not interface) so it satisfies the http QueryParams index signature. */
+export type SignalsQuery = {
+  instId?: string;
+  /** Equity used for sizing; the server falls back to the account's total equity */
+  equity?: string;
+  riskPct?: string;
+  maxNotionalPct?: string;
+};
+
+export interface SignalReportError {
+  instId: string;
+  error: { code: string; message: string };
+}
+
+export type SignalReportRow = InstrumentSignalReport | SignalReportError;
+
+export interface SignalsResponse {
+  generatedAt: number;
+  equity: string | null;
+  reports: SignalReportRow[];
+}
+
+export function isSignalReportError(row: SignalReportRow): row is SignalReportError {
+  return 'error' in row;
+}
+
 export const api = {
   health: () => http<HealthResponse>('/api/health'),
   instruments: (token?: string) =>
@@ -85,4 +112,5 @@ export const api = {
   ticker: (instId: string) => http<Ticker>('/api/ticker', { query: { instId } }),
   risk: () => http<RiskResponse>('/api/risk'),
   setKillSwitch: (body: KillSwitchRequest) => http<RiskState>('/api/risk/kill-switch', { body }),
+  signals: (query: SignalsQuery = {}) => http<SignalsResponse>('/api/signals', { query }),
 };

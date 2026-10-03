@@ -9,11 +9,14 @@ import type {
   InstId,
   Instrument,
   MarkPrice,
+  OrdType,
   Order,
   OrderBook,
   Position,
   RiskConfig,
   RiskState,
+  Side,
+  SizeUnit,
   Ticker,
   Trade,
 } from '@pegasus/shared';
@@ -45,6 +48,20 @@ export interface TicketPrice {
   nonce: number;
 }
 
+/** A whole order ticket filled from elsewhere (e.g. a signal row); the instrument is selected with it. */
+export interface TicketPrefill {
+  instId: InstId;
+  side: Side;
+  ordType: OrdType;
+  px: string;
+  sizeValue: string;
+  sizeUnit: SizeUnit;
+  /** Changes on every apply so the same prefill can be re-applied */
+  nonce: number;
+}
+
+export type TicketPrefillInput = Omit<TicketPrefill, 'nonce'>;
+
 export interface TerminalState {
   token: string | null;
   demo: boolean;
@@ -71,6 +88,7 @@ export interface TerminalState {
   toasts: Toast[];
   nextToastId: number;
   ticketPrice: TicketPrice | null;
+  ticketPrefill: TicketPrefill | null;
 }
 
 export const LIMITS = {
@@ -110,5 +128,6 @@ export function initialState(token: string | null): TerminalState {
     toasts: [],
     nextToastId: 1,
     ticketPrice: null,
+    ticketPrefill: null,
   };
 }

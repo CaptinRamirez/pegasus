@@ -15,6 +15,7 @@ export function OrderTicket() {
   const posMode = useStore((s) => s.account?.posMode ?? null);
   const killSwitch = useStore(getKillSwitch);
   const ticketPrice = useStore((s) => s.ticketPrice);
+  const ticketPrefill = useStore((s) => s.ticketPrefill);
   const pushToast = useStore((s) => s.pushToast);
   const [form, setForm] = useState<TicketForm>(defaultForm);
   const patch = (p: Partial<TicketForm>) => setForm((f) => ({ ...f, ...p }));
@@ -27,6 +28,13 @@ export function OrderTicket() {
   useEffect(() => {
     if (ticketPrice !== null) setForm((f) => ({ ...f, px: ticketPrice.px }));
   }, [ticketPrice]);
+
+  // Runs after the instId reset above (same commit when the prefill switched instrument), so the prefill wins.
+  useEffect(() => {
+    if (ticketPrefill === null || ticketPrefill.instId !== instId) return;
+    const { side, ordType, px, sizeValue, sizeUnit } = ticketPrefill;
+    setForm((f) => ({ ...f, side, ordType, px, sizeValue, sizeUnit, posSide: side === 'buy' ? 'long' : 'short', reduceOnly: false }));
+  }, [ticketPrefill, instId]);
 
   const longShort = posMode === 'long_short_mode';
   const request = useMemo(() => buildRequest(form, instId, posMode), [form, instId, posMode]);
