@@ -131,10 +131,27 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
     return this.state;
   }
 
-  /** Pre-trade checks. Returns the first violated rule. */
+  /**
+   * Pre-trade checks. Returns the first violated rule.
+   *
+   * Orders that can only reduce exposure (reduce-only in net mode, or the
+   * closing direction of a leg in long/short mode) are never blocked by the
+   * kill switch or the exposure rules: a halt must stop new risk, not exits.
+   * They still pass the price band so a mistyped exit price is caught.
+   */
   check(input: RiskCheckInput): RiskCheckResult {
     const c = this.config;
-    if (this.state.killSwitch) return fail('KILL_SWITCH', `trading halted: ${this.state.killSwitchReason}`);
+    const closing = isClosingOrder(input);
+    if (this.state.killSwitch && !closing) return fail('KILL_SWITCH', `trading halted: ${this.state.killSwitchReason}`);
+
+    const ref = D(input.refPrice);
+    if (input.ordType !== 'market' && input.px !== '' && ref.gt(0)) {
+      const dev = D(input.px).minus(ref).abs().div(ref);
+      if (dev.gt(c.priceBandPct)) {
+        return fail('PRICE_BAND', `limit price ${input.px} is ${dev.mul(100).toFixed(2)}% away from the mark price ${ref.toFixed()} (band ${D(c.priceBandPct).mul(100).toFixed(2)}%)`, { px: input.px, refPrice: ref.toFixed(), deviationPct: dev.toFixed(6) });
+      }
+    }
+    if (closing) return pass();
 
     const notional = D(input.notional);
     if (notional.gt(c.maxOrderNotional)) {
@@ -146,18 +163,9 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
     if (input.openOrders.length + 1 > c.maxOpenOrders && input.ordType !== 'market') {
       return fail('MAX_OPEN_ORDERS', `already ${input.openOrders.length} open orders (limit ${c.maxOpenOrders})`, { openOrders: input.openOrders.length, limit: c.maxOpenOrders });
     }
-    const ref = D(input.refPrice);
-    if (input.ordType !== 'market' && input.px !== '' && ref.gt(0)) {
-      const dev = D(input.px).minus(ref).abs().div(ref);
-      if (dev.gt(c.priceBandPct)) {
-        return fail('PRICE_BAND', `limit price ${input.px} is ${dev.mul(100).toFixed(2)}% away from the mark price ${ref.toFixed()} (band ${D(c.priceBandPct).mul(100).toFixed(2)}%)`, { px: input.px, refPrice: ref.toFixed(), deviationPct: dev.toFixed(6) });
-      }
-    }
     if (input.ordType === 'market' && input.estSlippagePct !== '' && D(input.estSlippagePct).gt(c.maxSlippagePct)) {
       return fail('MAX_SLIPPAGE', `estimated slippage ${D(input.estSlippagePct).mul(100).toFixed(3)}% exceeds ${D(c.maxSlippagePct).mul(100).toFixed(3)}%`, { estSlippagePct: input.estSlippagePct, limit: c.maxSlippagePct });
       }
-    if (input.reduceOnly) return pass();
-
     // Projected exposure after this order and every resting order fill.
     const exposure = projectExposure(input);
     if (exposure.instrument.gt(c.maxPositionNotionalPerInstrument)) {
@@ -196,6 +204,17 @@ export function positionSignedNotional(p: Position, inst?: Instrument): ReturnTy
   }
   const isShort = p.posSide === 'short' || (p.posSide === 'net' && pos.lt(0));
   return isShort ? abs.neg() : abs;
+}
+
+/**
+ * True when the order can only reduce exposure: reduce-only in net mode (the
+ * exchange enforces it) or, in long/short mode, the closing direction of a leg
+ * (sell a long / buy a short; the exchange rejects over-closing).
+ */
+export function isClosingOrder(input: Pick<RiskCheckInput, 'posSide' | 'side' | 'reduceOnly'>): boolean {
+  if (input.posSide === 'long') return input.side === 'sell';
+  if (input.posSide === 'short') return input.side === 'buy';
+  return input.reduceOnly;
 }
 
 /** Unfilled notional of a resting order, or null for orders without a price (market remainders). */

@@ -66,7 +66,7 @@ Error codes returned by the API:
 | `VALIDATION` | request body failed schema validation (`details.issues`) |
 | `UNKNOWN_INSTRUMENT` | instId not tracked |
 | `SIZING` | size/price could not be normalised (`details.code` = `SizingError.code`) |
-| `RISK_REJECTED` | risk engine rejected (`details` = `RiskCheckResult`) |
+| `RISK_REJECTED` | risk engine rejected (`details` = `RiskCheckResult`). While the kill switch is on only orders that reduce exposure (reduce-only in net mode, the closing direction of a leg in long/short mode) are accepted |
 | `EXCHANGE` | OKX returned an error (`details.okxCode`, `details.okxMsg`) |
 | `NOT_CONNECTED` | private stream not ready (503) |
 | `NO_PRICE` | no reference price for the instrument yet (503) |
