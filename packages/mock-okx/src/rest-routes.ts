@@ -158,6 +158,27 @@ export class RestRouter {
       const f = e.fundingRate(instId);
       return f ? ok([f]) : err('51001', 'Instrument ID does not exist.');
     });
+    // Settled records, newest first, at the regular 8h cadence ending with the last settlement before now.
+    this.get('/api/v5/public/funding-rate-history', false, (q) => {
+      const instId = q.get('instId');
+      if (!instId) return err('50014', 'Parameter instId cannot be empty.');
+      const f = e.fundingRate(instId);
+      if (!f) return err('51001', 'Instrument ID does not exist.');
+      const interval = Number(f.nextFundingTime) - Number(f.fundingTime);
+      const limit = Math.min(100, Math.max(1, Number(q.get('limit') ?? '100') || 100));
+      const before = q.get('before');
+      const after = q.get('after');
+      const rows: Array<{ instType: 'SWAP'; instId: string; fundingRate: string; realizedRate: string; fundingTime: string; method: string }> = [];
+      let t = Number(f.fundingTime) - interval; // last settled time
+      while (rows.length < limit && t > 0) {
+        const inAfter = after === null || t < Number(after);
+        const inBefore = before === null || t > Number(before);
+        if (inAfter && inBefore) rows.push({ instType: 'SWAP', instId, fundingRate: f.fundingRate, realizedRate: f.fundingRate, fundingTime: String(t), method: 'next_period' });
+        t -= interval;
+        if (before !== null && t <= Number(before)) break;
+      }
+      return ok(rows);
+    });
   }
 
   private registerAccount(): void {

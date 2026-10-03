@@ -9,6 +9,7 @@ import type { Deps } from './deps.js';
 import { AppError } from './errors.js';
 import { registerAccountRoutes } from './routes/account.js';
 import { registerMarketRoutes } from './routes/market.js';
+import { registerSignalRoutes } from './routes/signals.js';
 import { registerTradingRoutes } from './routes/trading.js';
 
 function tokenMatches(expected: string, provided: string | undefined): boolean {
@@ -75,6 +76,7 @@ export async function buildServer(deps: Deps): Promise<FastifyInstance> {
   await registerMarketRoutes(app, deps);
   await registerTradingRoutes(app, deps);
   await registerAccountRoutes(app, deps);
+  await registerSignalRoutes(app, deps);
 
   return app;
 }

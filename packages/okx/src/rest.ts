@@ -10,10 +10,12 @@ import type {
   OkxClosePositionParams,
   OkxFill,
   OkxFundingRate,
+  OkxFundingRateHistory,
   OkxInstType,
   OkxInstrument,
   OkxLeverageInfo,
   OkxMarkPrice,
+  OkxOpenInterest,
   OkxOrder,
   OkxOrderAck,
   OkxPlaceOrderParams,
@@ -179,6 +181,15 @@ export class OkxRestClient {
     const [f] = await this.getData<OkxFundingRate>('/api/v5/public/funding-rate', { instId });
     if (!f) throw new OkxApiError('EMPTY', `no funding rate for ${instId}`, '/api/v5/public/funding-rate');
     return f;
+  }
+
+  /** Settled funding records, newest first. OKX only keeps roughly the last three months. */
+  getFundingRateHistory(instId: string, opts: { before?: number; after?: number; limit?: number } = {}): Promise<OkxFundingRateHistory[]> {
+    return this.getData<OkxFundingRateHistory>('/api/v5/public/funding-rate-history', { instId, before: opts.before, after: opts.after, limit: opts.limit });
+  }
+
+  getOpenInterest(instType: OkxInstType, instId?: string): Promise<OkxOpenInterest[]> {
+    return this.getData<OkxOpenInterest>('/api/v5/public/open-interest', { instType, instId });
   }
 
   // ---- account ----

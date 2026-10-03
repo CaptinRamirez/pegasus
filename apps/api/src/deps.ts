@@ -6,6 +6,7 @@ import type { AccountService } from './services/account.js';
 import type { MarketDataService } from './services/market-data.js';
 import type { OrderService } from './services/order-service.js';
 import type { RiskEngine } from './services/risk-engine.js';
+import type { SignalsService } from './services/signals.js';
 import type { Hub } from './ws/hub.js';
 
 export interface Deps {
@@ -17,5 +18,6 @@ export interface Deps {
   account: AccountService;
   risk: RiskEngine;
   orders: OrderService;
+  signals: SignalsService;
   hub: Hub;
 }

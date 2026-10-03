@@ -105,6 +105,26 @@ export interface OkxTime {
   ts: string;
 }
 
+export interface OkxFundingRateHistory {
+  instType: OkxInstType;
+  instId: string;
+  fundingRate: string;
+  realizedRate: string;
+  fundingTime: string;
+  method?: string;
+}
+
+export interface OkxOpenInterest {
+  instType: OkxInstType;
+  instId: string;
+  /** Open interest in contracts */
+  oi: string;
+  /** Open interest in currency */
+  oiCcy: string;
+  oiUsd?: string;
+  ts: string;
+}
+
 export interface OkxAccountConfig {
   uid: string;
   acctLv: string;

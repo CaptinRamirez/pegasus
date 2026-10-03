@@ -9,6 +9,7 @@ import { AccountService } from './services/account.js';
 import { MarketDataService } from './services/market-data.js';
 import { OrderService } from './services/order-service.js';
 import { RiskEngine } from './services/risk-engine.js';
+import { SignalsService } from './services/signals.js';
 import { Hub } from './ws/hub.js';
 
 async function main(): Promise<void> {
@@ -47,8 +48,9 @@ async function main(): Promise<void> {
   const risk = new RiskEngine(config.risk, store, log);
   await risk.init();
   const orders = new OrderService(clients, market, account, risk, store, log, { defaultTdMode: config.defaultTdMode, wsTrading: config.okx.wsTrading });
+  const signals = new SignalsService(clients, market, account, log);
   const hub = new Hub(config, market, account, risk, log);
-  const deps: Deps = { config, log, clients, store, market, account, risk, orders, hub };
+  const deps: Deps = { config, log, clients, store, market, account, risk, orders, signals, hub };
 
   // Risk wiring: equity feeds the daily PnL / loss limit; exposure feeds the state shown in the UI.
   account.on('balance', (b) => risk.updateEquity(b.totalEq));
