@@ -50,7 +50,7 @@ OKX_WS_BUSINESS_URL=ws://127.0.0.1:9100/ws/v5/business \
 OKX_API_KEY=mock OKX_API_SECRET=mock OKX_API_PASSPHRASE=mock \
 pnpm dev:api
 
-# 终端 3：前端 http://localhost:5173
+# 终端 3：前端 http://localhost:5174
 pnpm dev:web
 ```
 
