@@ -34,6 +34,14 @@ pnpm install
 cp .env.example .env        # 填 OKX_API_KEY / SECRET / PASSPHRASE，API_TOKEN 改成随机串
 ```
 
+### 一键启动
+
+```bash
+pnpm start        # Windows 上也可以直接双击 start.bat
+```
+
+按 `.env` 的配置依次启动后端和前端，就绪后自动打开浏览器；`OKX_REST_URL` 指向本机时会先把 mock 交易所一并启动。关闭窗口或 Ctrl+C 停止全部服务。下面三种方式用它启动时，区别只在 `.env` 的内容（方式一的那组变量写进 `.env` 即可）；`pnpm dev:*` 仍可用于单独调试某一个服务。
+
 ### 方式一：离线，用本地 mock 交易所
 
 不需要 OKX 账号，也不需要外网。
