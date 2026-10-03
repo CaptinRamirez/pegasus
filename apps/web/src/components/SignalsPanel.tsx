@@ -120,6 +120,14 @@ export function SignalsPanel() {
               Funding 3d
               <span className="sub">annualised</span>
             </th>
+            <th title="Depth imbalance (bid − ask) / (bid + ask) over the visible book; execution context only, not a direction signal">
+              Book
+              <span className="sub">spread · depth</span>
+            </th>
+            <th title="Open interest: current level, 10-day change (1-day change)">
+              OI
+              <span className="sub">10d chg (1d)</span>
+            </th>
             <th className="left">Signals</th>
             <th>
               Stop long

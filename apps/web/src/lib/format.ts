@@ -96,6 +96,44 @@ export function fmtPct(fraction: DecimalInput | null | undefined, dp = 2, signed
   return `${signed && d.gt(0) ? '+' : ''}${pct}%`;
 }
 
+/** Formats a fraction (0.00003) as basis points ("0.3 bp"). */
+export function fmtBp(fraction: DecimalInput | null | undefined, dp = 1): string {
+  const d = safeDecimal(fraction);
+  if (d === null) return DASH;
+  return `${d.mul(10_000).toFixed(dp)} bp`;
+}
+
+export type CompactUnit = 'K' | 'M' | 'B';
+
+const COMPACT_SCALES: ReadonlyArray<readonly [CompactUnit, Decimal]> = [
+  ['B', D('1000000000')],
+  ['M', D('1000000')],
+  ['K', D('1000')],
+];
+
+/** The K/M/B unit the absolute value reaches, or null below 1,000 (or when unparseable). */
+export function compactUnit(v: DecimalInput | null | undefined): CompactUnit | null {
+  const d = safeDecimal(v);
+  if (d === null) return null;
+  const abs = d.abs();
+  for (const [unit, scale] of COMPACT_SCALES) if (abs.gte(scale)) return unit;
+  return null;
+}
+
+/**
+ * Compact K/M/B formatting: "4.2B", "812M", "1.2K", "950". One decimal below 10 units,
+ * none above. Pass `unit` to force a scale so comparable values line up ("1.2M / 0.9M").
+ */
+export function fmtCompact(v: DecimalInput | null | undefined, unit?: CompactUnit | null): string {
+  const d = safeDecimal(v);
+  if (d === null) return DASH;
+  const u = unit === undefined ? compactUnit(d) : unit;
+  if (u === null) return groupThousands(d.toFixed(0));
+  const scale = COMPACT_SCALES.find(([name]) => name === u)?.[1] ?? D(1);
+  const scaled = d.div(scale);
+  return `${scaled.toFixed(scaled.abs().lt(10) ? 1 : 0)}${u}`;
+}
+
 /** (last - open) / open, or null when open is zero/unparseable. */
 export function pctChange(last: DecimalInput | null | undefined, open: DecimalInput | null | undefined): Decimal | null {
   const l = safeDecimal(last);

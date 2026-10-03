@@ -87,8 +87,17 @@ const report: InstrumentSignalReport = {
     minUnitRiskQuote: '37.48',
     note: 'notional capped at 10% of equity; actual risk below 0.75%',
   },
+  structure: {
+    book: { spreadPct: '0.00003', bidNotional: '1234567.00', askNotional: '912345.00', imbalance: '0.1201', levels: 20, ts: 1_700_000_000_000 },
+    openInterest: { current: '4210000000', unit: 'usd', change1d: '0.012', change10d: '0.083', percentile30d: '0.867', points: 30 },
+  },
   params: DEFAULT_TREND_PARAMS,
 };
+
+/** Cells of the first signal row: 10 = Book, 11 = OI (after instrument, regime, close, MA, ATR, entry, exit, ER, vol ratio, funding). */
+const BOOK_CELL = 10;
+const OI_CELL = 11;
+const rowCells = (container: HTMLElement): HTMLTableCellElement[] => [...container.querySelectorAll<HTMLTableCellElement>('tr.signal-row td')];
 
 const response: SignalsResponse = {
   generatedAt: 1_700_000_000_000,
@@ -170,6 +179,15 @@ describe('SignalsPanel', () => {
     expect(text).toContain('10,000.00 USDT');
     expect(text).toContain('599.67 USDT');
 
+    const cells = rowCells(container);
+    const book = cells[BOOK_CELL];
+    expect(book?.textContent).toBe('+12%0.3 bp · 1.2M / 0.9M');
+    expect(book?.getAttribute('title')).toBe('Visible depth over 20 levels; execution context only, not a direction signal.');
+    const oi = cells[OI_CELL];
+    expect(oi?.textContent).toBe('4.2B+8.3% (+1.2%)');
+    expect(oi?.querySelector('.sub .pos')?.textContent).toBe('+8.3%');
+    expect(oi?.querySelector('.sub .neg')).toBeNull();
+
     const error = container.querySelector('.signal-error');
     expect(error?.textContent).toBe('NOT_ENOUGH_DATA: need at least 101 confirmed daily bars, got 40');
     expect(error?.closest('tr')?.textContent).toContain('ETH-USDT-SWAP');
@@ -182,9 +200,40 @@ describe('SignalsPanel', () => {
     await click(container.querySelector('tr.signal-row'));
     const reasons = container.querySelector('.signal-reasons');
     expect(reasons?.textContent).toBe('close 61000 vs 55d high 60500: breakout up\nregime trend: new entries allowed');
-    expect(container.querySelector('.signal-note')?.textContent).toContain(report.sizing?.note);
+    expect(container.querySelector('.signal-note:not(.signal-structure)')?.textContent).toContain(report.sizing?.note);
+    expect(container.querySelector('.signal-structure')?.textContent).toBe(
+      'structure: book imbalance +12%, spread 0.3 bp, depth 1.2M/0.9M · OI 4.2B, 1d +1.2%, 10d +8.3%, pct 0.87',
+    );
     await click(container.querySelector('tr.signal-row'));
     expect(container.querySelector('.signal-reasons')).toBeNull();
+  });
+
+  it('shows n/a for the Book and OI cells when the structure block is missing', async () => {
+    signals.mockResolvedValue({ ...response, reports: [{ ...report, structure: null }] });
+    await render();
+    const cells = rowCells(container);
+    expect(cells[BOOK_CELL]?.textContent).toBe('n/a');
+    expect(cells[BOOK_CELL]?.classList.contains('dim')).toBe(true);
+    expect(cells[OI_CELL]?.textContent).toBe('n/a');
+    expect(cells[OI_CELL]?.classList.contains('dim')).toBe(true);
+    await click(container.querySelector('tr.signal-row'));
+    expect(container.querySelector('.signal-structure')?.textContent).toBe('structure: book n/a · OI n/a');
+  });
+
+  it('formats OI in contracts, dashes unavailable changes and colours a large 10d drop red', async () => {
+    const structure: InstrumentSignalReport['structure'] = {
+      book: null,
+      openInterest: { current: '1234567', unit: 'contracts', change1d: '', change10d: '-0.0712', percentile30d: '', points: 12 },
+    };
+    signals.mockResolvedValue({ ...response, reports: [{ ...report, structure }] });
+    await render();
+    const cells = rowCells(container);
+    expect(cells[BOOK_CELL]?.textContent).toBe('n/a');
+    const oi = cells[OI_CELL];
+    expect(oi?.textContent).toBe('1,234,567-7.1% (–)');
+    expect(oi?.querySelector('.sub .neg')?.textContent).toBe('-7.1%');
+    await click(container.querySelector('tr.signal-row'));
+    expect(container.querySelector('.signal-structure')?.textContent).toBe('structure: book n/a · OI 1,234,567, 1d –, 10d -7.1%, pct –');
   });
 
   it('Apply fills the ticket prefill in the store and the order ticket picks it up', async () => {

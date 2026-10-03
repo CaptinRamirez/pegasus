@@ -1,10 +1,13 @@
-import type { Instrument, InstrumentSignalReport, Side, SizingPlan } from '@pegasus/shared';
+import type { BookMetrics, Instrument, InstrumentSignalReport, MarketStructure, OpenInterestMetrics, Side, SizingPlan } from '@pegasus/shared';
 import { isSignalReportError, type SignalReportRow } from '../../lib/api';
-import { DASH, coinDecimals, fmtContracts, fmtNum, fmtPct, fmtPx, fmtSigned } from '../../lib/format';
+import { DASH, coinDecimals, compactUnit, fmtBp, fmtCompact, fmtContracts, fmtNum, fmtPct, fmtPx, fmtSigned, safeDecimal } from '../../lib/format';
 import { RegimeBadge, SignalBadges } from './badges';
 
 /** Number of columns in the SignalsPanel header; the expanded details row spans them all. */
-const SIGNAL_COLUMNS = 18;
+const SIGNAL_COLUMNS = 20;
+
+/** |10-day OI change| above which the figure is coloured (fraction). */
+const OI_CHANGE_HIGHLIGHT = '0.05';
 
 interface Props {
   row: SignalReportRow;
@@ -67,6 +70,70 @@ function SizingCells({ sizing, inst }: { sizing: SizingPlan | null; inst: Instru
   );
 }
 
+/** Bid/ask depth in one shared K/M/B unit so the two sides read on the same scale ("1.2M / 0.9M"). */
+function depthParts(book: BookMetrics): [string, string] {
+  const bid = safeDecimal(book.bidNotional);
+  const ask = safeDecimal(book.askNotional);
+  const larger = bid !== null && ask !== null ? (bid.abs().gte(ask.abs()) ? bid : ask) : (bid ?? ask);
+  const unit = compactUnit(larger);
+  return [fmtCompact(book.bidNotional, unit), fmtCompact(book.askNotional, unit)];
+}
+
+const bookTitle = (book: BookMetrics): string => `Visible depth over ${book.levels} levels; execution context only, not a direction signal.`;
+
+const fmtOiLevel = (oi: OpenInterestMetrics): string => (oi.unit === 'usd' ? fmtCompact(oi.current) : fmtNum(oi.current, 0));
+
+/** Signed percent with one decimal; the dash for '' (unavailable). */
+const fmtChange = (fraction: string): string => fmtPct(fraction, 1, true);
+
+/** 'pos' / 'neg' when the 10-day OI change is beyond ±5%, '' otherwise (or when unavailable). */
+function oiChangeTone(change10d: string): string {
+  const d = safeDecimal(change10d);
+  if (d === null) return '';
+  if (d.gt(OI_CHANGE_HIGHLIGHT)) return 'pos';
+  if (d.lt(`-${OI_CHANGE_HIGHLIGHT}`)) return 'neg';
+  return '';
+}
+
+function StructureCells({ structure }: { structure: MarketStructure | null }) {
+  const book = structure?.book ?? null;
+  const oi = structure?.openInterest ?? null;
+  return (
+    <>
+      {book === null ? (
+        <td className="dim">n/a</td>
+      ) : (
+        <td title={bookTitle(book)}>
+          {fmtPct(book.imbalance, 0, true)}
+          <span className="sub">
+            {fmtBp(book.spreadPct)} · {depthParts(book).join(' / ')}
+          </span>
+        </td>
+      )}
+      {oi === null ? (
+        <td className="dim">n/a</td>
+      ) : (
+        <td title={`Open interest in ${oi.unit === 'usd' ? 'USD' : 'contracts'} over ${oi.points} daily points; 10-day change (1-day change)`}>
+          {fmtOiLevel(oi)}
+          <span className="sub">
+            <span className={oiChangeTone(oi.change10d)}>{fmtChange(oi.change10d)}</span> ({fmtChange(oi.change1d)})
+          </span>
+        </td>
+      )}
+    </>
+  );
+}
+
+/** One-line summary of the structure block for the expanded details row. */
+function structureLine(structure: MarketStructure | null): string {
+  const book = structure?.book ?? null;
+  const oi = structure?.openInterest ?? null;
+  const bookPart = book === null ? 'book n/a' : `book imbalance ${fmtPct(book.imbalance, 0, true)}, spread ${fmtBp(book.spreadPct)}, depth ${depthParts(book).join('/')}`;
+  const oiPart =
+    oi === null ? 'OI n/a' : `OI ${fmtOiLevel(oi)}, 1d ${fmtChange(oi.change1d)}, 10d ${fmtChange(oi.change10d)}, pct ${fmtNum(oi.percentile30d, 2)}`;
+  return `${bookPart} · ${oiPart}`;
+}
+
 export function SignalRow({ row, inst, expanded, onToggle, onApply }: Props) {
   if (isSignalReportError(row)) {
     return (
@@ -127,6 +194,7 @@ export function SignalRow({ row, inst, expanded, onToggle, onApply }: Props) {
             </>
           )}
         </td>
+        <StructureCells structure={row.structure} />
         <td className="left">
           <SignalBadges signals={row.signals} />
         </td>
@@ -151,6 +219,7 @@ export function SignalRow({ row, inst, expanded, onToggle, onApply }: Props) {
         <tr className="signal-details">
           <td colSpan={SIGNAL_COLUMNS}>
             <pre className="signal-reasons">{row.signals.reasons.join('\n')}</pre>
+            <div className="signal-note signal-structure">structure: {structureLine(row.structure)}</div>
             {sizing === null ? (
               <div className="signal-note dim">sizing: no equity available (sign in with a funded account or pass ?equity)</div>
             ) : (
