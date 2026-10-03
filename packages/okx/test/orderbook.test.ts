@@ -46,4 +46,12 @@ describe('LocalOrderBook', () => {
     b.reset();
     expect(b.ready).toBe(false);
   });
+
+  it('ignores the retired checksum that OKX now fixes to 0, but still checks sequence', () => {
+    const b = new LocalOrderBook('BTC-USDT-SWAP');
+    expect(b.apply('snapshot', data([['101', '2'], ['100', '1']], [['102', '5']], { seqId: 1, prevSeqId: -1, checksum: 0 }))).toBeNull();
+    expect(b.apply('update', data([['100', '0']], [['103', '1']], { seqId: 2, prevSeqId: 1, checksum: 0 }))).toBeNull();
+    expect(b.topBids(5)).toEqual([['101', '2']]);
+    expect(b.apply('update', data([], [['102', '1']], { seqId: 4, prevSeqId: 3, checksum: 0 }))).toMatch(/sequence gap/);
+  });
 });
