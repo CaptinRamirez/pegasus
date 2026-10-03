@@ -4,8 +4,9 @@ import { FillsTable } from './FillsTable';
 import { OrdersTable } from './OrdersTable';
 import { Panel } from './Panel';
 import { PositionsTable } from './PositionsTable';
+import { SignalsPanel } from './SignalsPanel';
 
-type Tab = 'positions' | 'orders' | 'history' | 'fills';
+type Tab = 'positions' | 'orders' | 'history' | 'fills' | 'signals';
 
 export function BottomTabs() {
   const [tab, setTab] = useState<Tab>('positions');
@@ -17,6 +18,7 @@ export function BottomTabs() {
     { id: 'orders', label: 'Open orders', count: orders },
     { id: 'history', label: 'History' },
     { id: 'fills', label: 'Fills' },
+    { id: 'signals', label: 'Signals' },
   ];
 
   const title = (
@@ -36,6 +38,7 @@ export function BottomTabs() {
       {tab === 'orders' && <OrdersTable mode="open" />}
       {tab === 'history' && <OrdersTable mode="history" />}
       {tab === 'fills' && <FillsTable />}
+      {tab === 'signals' && <SignalsPanel />}
     </Panel>
   );
 }

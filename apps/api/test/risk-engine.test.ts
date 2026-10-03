@@ -50,10 +50,17 @@ describe('RiskEngine.check', () => {
   it('passes a plain order', () => {
     expect(engine().check(input()).ok).toBe(true);
   });
-  it('rejects when the kill switch is on', () => {
+  it('rejects when the kill switch is on, but lets exits through', () => {
     const e = engine();
     e.setKillSwitch(true, 'test');
     expect(e.check(input()).code).toBe('KILL_SWITCH');
+    // net mode: reduce-only exits pass; long/short mode: the closing direction passes
+    expect(e.check(input({ reduceOnly: true, side: 'sell' })).ok).toBe(true);
+    expect(e.check(input({ posSide: 'long', side: 'sell' })).ok).toBe(true);
+    expect(e.check(input({ posSide: 'short', side: 'buy' })).ok).toBe(true);
+    expect(e.check(input({ posSide: 'long', side: 'buy' })).code).toBe('KILL_SWITCH');
+    // exits still go through the fat-finger band
+    expect(e.check(input({ reduceOnly: true, side: 'sell', px: '40000' })).code).toBe('PRICE_BAND');
     e.setKillSwitch(false, '');
     expect(e.check(input()).ok).toBe(true);
   });
@@ -125,9 +132,12 @@ describe('RiskEngine.check', () => {
     expect(engine().check(input({ notional: '1000', positions })).code).toBe('MAX_TOTAL_NOTIONAL');
     expect(engine().check(input({ notional: '500', positions })).ok).toBe(true);
   });
-  it('skips exposure limits for reduce-only orders', () => {
+  it('skips exposure and notional limits for reduce-only orders', () => {
     const positions = [position('BTC-USDT-SWAP', '19500')];
     expect(engine().check(input({ notional: '5000', side: 'sell', reduceOnly: true, positions })).ok).toBe(true);
+    expect(engine().check(input({ notional: '9000', side: 'sell', reduceOnly: true, positions })).ok).toBe(true);
+    // closing a hedged leg is also exempt
+    expect(engine().check(input({ notional: '9000', side: 'sell', posSide: 'long', positions: [position('BTC-USDT-SWAP', '19500', 'long', '39')] })).ok).toBe(true);
   });
 });
 

@@ -10,10 +10,13 @@ import type {
   OkxClosePositionParams,
   OkxFill,
   OkxFundingRate,
+  OkxFundingRateHistory,
   OkxInstType,
   OkxInstrument,
   OkxLeverageInfo,
   OkxMarkPrice,
+  OkxOpenInterest,
+  OkxOpenInterestVolumeRow,
   OkxOrder,
   OkxOrderAck,
   OkxPlaceOrderParams,
@@ -179,6 +182,23 @@ export class OkxRestClient {
     const [f] = await this.getData<OkxFundingRate>('/api/v5/public/funding-rate', { instId });
     if (!f) throw new OkxApiError('EMPTY', `no funding rate for ${instId}`, '/api/v5/public/funding-rate');
     return f;
+  }
+
+  /** Settled funding records, newest first. OKX only keeps roughly the last three months. */
+  getFundingRateHistory(instId: string, opts: { before?: number; after?: number; limit?: number } = {}): Promise<OkxFundingRateHistory[]> {
+    return this.getData<OkxFundingRateHistory>('/api/v5/public/funding-rate-history', { instId, before: opts.before, after: opts.after, limit: opts.limit });
+  }
+
+  getOpenInterest(instType: OkxInstType, instId?: string): Promise<OkxOpenInterest[]> {
+    return this.getData<OkxOpenInterest>('/api/v5/public/open-interest', { instType, instId });
+  }
+
+  /**
+   * Aggregated open interest and volume history for a currency across OKX
+   * contracts (trading statistics), newest first. `period` is 5m, 1H or 1D.
+   */
+  getOpenInterestVolume(ccy: string, period: '5m' | '1H' | '1D' = '1D', opts: { begin?: number; end?: number } = {}): Promise<OkxOpenInterestVolumeRow[]> {
+    return this.getData<OkxOpenInterestVolumeRow>('/api/v5/rubik/stat/contracts/open-interest-volume', { ccy, period, begin: opts.begin, end: opts.end });
   }
 
   // ---- account ----

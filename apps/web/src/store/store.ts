@@ -3,7 +3,7 @@ import type { CandleBar, Fill, InstId, Instrument, Order, ServerMessage } from '
 import { readStoredToken, writeStoredToken } from '../lib/http';
 import type { WsStatus } from '../lib/ws';
 import { applyServerMessage, mergeFills, mergeOrderHistory, pushToast } from './reducers';
-import { emptyMarket, initialState, type MarketData, type TerminalState, type ToastKind } from './types';
+import { emptyMarket, initialState, type MarketData, type TerminalState, type TicketPrefillInput, type ToastKind } from './types';
 
 export interface TerminalActions {
   setToken: (token: string | null) => void;
@@ -16,6 +16,8 @@ export interface TerminalActions {
   seedOrderHistory: (orders: Order[]) => void;
   seedFills: (fills: Fill[]) => void;
   setTicketPrice: (px: string) => void;
+  /** Selects the prefill's instrument and hands the whole ticket to the order form. */
+  applyTicketPrefill: (prefill: TicketPrefillInput) => void;
   reset: () => void;
 }
 
@@ -32,7 +34,7 @@ export const useStore = create<TerminalStore>()((set, get) => ({
   setWsStatus: (wsStatus) => set({ wsStatus }),
   selectInstrument: (instId) => {
     if (get().selectedInstId === instId) return;
-    set({ selectedInstId: instId, ticketPrice: null });
+    set({ selectedInstId: instId, ticketPrice: null, ticketPrefill: null });
   },
   setBar: (bar) => {
     if (get().bar === bar) return;
@@ -46,6 +48,12 @@ export const useStore = create<TerminalStore>()((set, get) => ({
   seedOrderHistory: (orders) => set((s) => ({ orderHistory: mergeOrderHistory(s.orderHistory, orders) })),
   seedFills: (fills) => set((s) => ({ fills: mergeFills(s.fills, fills) })),
   setTicketPrice: (px) => set((s) => ({ ticketPrice: { px, nonce: (s.ticketPrice?.nonce ?? 0) + 1 } })),
+  applyTicketPrefill: (prefill) =>
+    set((s) => ({
+      selectedInstId: prefill.instId,
+      ticketPrice: null,
+      ticketPrefill: { ...prefill, nonce: (s.ticketPrefill?.nonce ?? 0) + 1 },
+    })),
   reset: () => set({ ...initialState(get().token) }),
 }));
 

@@ -19,6 +19,7 @@ import { AccountService } from '../src/services/account.js';
 import { MarketDataService } from '../src/services/market-data.js';
 import { OrderService } from '../src/services/order-service.js';
 import { RiskEngine } from '../src/services/risk-engine.js';
+import { SignalsService } from '../src/services/signals.js';
 import { Hub } from '../src/ws/hub.js';
 
 const TOKEN = 'test-token';
@@ -83,8 +84,9 @@ beforeAll(async () => {
   const risk = new RiskEngine(config.risk, store, log);
   await risk.init();
   const orders = new OrderService(clients, market, account, risk, store, log, { defaultTdMode: config.defaultTdMode, wsTrading: true });
+  const signals = new SignalsService(clients, market, account, log);
   const hub = new Hub(config, market, account, risk, log);
-  deps = { config, log, clients, store, market, account, risk, orders, hub };
+  deps = { config, log, clients, store, market, account, risk, orders, signals, hub };
   account.on('balance', (b) => risk.updateEquity(b.totalEq));
   account.on('positions', () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional()));
   account.on('order', () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional()));
@@ -125,6 +127,32 @@ describe('api e2e against mock OKX', () => {
     expect(candles[0]!.ts).toBeLessThan(candles[candles.length - 1]!.ts);
     const ticker = data(await api<{ last: string }>('GET', '/api/ticker?instId=BTC-USDT-SWAP'));
     expect(D(ticker.last).gt(0)).toBe(true);
+  });
+
+  it('computes daily signal reports with indicators, regime and sizing', async () => {
+    const res = data(await api<{ equity: string | null; reports: Array<{ instId: string; indicators?: { bars: number; atr: string; entryHigh: string }; regime?: string; funding?: { avg8h: string; samples: number } | null; sizing?: { contracts: string; riskQuote: string } | null; signals?: { reasons: string[] }; error?: { code: string; message: string } }> }>('GET', '/api/signals?equity=100000'));
+    expect(res.reports).toHaveLength(2);
+    expect(res.equity).toBe('100000');
+    for (const r of res.reports) {
+      expect(r.error).toBeUndefined();
+      expect(r.indicators!.bars).toBeGreaterThanOrEqual(100);
+      expect(D(r.indicators!.atr).gt(0)).toBe(true);
+      expect(['trend', 'neutral', 'range', 'crisis']).toContain(r.regime);
+      expect(r.funding).not.toBeNull();
+      expect(r.funding!.samples).toBeGreaterThanOrEqual(9); // three days of 8h settlements
+      expect(D(r.funding!.avg8h).eq('0.0001')).toBe(true);
+      expect(r.sizing).not.toBeNull();
+      expect(D(r.sizing!.riskQuote).lte('750')).toBe(true); // 0.75% of 100k at most
+      expect(r.signals!.reasons.length).toBeGreaterThan(3);
+      const st = (r as { structure?: { book: { imbalance: string; levels: number } | null; openInterest: { current: string; points: number } | null } }).structure;
+      expect(st?.book).not.toBeNull();
+      expect(st!.book!.levels).toBeGreaterThan(5);
+      expect(Math.abs(Number(st!.book!.imbalance))).toBeLessThanOrEqual(1);
+      expect(st?.openInterest).not.toBeNull();
+      expect(D(st!.openInterest!.current).gt(0)).toBe(true);
+    }
+    const one = data(await api<{ reports: Array<{ instId: string }> }>('GET', '/api/signals?instId=ETH-USDT-SWAP'));
+    expect(one.reports.map((r) => r.instId)).toEqual(['ETH-USDT-SWAP']);
   });
 
   it('previews a limit order with sizing in coin and risk ok', async () => {

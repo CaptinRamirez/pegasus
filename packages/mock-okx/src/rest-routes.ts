@@ -158,6 +158,46 @@ export class RestRouter {
       const f = e.fundingRate(instId);
       return f ? ok([f]) : err('51001', 'Instrument ID does not exist.');
     });
+    this.get('/api/v5/public/open-interest', false, (q) => {
+      const instType = q.get('instType');
+      if (!instType) return err('50014', 'Parameter instType cannot be empty.');
+      if (instType !== 'SWAP') return ok([]);
+      const instId = q.get('instId') ?? undefined;
+      const insts = e.instrumentList(instId);
+      if (instId && insts.length === 0) return err('51001', 'Instrument ID does not exist.');
+      const now = String(e.now());
+      return ok(insts.map((inst) => {
+        // Synthetic open interest: a fixed base per instrument plus whatever the user holds.
+        const base = inst.instId.startsWith('BTC') ? 250000 : 400000;
+        const held = e.positions(inst.instId).reduce((acc, p) => acc + Math.abs(Number(p.pos)), 0);
+        const oi = base + held;
+        const ticker = e.ticker(inst.instId);
+        const px = ticker ? Number(ticker.last) : 0;
+        const ctVal = Number(inst.ctVal);
+        return { instType: 'SWAP', instId: inst.instId, oi: String(oi), oiCcy: String(oi * ctVal), oiUsd: String(oi * ctVal * px), ts: now };
+      }));
+    });
+    // Settled records, newest first, at the regular 8h cadence ending with the last settlement before now.
+    this.get('/api/v5/public/funding-rate-history', false, (q) => {
+      const instId = q.get('instId');
+      if (!instId) return err('50014', 'Parameter instId cannot be empty.');
+      const f = e.fundingRate(instId);
+      if (!f) return err('51001', 'Instrument ID does not exist.');
+      const interval = Number(f.nextFundingTime) - Number(f.fundingTime);
+      const limit = Math.min(100, Math.max(1, Number(q.get('limit') ?? '100') || 100));
+      const before = q.get('before');
+      const after = q.get('after');
+      const rows: Array<{ instType: 'SWAP'; instId: string; fundingRate: string; realizedRate: string; fundingTime: string; method: string }> = [];
+      let t = Number(f.fundingTime) - interval; // last settled time
+      while (rows.length < limit && t > 0) {
+        const inAfter = after === null || t < Number(after);
+        const inBefore = before === null || t > Number(before);
+        if (inAfter && inBefore) rows.push({ instType: 'SWAP', instId, fundingRate: f.fundingRate, realizedRate: f.fundingRate, fundingTime: String(t), method: 'next_period' });
+        t -= interval;
+        if (before !== null && t <= Number(before)) break;
+      }
+      return ok(rows);
+    });
   }
 
   private registerAccount(): void {

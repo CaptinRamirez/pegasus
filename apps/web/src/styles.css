@@ -299,3 +299,51 @@ a:hover { text-decoration: underline; }
 .gate-card { width: 360px; background: var(--bg-1); border: 1px solid var(--border); border-radius: 6px; padding: 24px; }
 .gate-card h1 { margin: 0 0 4px; font-size: 16px; letter-spacing: 0.12em; }
 .gate-card p { margin: 0 0 16px; color: var(--fg-muted); }
+
+/* ---------- signals ---------- */
+.signals { display: flex; flex-direction: column; min-width: max-content; min-height: 100%; }
+.signals-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg-muted);
+  font-size: 11px;
+  position: sticky;
+  left: 0;
+  width: 100%;
+  background: var(--bg-1);
+}
+.signals-table { width: auto; min-width: 100%; }
+.signals-table th { vertical-align: bottom; line-height: 1.2; }
+.signals-table td { vertical-align: top; line-height: 1.3; }
+.signals-table .sub { display: block; color: var(--fg-dim); font-size: 10.5px; font-weight: 400; }
+.signal-row { cursor: pointer; }
+.signal-row .chev { display: inline-block; width: 10px; color: var(--fg-dim); font-size: 10px; }
+.signal-badge {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: var(--radius);
+  font-family: var(--font);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+.signal-badge + .signal-badge, td > .signal-badge.signal-capped { margin-left: 4px; }
+.regime-trend { background: var(--up-bg); color: var(--up); }
+.regime-neutral { background: var(--bg-3); color: var(--fg-muted); }
+.regime-range { background: var(--warn-bg); color: var(--warn); }
+.regime-crisis { background: var(--down-bg); color: var(--down); }
+.signal-long { background: var(--up-bg); color: var(--up); }
+.signal-short { background: var(--down-bg); color: var(--down); }
+.signal-exit { background: var(--warn-bg); color: var(--warn); }
+.signal-capped { background: var(--warn-bg); color: var(--warn); }
+.signals-table td.signal-note-cell, .signals-table td.signal-error { text-align: left; white-space: normal; max-width: 520px; font-family: var(--font); }
+.signal-details > td { padding: 6px 10px 8px 24px; background: var(--bg); white-space: normal; text-align: left; }
+.signal-details:hover { background: transparent; }
+.signal-reasons { margin: 0; font-family: var(--mono); font-size: 11px; line-height: 1.5; white-space: pre-wrap; color: var(--fg); }
+.signal-note { margin-top: 4px; font-size: 11px; color: var(--fg-muted); }
+.signal-note.neg { color: var(--down); }
