@@ -71,7 +71,8 @@ export class LocalOrderBook {
     this.sortedAsks = null;
     this._ts = Number(data.ts);
     if (data.seqId !== undefined) this._seqId = data.seqId;
-    if (data.checksum !== undefined) {
+    // OKX retired the checksum (2026-06-23): the field is still sent but fixed to 0, and seqId/prevSeqId is the integrity check.
+    if (data.checksum !== undefined && data.checksum !== 0) {
       const expected = data.checksum;
       const actual = bookChecksum(this.topBids(25), this.topAsks(25));
       if (expected !== actual) return `checksum mismatch: expected ${expected}, got ${actual}`;

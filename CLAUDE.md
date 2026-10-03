@@ -22,3 +22,4 @@ Single-user OKX perpetual-swap manual trading terminal. pnpm monorepo, TypeScrip
 - `pnpm --filter @pegasus/api test` runs unit tests plus the e2e suite against the in-process mock exchange (`test/e2e.test.ts`).
 - `TEST_DATABASE_URL=postgres://... pnpm --filter @pegasus/api exec vitest run test/pg-store.test.ts` exercises the Postgres store (skipped without the variable).
 - `pnpm dev:mock`, `pnpm dev:api`, `pnpm dev:web` for local development (see README for the env overrides that point the api at the mock).
+- `pnpm start` (or double-clicking `start.bat` on Windows) runs `scripts/start.mjs`: the mock exchange when `.env` points `OKX_REST_URL` at this machine, then the api, then the web terminal, and opens the browser.

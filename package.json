@@ -9,6 +9,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "start": "node scripts/start.mjs",
     "dev": "pnpm -r --parallel --filter ./apps/* dev",
     "dev:api": "pnpm --filter @pegasus/api dev",
     "dev:web": "pnpm --filter @pegasus/web dev",
