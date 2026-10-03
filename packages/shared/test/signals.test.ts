@@ -110,12 +110,14 @@ describe('regime and signals', () => {
     expect(sig.longEntry).toBe(true);
     expect(sig.shortEntry).toBe(false);
     expect(sig.longExit).toBe(false);
-    // crowded funding blocks the long
-    const blocked = evaluateTrendSignals(ind, regime, { avg8h: '0.0008', latest8h: '0.0008', samples: 9, annualized: '0.9' });
+    // only extreme funding (above 0.1%/8h) blocks the long; 0.08%/8h is still allowed
+    expect(evaluateTrendSignals(ind, regime, { avg8h: '0.0008', latest8h: '0.0008', samples: 9, annualized: '0.9' }).longEntry).toBe(true);
+    const blocked = evaluateTrendSignals(ind, regime, { avg8h: '0.0012', latest8h: '0.0012', samples: 9, annualized: '1.3' });
     expect(blocked.longEntry).toBe(false);
     expect(blocked.reasons.some((r) => r.includes('long blocked'))).toBe(true);
-    // a ranging regime blocks new entries
-    expect(evaluateTrendSignals(ind, 'range', null).longEntry).toBe(false);
+    // the range filter is off by default and blocks entries only when enabled
+    expect(evaluateTrendSignals(ind, 'range', null).longEntry).toBe(true);
+    expect(evaluateTrendSignals(ind, 'range', null, { ...DEFAULT_TREND_PARAMS, useRangeFilter: true }).longEntry).toBe(false);
   });
 
   it('classifies a flat zigzag near the MA as range and a 3-sigma day as crisis', () => {

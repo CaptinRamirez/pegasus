@@ -34,12 +34,24 @@ export interface TrendParams {
   crisisVolRatio: string;
   /** |daily return| above this many daily sigmas is a crisis day */
   crisisReturnSigmas: string;
-  /** Do not open longs when the 3-day 8h-normalised funding average is above this (fraction, e.g. 0.0005 = 0.05%) */
+  /**
+   * Do not open longs when the 3-day 8h-normalised funding average is above this
+   * (fraction, 0.001 = 0.1%/8h ≈ 110% p.a.). Positive funding is the normal state
+   * of an uptrend (the perp premium is largely explained by past returns), so only
+   * the extreme tail is treated as a crowding/tail-risk gate.
+   */
   maxFundingForLong: string;
   /** Do not open shorts when the 3-day 8h-normalised funding average is below this */
   minFundingForShort: string;
   /** Window for the funding average, hours */
   fundingWindowHours: number;
+  /**
+   * Block new entries in the 'range' regime (low efficiency ratio near the MA).
+   * Off by default: the evidence for choppiness filters on top of a slow trend
+   * filter is weak and every extra filter is a degree of freedom to overfit.
+   * Turn it on only after a backtest shows it helps out of sample.
+   */
+  useRangeFilter: boolean;
 }
 
 export const DEFAULT_TREND_PARAMS: TrendParams = {
@@ -55,9 +67,10 @@ export const DEFAULT_TREND_PARAMS: TrendParams = {
   volLongPeriod: 100,
   crisisVolRatio: '2',
   crisisReturnSigmas: '3',
-  maxFundingForLong: '0.0005',
-  minFundingForShort: '-0.0003',
+  maxFundingForLong: '0.001',
+  minFundingForShort: '-0.0005',
   fundingWindowHours: 72,
+  useRangeFilter: false,
 };
 
 /** Minimum number of confirmed bars the indicators need. */
@@ -315,11 +328,11 @@ export function evaluateTrendSignals(ind: IndicatorSnapshot, regime: Regime, fun
   const breakDown = close.lt(ind.entryLow);
   const fundingOkLong = funding === null || D(funding.avg8h).lte(p.maxFundingForLong);
   const fundingOkShort = funding === null || D(funding.avg8h).gte(p.minFundingForShort);
-  const regimeOk = regime !== 'range';
+  const regimeOk = !p.useRangeFilter || regime !== 'range';
   reasons.push(`close ${ind.close} vs ${p.entryChannel}d high ${ind.entryHigh}: ${breakUp ? 'breakout up' : 'no'}`);
   reasons.push(`close vs ${p.entryChannel}d low ${ind.entryLow}: ${breakDown ? 'breakout down' : 'no'}`);
   reasons.push(`close vs MA${p.trendMaPeriod} ${ind.ma}: ${aboveMa ? 'above' : belowMa ? 'below' : 'equal'}`);
-  reasons.push(`regime ${regime}: ${regimeOk ? 'new entries allowed' : 'no new entries'}`);
+  reasons.push(`regime ${regime}: ${regimeOk ? 'new entries allowed' : 'no new entries'}${p.useRangeFilter ? '' : ' (range filter off)'}`);
   reasons.push(funding === null ? 'funding: no data (filter skipped)' : `funding 3d avg ${D(funding.avg8h).mul(100).toFixed(4)}%/8h: long ${fundingOkLong ? 'ok' : 'blocked'}, short ${fundingOkShort ? 'ok' : 'blocked'}`);
   const longExit = close.lt(ind.exitLow);
   const shortExit = close.gt(ind.exitHigh);
