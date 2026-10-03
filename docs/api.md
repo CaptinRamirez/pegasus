@@ -14,7 +14,7 @@ Request bodies are validated with the zod schemas in `packages/shared/src/schema
 
 | Method | Path | Body / query | Returns |
 | --- | --- | --- | --- |
-| GET | `/api/health` | – | `{ ok: true, demo, connection: ConnectionStatus, serverTime }` (no auth) |
+| GET | `/api/health` | – | `{ ok: true, demo, connection: ConnectionStatus, clients, store: 'memory' \| 'postgres', serverTime }` (no auth) |
 | GET | `/api/instruments` | – | `Instrument[]` (tracked instruments) |
 | GET | `/api/account` | – | `{ config: AccountConfig, balance: Balance \| null }` |
 | GET | `/api/account/leverage` | `?instId&mgnMode` | `{ instId, mgnMode, posSide, lever }[]` |
@@ -34,7 +34,7 @@ Request bodies are validated with the zod schemas in `packages/shared/src/schema
 | GET | `/api/risk` | – | `{ config: RiskConfig, state: RiskState }` |
 | POST | `/api/risk/kill-switch` | `KillSwitchRequest` | `RiskState` |
 
-`OrderPreview`:
+`OrderPreview` (exported from `@pegasus/shared`):
 
 ```ts
 interface OrderPreview {
@@ -50,9 +50,13 @@ interface OrderPreview {
   refPrice: string;        // price used for notional / conversions
   notionalQuote: string;   // USD(T) notional of this order
   estSlippagePct: string;  // market orders only, from the order book; '' otherwise
+  lever: string;           // leverage currently configured for the instrument/mode
   risk: RiskCheckResult;   // ok=false means the order would be rejected
 }
 ```
+
+`reduceOnly` is only forwarded to OKX in net position mode; in long/short mode it is ignored and a
+position is closed by sending the opposite side with the position's `posSide`.
 
 Error codes returned by the API:
 
@@ -64,8 +68,14 @@ Error codes returned by the API:
 | `SIZING` | size/price could not be normalised (`details.code` = `SizingError.code`) |
 | `RISK_REJECTED` | risk engine rejected (`details` = `RiskCheckResult`) |
 | `EXCHANGE` | OKX returned an error (`details.okxCode`, `details.okxMsg`) |
-| `NOT_CONNECTED` | private stream not ready |
-| `INTERNAL` | anything else |
+| `NOT_CONNECTED` | private stream not ready (503) |
+| `NO_PRICE` | no reference price for the instrument yet (503) |
+| `NO_BOOK` | market order refused because the order book is not synced, so slippage cannot be estimated (503) |
+| `NO_DATA` | `/api/ticker` or `/api/book` has nothing yet for the instrument (503) |
+| `LEVERAGE_UNAVAILABLE` | the leverage lookup failed; the order is refused rather than checked against an unknown leverage (503) |
+| `ORDER_STATUS_UNKNOWN` | the exchange did not acknowledge the order and it could not be found by `clOrdId`; it may still be live, check open orders before retrying (504) |
+| `NOT_FOUND` | unknown route (404) |
+| `INTERNAL` | anything else (500) |
 
 ## WebSocket `/ws?token=<API_TOKEN>`
 

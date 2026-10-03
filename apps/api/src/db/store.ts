@@ -47,7 +47,8 @@ export class MemoryStore implements Store {
   }
 
   async upsertFill(fill: Fill): Promise<void> {
-    this.fills.set(fill.tradeId, fill);
+    // OKX trade ids are only unique per instrument
+    this.fills.set(`${fill.instId}:${fill.tradeId}`, fill);
   }
 
   async listOrders(opts: ListOrdersOptions): Promise<Order[]> {

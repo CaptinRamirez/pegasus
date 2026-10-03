@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS orders_inst_ctime_idx ON orders (inst_id, c_time);
 CREATE INDEX IF NOT EXISTS orders_cl_ord_id_idx ON orders (cl_ord_id);
 CREATE TABLE IF NOT EXISTS fills (
-  trade_id text PRIMARY KEY,
+  trade_id text NOT NULL,
   ord_id text NOT NULL,
   cl_ord_id text NOT NULL DEFAULT '',
   inst_id text NOT NULL,
@@ -41,8 +41,20 @@ CREATE TABLE IF NOT EXISTS fills (
   fee numeric NOT NULL DEFAULT 0,
   fee_ccy text NOT NULL DEFAULT '',
   exec_type text NOT NULL DEFAULT '',
-  ts bigint NOT NULL
+  ts bigint NOT NULL,
+  PRIMARY KEY (inst_id, trade_id)
 );
+-- Upgrade journals created with the old single-column key: OKX trade ids are only unique per instrument.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'fills_pkey' AND conrelid = 'fills'::regclass AND array_length(conkey, 1) = 1
+  ) THEN
+    ALTER TABLE fills DROP CONSTRAINT fills_pkey;
+    ALTER TABLE fills ADD CONSTRAINT fills_pkey PRIMARY KEY (inst_id, trade_id);
+  END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS fills_inst_ts_idx ON fills (inst_id, ts);
 CREATE TABLE IF NOT EXISTS risk_events (
   id serial PRIMARY KEY,

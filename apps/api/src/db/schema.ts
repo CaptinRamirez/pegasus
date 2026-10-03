@@ -1,4 +1,4 @@
-import { bigint, boolean, index, jsonb, numeric, pgTable, serial, text } from 'drizzle-orm/pg-core';
+import { bigint, boolean, index, jsonb, numeric, pgTable, primaryKey, serial, text } from 'drizzle-orm/pg-core';
 
 export const orders = pgTable(
   'orders',
@@ -26,10 +26,11 @@ export const orders = pgTable(
   (t) => [index('orders_inst_ctime_idx').on(t.instId, t.cTime), index('orders_cl_ord_id_idx').on(t.clOrdId)],
 );
 
+/** OKX trade ids are only unique per instrument, so the key is (instId, tradeId). */
 export const fills = pgTable(
   'fills',
   {
-    tradeId: text('trade_id').primaryKey(),
+    tradeId: text('trade_id').notNull(),
     ordId: text('ord_id').notNull(),
     clOrdId: text('cl_ord_id').notNull().default(''),
     instId: text('inst_id').notNull(),
@@ -42,7 +43,7 @@ export const fills = pgTable(
     execType: text('exec_type').notNull().default(''),
     ts: bigint('ts', { mode: 'number' }).notNull(),
   },
-  (t) => [index('fills_inst_ts_idx').on(t.instId, t.ts)],
+  (t) => [primaryKey({ name: 'fills_pkey', columns: [t.instId, t.tradeId] }), index('fills_inst_ts_idx').on(t.instId, t.ts)],
 );
 
 export const riskEvents = pgTable('risk_events', {
