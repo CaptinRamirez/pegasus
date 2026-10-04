@@ -1,7 +1,7 @@
 import { D, Decimal, ZERO, floorToStep, type DecimalInput } from './decimal.js';
 import { contractsToCoin, notionalQuote } from './sizing.js';
 import { utcDayStart } from './time.js';
-import type { Candle, Instrument } from './types.js';
+import type { Candle, Instrument, Lang } from './types.js';
 
 /**
  * Daily signal arithmetic for the low-frequency trend framework (docs/strategy.md).
@@ -434,11 +434,14 @@ export interface TrendSignals {
   shortEntry: boolean;
   longExit: boolean;
   shortExit: boolean;
-  /** Human-readable explanation of every condition, true or false */
+  /** Human-readable explanation of every condition, true or false, in the language asked for */
   reasons: string[];
 }
 
-export function evaluateTrendSignals(ind: IndicatorSnapshot, regime: Regime, funding: FundingSummary | null, p: TrendParams = DEFAULT_TREND_PARAMS): TrendSignals {
+const REGIME_ZH: Record<Regime, string> = { trend: '趋势', neutral: '中性', range: '震荡', crisis: '危机' };
+
+export function evaluateTrendSignals(ind: IndicatorSnapshot, regime: Regime, funding: FundingSummary | null, p: TrendParams = DEFAULT_TREND_PARAMS, lang: Lang = 'en'): TrendSignals {
+  const zh = lang === 'zh';
   const close = D(ind.close);
   const reasons: string[] = [];
   const aboveMa = close.gt(ind.ma);
@@ -448,32 +451,63 @@ export function evaluateTrendSignals(ind: IndicatorSnapshot, regime: Regime, fun
   const fundingOkLong = funding === null || D(funding.avg8h).lt(p.maxFundingForLong);
   const fundingOkShort = funding === null || D(funding.avg8h).gt(p.minFundingForShort);
   const regimeOk = !p.useRangeFilter || regime !== 'range';
-  const closesAgo = (ago: number): string => (ago === 0 ? 'the last bar' : `the bar ${ago} ${ago === 1 ? 'close' : 'closes'} ago`);
-  reasons.push(`close ${ind.close} vs ${p.entryChannel}d high ${ind.entryHigh}: ${breakUp ? 'breakout up' : 'no'}`);
-  reasons.push(`close vs ${p.entryChannel}d low ${ind.entryLow}: ${breakDown ? 'breakout down' : 'no'}`);
-  if (!p.allowShort) reasons.push('shorts off (allowShort = false): no short entries; the short exit is still evaluated');
-  reasons.push(`close vs MA${p.trendMaPeriod} ${ind.ma}: ${aboveMa ? 'above' : belowMa ? 'below' : 'equal'}`);
-  if (regime === 'crisis') {
-    const halfSize = `new entries at half size (x${p.crisisSizeMultiplier})`;
-    if (ind.crisisDaysAgo === null) {
-      reasons.push(`regime crisis: ${p.volShortPeriod}d/${p.volLongPeriod}d vol ratio ${D(ind.volRatio).toFixed(2)} above ${p.crisisVolRatio}; ${halfSize} while it lasts`);
-    } else {
-      const left = p.crisisHoldBars - 1 - ind.crisisDaysAgo;
-      reasons.push(`regime crisis: ${closesAgo(ind.crisisDaysAgo)} was a crisis day; ${halfSize} for this close and ${left} more ${left === 1 ? 'close' : 'closes'}`);
-    }
-  } else {
-    reasons.push(`regime ${regime}: ${regimeOk ? 'new entries allowed' : 'no new entries'}${p.useRangeFilter ? '' : ' (range filter off)'}`);
-  }
-  for (const b of ind.shockBars) {
-    const move = D(b.return).exp().minus(1).mul(100);
-    const oi = b.oiChange === '' ? 'OI change unavailable, counted as crisis' : `OI ${D(b.oiChange).gte(0) ? '+' : ''}${D(b.oiChange).mul(100).toFixed(1)}%: ${b.crisis ? 'crisis' : 'not a deleveraging day'}`;
-    reasons.push(`shock: ${closesAgo(b.daysAgo)} moved ${move.gte(0) ? '+' : ''}${move.toFixed(2)}% (more than ${p.crisisReturnSigmas} sigma); ${oi}`);
-  }
-  const fundingShort = p.allowShort ? `, short ${fundingOkShort ? 'ok' : 'blocked'}` : '';
-  reasons.push(funding === null ? 'funding: no data (filter skipped)' : `funding 3d avg ${D(funding.avg8h).mul(100).toFixed(4)}%/8h: long ${fundingOkLong ? 'ok' : 'blocked'}${fundingShort}`);
   const longExit = close.lt(ind.exitLow);
   const shortExit = close.gt(ind.exitHigh);
-  reasons.push(`exit: close vs ${p.exitChannel}d low ${ind.exitLow} → long exit ${longExit ? 'YES' : 'no'}; vs ${p.exitChannel}d high ${ind.exitHigh} → short exit ${shortExit ? 'YES' : 'no'}`);
+  const shockMove = (b: ShockBar): string => {
+    const move = D(b.return).exp().minus(1).mul(100);
+    return `${move.gte(0) ? '+' : ''}${move.toFixed(2)}%`;
+  };
+  const shockOi = (b: ShockBar): string => `${D(b.oiChange).gte(0) ? '+' : ''}${D(b.oiChange).mul(100).toFixed(1)}%`;
+  const fundingAvg = funding === null ? '' : D(funding.avg8h).mul(100).toFixed(4);
+  if (zh) {
+    const closesAgo = (ago: number): string => (ago === 0 ? '最近一根K线' : `${ago} 根之前的K线`);
+    reasons.push(`收盘价 ${ind.close} 对比 ${p.entryChannel} 日高点 ${ind.entryHigh}：${breakUp ? '向上突破' : '否'}`);
+    reasons.push(`收盘价对比 ${p.entryChannel} 日低点 ${ind.entryLow}：${breakDown ? '向下突破' : '否'}`);
+    if (!p.allowShort) reasons.push('做空已关闭（allowShort = false）：不开空仓；空头离场信号仍会计算');
+    reasons.push(`收盘价对比 MA${p.trendMaPeriod} ${ind.ma}：${aboveMa ? '高于' : belowMa ? '低于' : '等于'}`);
+    if (regime === 'crisis') {
+      const halfSize = `新开仓按半仓（x${p.crisisSizeMultiplier}）`;
+      if (ind.crisisDaysAgo === null) {
+        reasons.push(`市场状态 危机：${p.volShortPeriod} 日/${p.volLongPeriod} 日波动率比值 ${D(ind.volRatio).toFixed(2)} 高于 ${p.crisisVolRatio}；持续期间${halfSize}`);
+      } else {
+        const left = p.crisisHoldBars - 1 - ind.crisisDaysAgo;
+        reasons.push(`市场状态 危机：${closesAgo(ind.crisisDaysAgo)}是危机日；本次收盘及之后 ${left} 次收盘${halfSize}`);
+      }
+    } else {
+      reasons.push(`市场状态 ${REGIME_ZH[regime]}：${regimeOk ? '允许新开仓' : '不开新仓'}${p.useRangeFilter ? '' : '（震荡过滤已关闭）'}`);
+    }
+    for (const b of ind.shockBars) {
+      const oi = b.oiChange === '' ? '持仓量变化未知，按危机处理' : `持仓量 ${shockOi(b)}：${b.crisis ? '危机' : '非去杠杆日'}`;
+      reasons.push(`冲击：${closesAgo(b.daysAgo)}涨跌 ${shockMove(b)}（超过 ${p.crisisReturnSigmas} 倍标准差）；${oi}`);
+    }
+    const fundingShort = p.allowShort ? `，做空${fundingOkShort ? '允许' : '禁止'}` : '';
+    reasons.push(funding === null ? '资金费率：无数据（已跳过过滤）' : `资金费率 3 日均值 ${fundingAvg}%/8h：做多${fundingOkLong ? '允许' : '禁止'}${fundingShort}`);
+    reasons.push(`离场：收盘价对比 ${p.exitChannel} 日低点 ${ind.exitLow} → 多头离场 ${longExit ? '是' : '否'}；对比 ${p.exitChannel} 日高点 ${ind.exitHigh} → 空头离场 ${shortExit ? '是' : '否'}`);
+  } else {
+    const closesAgo = (ago: number): string => (ago === 0 ? 'the last bar' : `the bar ${ago} ${ago === 1 ? 'close' : 'closes'} ago`);
+    reasons.push(`close ${ind.close} vs ${p.entryChannel}d high ${ind.entryHigh}: ${breakUp ? 'breakout up' : 'no'}`);
+    reasons.push(`close vs ${p.entryChannel}d low ${ind.entryLow}: ${breakDown ? 'breakout down' : 'no'}`);
+    if (!p.allowShort) reasons.push('shorts off (allowShort = false): no short entries; the short exit is still evaluated');
+    reasons.push(`close vs MA${p.trendMaPeriod} ${ind.ma}: ${aboveMa ? 'above' : belowMa ? 'below' : 'equal'}`);
+    if (regime === 'crisis') {
+      const halfSize = `new entries at half size (x${p.crisisSizeMultiplier})`;
+      if (ind.crisisDaysAgo === null) {
+        reasons.push(`regime crisis: ${p.volShortPeriod}d/${p.volLongPeriod}d vol ratio ${D(ind.volRatio).toFixed(2)} above ${p.crisisVolRatio}; ${halfSize} while it lasts`);
+      } else {
+        const left = p.crisisHoldBars - 1 - ind.crisisDaysAgo;
+        reasons.push(`regime crisis: ${closesAgo(ind.crisisDaysAgo)} was a crisis day; ${halfSize} for this close and ${left} more ${left === 1 ? 'close' : 'closes'}`);
+      }
+    } else {
+      reasons.push(`regime ${regime}: ${regimeOk ? 'new entries allowed' : 'no new entries'}${p.useRangeFilter ? '' : ' (range filter off)'}`);
+    }
+    for (const b of ind.shockBars) {
+      const oi = b.oiChange === '' ? 'OI change unavailable, counted as crisis' : `OI ${shockOi(b)}: ${b.crisis ? 'crisis' : 'not a deleveraging day'}`;
+      reasons.push(`shock: ${closesAgo(b.daysAgo)} moved ${shockMove(b)} (more than ${p.crisisReturnSigmas} sigma); ${oi}`);
+    }
+    const fundingShort = p.allowShort ? `, short ${fundingOkShort ? 'ok' : 'blocked'}` : '';
+    reasons.push(funding === null ? 'funding: no data (filter skipped)' : `funding 3d avg ${fundingAvg}%/8h: long ${fundingOkLong ? 'ok' : 'blocked'}${fundingShort}`);
+    reasons.push(`exit: close vs ${p.exitChannel}d low ${ind.exitLow} → long exit ${longExit ? 'YES' : 'no'}; vs ${p.exitChannel}d high ${ind.exitHigh} → short exit ${shortExit ? 'YES' : 'no'}`);
+  }
   return {
     longEntry: breakUp && aboveMa && regimeOk && fundingOkLong,
     shortEntry: p.allowShort && breakDown && belowMa && regimeOk && fundingOkShort,
@@ -500,7 +534,7 @@ export type EntrySide = 'long' | 'short';
 export interface SizeAdjustment {
   /** Product of the applied cuts, "1" when none applies */
   multiplier: string;
-  /** One human-readable entry per applied cut, e.g. "short x0.5" */
+  /** One human-readable entry per applied cut, e.g. "short x0.5" (in Chinese "做空 x0.5") */
   adjustments: string[];
 }
 
@@ -514,16 +548,17 @@ const NO_ADJUSTMENT: SizeAdjustment = { multiplier: '1', adjustments: [] };
  * funding is extreme but the open interest change is unknown the cut is applied
  * anyway: where the framework is silent the smaller size wins.
  */
-export function sizeAdjustment(side: EntrySide, regime: Regime, funding: FundingSummary | null, oiChange10d: DecimalInput | null, p: TrendParams = DEFAULT_TREND_PARAMS): SizeAdjustment {
+export function sizeAdjustment(side: EntrySide, regime: Regime, funding: FundingSummary | null, oiChange10d: DecimalInput | null, p: TrendParams = DEFAULT_TREND_PARAMS, lang: Lang = 'en'): SizeAdjustment {
+  const zh = lang === 'zh';
   let multiplier = D(1);
   const adjustments: string[] = [];
   if (side === 'short') {
     multiplier = multiplier.mul(p.shortSizeMultiplier);
-    adjustments.push(`short x${p.shortSizeMultiplier}`);
+    adjustments.push(`${zh ? '做空' : 'short'} x${p.shortSizeMultiplier}`);
   }
   if (regime === 'crisis') {
     multiplier = multiplier.mul(p.crisisSizeMultiplier);
-    adjustments.push(`crisis x${p.crisisSizeMultiplier}`);
+    adjustments.push(`${zh ? '危机' : 'crisis'} x${p.crisisSizeMultiplier}`);
   }
   if (funding !== null) {
     const avg = D(funding.avg8h);
@@ -531,8 +566,10 @@ export function sizeAdjustment(side: EntrySide, regime: Regime, funding: Funding
     const oiKnown = oiChange10d !== null && oiChange10d !== '';
     if (avg.abs().gt(p.crowdedFunding) && crowdedSide === side && (!oiKnown || D(oiChange10d).gt(p.crowdedOiChange))) {
       multiplier = multiplier.mul(p.crowdedSizeMultiplier);
-      const oi = oiKnown ? `OI +${D(oiChange10d).mul(100).toFixed(0)}% in 10d` : '10d OI change unavailable';
-      adjustments.push(`crowded x${p.crowdedSizeMultiplier} (funding ${avg.mul(100).toFixed(2)}%/8h, ${oi})`);
+      const oiPct = oiKnown ? D(oiChange10d).mul(100).toFixed(0) : '';
+      const fundingPct = avg.mul(100).toFixed(2);
+      if (zh) adjustments.push(`拥挤 x${p.crowdedSizeMultiplier}（资金费率 ${fundingPct}%/8h，${oiKnown ? `持仓量 10 日 +${oiPct}%` : '10 日持仓量变化未知'}）`);
+      else adjustments.push(`crowded x${p.crowdedSizeMultiplier} (funding ${fundingPct}%/8h, ${oiKnown ? `OI +${oiPct}% in 10d` : '10d OI change unavailable'})`);
     }
   }
   return { multiplier: multiplier.toFixed(), adjustments };
@@ -570,7 +607,8 @@ export interface SizingPlan {
  * to contracts and rounded down. The minimum order size is checked last. The
  * notional, coin and risk reported are those of the rounded order.
  */
-export function planSize(equity: DecimalInput, entryPx: DecimalInput, atrValue: DecimalInput, inst: Instrument, s: SizingParams = DEFAULT_SIZING, adj: SizeAdjustment = NO_ADJUSTMENT): SizingPlan {
+export function planSize(equity: DecimalInput, entryPx: DecimalInput, atrValue: DecimalInput, inst: Instrument, s: SizingParams = DEFAULT_SIZING, adj: SizeAdjustment = NO_ADJUSTMENT, lang: Lang = 'en'): SizingPlan {
+  const zh = lang === 'zh';
   const eq = D(equity);
   const px = D(entryPx);
   const stopDist = D(atrValue).mul(s.atrStopMultiple);
@@ -585,12 +623,23 @@ export function planSize(equity: DecimalInput, entryPx: DecimalInput, atrValue: 
   const perContractNotional = inst.ctType === 'linear' ? unit.mul(px) : unit;
   const minUnitRisk = perContractNotional.mul(inst.minSz).mul(distPct);
   let contracts = floorToStep(targetNotional.div(perContractNotional), inst.lotSz);
-  let note = capped ? `notional capped at ${D(s.maxNotionalPct).mul(100).toFixed(0)}% of equity; actual risk below ${D(s.riskPct).mul(100).toFixed(2)}%` : 'sized from the stop distance';
-  if (reduced) note += `; size x${adj.multiplier} (${adj.adjustments.join(', ')})`;
+  const capPct = D(s.maxNotionalPct).mul(100).toFixed(0);
+  const riskPct = D(s.riskPct).mul(100).toFixed(2);
+  const cuts = adj.adjustments.join(zh ? '，' : ', ');
+  let note: string;
+  if (zh) {
+    note = capped ? `名义价值封顶为权益的 ${capPct}%；实际风险低于 ${riskPct}%` : '按止损距离计算仓位';
+    if (reduced) note += `；仓位 x${adj.multiplier}（${cuts}）`;
+  } else {
+    note = capped ? `notional capped at ${capPct}% of equity; actual risk below ${riskPct}%` : 'sized from the stop distance';
+    if (reduced) note += `; size x${adj.multiplier} (${cuts})`;
+  }
   if (contracts.lt(inst.minSz)) {
     contracts = ZERO;
     const budget = eq.mul(s.riskPct).mul(adj.multiplier).toFixed(2);
-    note = `the minimum order size (${inst.minSz} contracts) would risk ${minUnitRisk.toFixed(2)} which exceeds the budget ${budget}${reduced ? ` (after size x${adj.multiplier}: ${adj.adjustments.join(', ')})` : ''}; do not trade this instrument at this equity`;
+    note = zh
+      ? `最小下单量（${inst.minSz} 张）的风险为 ${minUnitRisk.toFixed(2)}，超过预算 ${budget}${reduced ? `（已按仓位 x${adj.multiplier} 调整：${cuts}）` : ''}；当前权益下不要交易该合约`
+      : `the minimum order size (${inst.minSz} contracts) would risk ${minUnitRisk.toFixed(2)} which exceeds the budget ${budget}${reduced ? ` (after size x${adj.multiplier}: ${cuts})` : ''}; do not trade this instrument at this equity`;
   }
   const notional = contracts.isZero() ? ZERO : notionalQuote(contracts, px, inst);
   const riskQuote = notional.mul(distPct);
@@ -647,20 +696,22 @@ export function buildSignalReport(
   oiChanges: readonly BarOiChange[] | null = null,
   /** The daily cut `candles` close at; the caller builds the bars of that cut (see dailyBarsFromHalfDays) */
   phase: SignalPhase = 0,
+  /** Language of the texts in the report: signals.reasons, the sizing notes and adjustments */
+  lang: Lang = 'en',
 ): InstrumentSignalReport {
   const confirmed = candles.filter((c) => c.confirm);
   const indicators = computeIndicators(confirmed, p, oiChanges);
   const regime = classifyRegime(indicators, p);
   const fundingSummary = funding ? summarizeFunding(funding, now, p.fundingWindowHours) : null;
-  const signals = evaluateTrendSignals(indicators, regime, fundingSummary, p);
-  const adjLong = sizeAdjustment('long', regime, fundingSummary, oiChange10d, p);
-  const adjShort = sizeAdjustment('short', regime, fundingSummary, oiChange10d, p);
-  for (const a of adjLong.adjustments) signals.reasons.push(`long size: ${a}`);
-  if (p.allowShort) for (const a of adjShort.adjustments) signals.reasons.push(`short size: ${a}`);
+  const signals = evaluateTrendSignals(indicators, regime, fundingSummary, p, lang);
+  const adjLong = sizeAdjustment('long', regime, fundingSummary, oiChange10d, p, lang);
+  const adjShort = sizeAdjustment('short', regime, fundingSummary, oiChange10d, p, lang);
+  for (const a of adjLong.adjustments) signals.reasons.push(lang === 'zh' ? `做多仓位：${a}` : `long size: ${a}`);
+  if (p.allowShort) for (const a of adjShort.adjustments) signals.reasons.push(lang === 'zh' ? `做空仓位：${a}` : `short size: ${a}`);
   const sizingParams = { ...s, atrStopMultiple: p.atrStopMultiple };
   const sizing =
     inst && equity !== null && D(equity).gt(0)
-      ? { long: planSize(equity, indicators.close, indicators.atr, inst, sizingParams, adjLong), short: planSize(equity, indicators.close, indicators.atr, inst, sizingParams, adjShort) }
+      ? { long: planSize(equity, indicators.close, indicators.atr, inst, sizingParams, adjLong, lang), short: planSize(equity, indicators.close, indicators.atr, inst, sizingParams, adjShort, lang) }
       : null;
   return { instId, phase, indicators, regime, funding: fundingSummary, signals, sizing, structure: null, dataFetchedAt: null, params: p };
 }

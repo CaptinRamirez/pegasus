@@ -3,6 +3,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { D, DEFAULT_TREND_PARAMS, utcDayStart, type Instrument, type InstrumentSignalReport, type Order, type Position, type SignalsResponse, type SizingPlan } from '@pegasus/shared';
+import { useLangStore } from '../i18n';
 import { api } from '../lib/api';
 import { useStore } from '../store/store';
 import { initialState } from '../store/types';
@@ -213,6 +214,7 @@ describe('SignalsPanel', () => {
     await act(async () => root.unmount());
     container.remove();
     useStore.setState({ ...initialState(null) });
+    useLangStore.setState({ lang: 'en' });
     vi.useRealTimers();
   });
 
@@ -264,6 +266,20 @@ describe('SignalsPanel', () => {
     expect(error?.textContent).toBe('NOT_ENOUGH_DATA: need at least 101 confirmed daily bars, got 40');
     expect(error?.closest('tr')?.textContent).toContain('ETH-USDT-SWAP');
     expect(container.querySelectorAll('button.btn-buy')).toHaveLength(1);
+  });
+
+  it('on a Chinese page asks the server for Chinese texts and labels the table in Chinese', async () => {
+    useLangStore.setState({ lang: 'zh' });
+    await render(false, '做多入场');
+    // the reasons and sizing notes are written by the server: it is told the language
+    expect(signals).toHaveBeenCalledWith({ equity: '10123.45', riskPct: '0.005', lang: 'zh' });
+    expect(container.querySelector('.signal-badge.regime-trend')?.textContent).toBe('趋势');
+    const badges = [...container.querySelectorAll('.signal-badge')].map((b) => b.textContent);
+    expect(badges).toContain('做多入场');
+    expect(badges).toContain('空头离场');
+    expect(container.querySelector('button.btn-buy')?.textContent).toBe('应用');
+    expect(container.querySelector('.signals-table thead')?.textContent).toContain('市场状态');
+    expect(container.querySelector('.signal-error')?.textContent).toBe('NOT_ENOUGH_DATA: 已确认的日K线数量不足（need at least 101 confirmed daily bars, got 40）');
   });
 
   it('expands a row to show the reasons verbatim and the sizing note', async () => {
@@ -635,7 +651,7 @@ describe('SignalsPanel', () => {
     await flush(container, 'boom');
     const notice = container.querySelector('.signals-outdated');
     expect(notice?.textContent).toMatch(/^Signals not updated since \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\./);
-    expect(notice?.textContent).toContain('信号');
+    expect(notice?.textContent).not.toContain('信号');
     expect(container.querySelector('.signals-stale')).not.toBeNull();
     expect(container.textContent).toContain('LONG ENTRY'); // the old table stays readable
     const apply = container.querySelector<HTMLButtonElement>('button.btn-buy');

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { skipToken, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { CandleBar, ConnState } from '@pegasus/shared';
+import { useT } from '../i18n';
 import { api } from '../lib/api';
 import { fmtCoin, fmtPct, fmtPx, signOf } from '../lib/format';
 import { useCandleChart } from '../hooks/useCandleChart';
@@ -12,6 +13,7 @@ import { Panel } from './Panel';
 const BARS: readonly CandleBar[] = ['1m', '5m', '15m', '1H', '4H', '1D'];
 
 export function Chart() {
+  const t = useT();
   const inst = useStore(getSelectedInstrument);
   const bar = useStore((s) => s.bar);
   const instId = inst?.instId ?? null;
@@ -22,7 +24,7 @@ export function Chart() {
   // Dimmed like the instrument list: a frozen figure must not read as the current price.
   const tickerStale = useStore((s) => isStreamStale(s, s.selectedInstId, 'ticker')) && ticker !== null;
   const markStale = useStore((s) => isStreamStale(s, s.selectedInstId, 'mark')) && mark !== null;
-  const staleTicker = tickerStale ? { className: 'stale', title: 'Price stopped updating' } : {};
+  const staleTicker = tickerStale ? { className: 'stale', title: t.common.priceStopped } : {};
   const container = useRef<HTMLDivElement | null>(null);
 
   const key = `${instId ?? ''}|${bar}`;
@@ -53,7 +55,7 @@ export function Chart() {
 
   const title = (
     <span className="row">
-      <span>{inst?.instId ?? 'Chart'}</span>
+      <span>{inst?.instId ?? t.chart.title}</span>
       <span className="btn-group">
         {BARS.map((b) => (
           <button key={b} className={`btn btn-sm${b === bar ? ' active' : ''}`} onClick={() => changeBar(b)}>
@@ -67,19 +69,19 @@ export function Chart() {
   const extra = (
     <span className="chart-info num">
       <span {...staleTicker}>
-        Last <b className={signOf(ticker !== null ? ticker.last : null)}>{fmtPx(ticker?.last, inst)}</b>
+        {t.chart.last} <b className={signOf(ticker !== null ? ticker.last : null)}>{fmtPx(ticker?.last, inst)}</b>
       </span>
-      <span {...(markStale ? { className: 'stale', title: 'Mark price stopped updating' } : {})}>
-        Mark <b>{fmtPx(mark?.markPx, inst)}</b>
+      <span {...(markStale ? { className: 'stale', title: t.chart.markStopped } : {})}>
+        {t.chart.mark} <b>{fmtPx(mark?.markPx, inst)}</b>
       </span>
       <span>
-        Funding <b className={signOf(funding?.fundingRate)}>{fmtPct(funding?.fundingRate, 4, true)}</b>
+        {t.chart.funding} <b className={signOf(funding?.fundingRate)}>{fmtPct(funding?.fundingRate, 4, true)}</b>
       </span>
       <span {...staleTicker}>
-        24h vol <b>{fmtCoin(ticker?.vol24h, inst, ticker?.last)}</b>
+        {t.chart.vol24h} <b>{fmtCoin(ticker?.vol24h, inst, ticker?.last)}</b>
       </span>
-      {history.isError && <span className="neg">history failed</span>}
-      {history.isFetching && <span className="dim">loading…</span>}
+      {history.isError && <span className="neg">{t.chart.historyFailed}</span>}
+      {history.isFetching && <span className="dim">{t.chart.loading}</span>}
     </span>
   );
 

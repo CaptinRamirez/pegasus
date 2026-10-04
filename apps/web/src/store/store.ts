@@ -1,8 +1,8 @@
 import { create } from 'zustand';
-import type { CandleBar, Fill, InstId, Instrument, Order, RiskState, ServerMessage } from '@pegasus/shared';
+import type { AlgoOrderList, CandleBar, Fill, InstId, Instrument, Localized, Order, RiskState, ServerMessage } from '@pegasus/shared';
 import { readStoredToken, writeStoredToken } from '../lib/http';
 import type { WsStatus } from '../lib/ws';
-import { applyOrderHistorySeed, applyRiskReply, applyServerMessage, applyWsStatus, mergeFills, pushToast, stampMessage } from './reducers';
+import { applyAlgoOrders, applyOrderHistorySeed, applyRiskReply, applyServerMessage, applyWsStatus, mergeFills, pushToast, stampMessage } from './reducers';
 import { emptyMarket, initialState, type MarketData, type TerminalState, type TicketPrefillInput, type ToastKind } from './types';
 
 export interface TerminalActions {
@@ -10,10 +10,13 @@ export interface TerminalActions {
   applyMessage: (msg: ServerMessage) => void;
   /** Applies the risk state returned by an HTTP call (the kill-switch toggle). */
   applyRiskReply: (risk: RiskState) => void;
+  /** Applies the algo order list returned by an HTTP call (the Refresh of the Stops tab). */
+  applyAlgoOrders: (list: AlgoOrderList) => void;
   setWsStatus: (status: WsStatus) => void;
   selectInstrument: (instId: InstId) => void;
   setBar: (bar: CandleBar) => void;
-  pushToast: (kind: ToastKind, message: string) => void;
+  /** A plain message is shown as it is; one given in both languages follows the language of the page. */
+  pushToast: (kind: ToastKind, message: string | Localized) => void;
   dismissToast: (id: number) => void;
   seedOrderHistory: (orders: Order[]) => void;
   seedFills: (fills: Fill[]) => void;
@@ -34,6 +37,7 @@ export const useStore = create<TerminalStore>()((set, get) => ({
   },
   applyMessage: (msg) => set((s) => ({ ...applyServerMessage(s, msg), ...stampMessage(s, msg, Date.now()) })),
   applyRiskReply: (risk) => set(applyRiskReply(risk)),
+  applyAlgoOrders: (list) => set((s) => applyAlgoOrders(s, list)),
   setWsStatus: (wsStatus) => set((s) => applyWsStatus(s, wsStatus, Date.now())),
   selectInstrument: (instId) => {
     if (get().selectedInstId === instId) return;
@@ -72,11 +76,8 @@ export const getSelectedMarket = (s: TerminalState): MarketData =>
 
 export const getKillSwitch = (s: TerminalState): boolean => s.risk?.killSwitch ?? false;
 
-/** Why nothing can be sent to the exchange from this terminal; English first, then a short Chinese line. */
-export interface TradingBlock {
-  en: string;
-  zh: string;
-}
+/** Why nothing can be sent to the exchange from this terminal, in both languages. */
+export type TradingBlock = Localized;
 
 export const READ_ONLY_KEY_BLOCK: TradingBlock = { en: 'Read-only API key: trading from Pegasus is disabled', zh: '只读 key：无法从 Pegasus 下单' };
 /** The position mode is unknown, so an order could be built for the wrong kind of account. */
@@ -85,4 +86,3 @@ export const ACCOUNT_NOT_LOADED_BLOCK: TradingBlock = { en: 'Account not loaded:
 export const getTradingBlock = (s: TerminalState): TradingBlock | null =>
   s.account === null ? ACCOUNT_NOT_LOADED_BLOCK : s.account.canTrade ? null : READ_ONLY_KEY_BLOCK;
 
-export const blockTitle = (b: TradingBlock): string => `${b.en} / ${b.zh}`;

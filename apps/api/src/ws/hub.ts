@@ -66,6 +66,7 @@ export class Hub {
     this.account.on('order', (o) => this.broadcast({ type: 'order', data: o }));
     this.account.on('fill', (f) => this.broadcast({ type: 'fill', data: f }));
     this.account.on('positions', (p) => this.broadcast({ type: 'positions', data: p }));
+    this.account.on('algoOrders', (a) => this.broadcast({ type: 'algoOrders', data: a }));
     this.account.on('balance', (b) => this.broadcast({ type: 'balance', data: b }));
     this.account.on('config', (c) => this.broadcast({ type: 'account', data: c }));
     this.account.on('status', () => this.broadcast({ type: 'connection', data: this.connectionStatus() }));
@@ -92,6 +93,7 @@ export class Hub {
   hello(): HelloPayload {
     return {
       demo: this.config.okx.demo,
+      paper: this.config.okx.paper,
       instruments: [...this.market.instruments.values()],
       account: this.account.config,
       riskConfig: this.risk.config,
@@ -100,6 +102,7 @@ export class Hub {
       balance: this.account.balance,
       positions: this.account.positionList(),
       openOrders: this.account.openOrderList(),
+      algoOrders: this.account.algoOrders,
       serverTime: Date.now(),
     };
   }

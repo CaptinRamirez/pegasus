@@ -3,6 +3,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { Instrument, Order, OrderPreview, PlaceOrderRequest, RiskState } from '@pegasus/shared';
+import { useLangStore } from '../i18n';
 import { api, type LeverageInfo } from '../lib/api';
 import { ApiError } from '../lib/http';
 import { useStore } from '../store/store';
@@ -96,6 +97,7 @@ describe('OrderTicket', () => {
     await act(async () => root.unmount());
     container.remove();
     useStore.setState({ ...initialState(null) });
+    useLangStore.setState({ lang: 'en' });
   });
 
   const render = async () => {
@@ -301,11 +303,17 @@ describe('OrderTicket', () => {
     await until('the failure', () => container.querySelector('[role="alert"]') !== null);
     const alert = (): string => container.querySelector('[role="alert"]')?.textContent ?? '';
     expect(alert()).toContain('Order status unknown: check Positions, Fills and Open orders before retrying');
-    expect(alert()).toContain('订单状态未知：重试前请先查看持仓、成交和当前委托');
+    expect(alert()).not.toContain('订单状态未知');
     expect(alert()).not.toContain('rejected');
     const toast = useStore.getState().toasts.at(-1);
     expect(toast?.kind).toBe('error');
     expect(toast?.message).toContain('Order status unknown: check Positions, Fills and Open orders before retrying');
+    // the notice stays up across a switch of the language, so it is kept in both
+    expect(toast?.zh).toContain('订单状态未知：重试前请先查看持仓、成交和当前委托');
+    await act(async () => useLangStore.setState({ lang: 'zh' }));
+    expect(alert()).toContain('订单状态未知：重试前请先查看持仓、成交和当前委托');
+    expect(alert()).not.toContain('Order status unknown');
+    await act(async () => useLangStore.setState({ lang: 'en' }));
     const first = placeOrder.mock.calls[0]?.[0].clOrdId;
     expect(first).toMatch(/^pgw/);
     expect(placeOrder.mock.calls[0]?.[0].retry).toBeUndefined();

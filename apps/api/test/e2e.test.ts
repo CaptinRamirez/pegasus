@@ -9,7 +9,7 @@ import { pino } from 'pino';
 import WebSocket from 'ws';
 import { startMockOkx, type MockOkxHandle } from '@pegasus/mock-okx';
 import { OkxTransportError, type OkxRestClient } from '@pegasus/okx';
-import { D, decodeServerMessage, type ApiResponse, type Order, type Position, type ServerMessage } from '@pegasus/shared';
+import { D, decodeServerMessage, type AlgoOrderList, type ApiResponse, type Order, type Position, type ServerMessage } from '@pegasus/shared';
 import type { FastifyInstance, InjectOptions } from 'fastify';
 import { loadConfig, type AppConfig } from '../src/config.js';
 import { MemoryStore } from '../src/db/store.js';
@@ -183,6 +183,10 @@ describe('api e2e against mock OKX', () => {
     expect(noon.phases).toEqual([0, 12]);
     expect(noon.sizingParams.riskPct).toBe('0.00375');
     expect((await api('GET', '/api/signals?phase=6')).status).toBe(400);
+    // ?lang words the reasons and the sizing notes in Chinese; English is the default
+    const zh = data(await api<{ reports: Array<{ signals?: { reasons: string[] } }> }>('GET', '/api/signals?instId=ETH-USDT-SWAP&phase=0&equity=100000&lang=zh'));
+    expect(zh.reports[0]?.signals?.reasons[0]).toMatch(/^收盘价 /);
+    expect((await api('GET', '/api/signals?lang=fr')).status).toBe(400);
   });
 
   it('previews a limit order with sizing in coin and risk ok', async () => {
@@ -397,6 +401,107 @@ describe('api e2e against mock OKX', () => {
       mock.setMarkPrice(ETH, null);
     }
     await waitFor(() => D(deps.market.markPrice(ETH)?.markPx ?? '0').gt(2900), 5000, 'mark released');
+  });
+
+  it('lists the stop of a filled entry, moves it and cancels it; the page hears every read', async () => {
+    const ETH = 'ETH-USDT-SWAP';
+    const heard: AlgoOrderList[] = [];
+    const onList = (l: AlgoOrderList): void => void heard.push(l);
+    deps.account.on('algoOrders', onList);
+    try {
+      expect(data(await api<AlgoOrderList>('GET', '/api/algo-orders')).orders).toEqual([]);
+      const entry = data(await api<{ order: Order }>('POST', '/api/orders', { instId: ETH, side: 'buy', ordType: 'market', size: { unit: 'contracts', value: '10' }, slTriggerPx: '2700' }));
+      // no request from the page: the fill itself makes the server read the stops again
+      const stop = await waitFor(() => deps.account.algoOrders?.orders.find((a) => a.instId === ETH), 5000, 'stop in the mirror');
+      expect(stop).toMatchObject({ algoClOrdId: `sl${entry.order.clOrdId}`, instId: ETH, side: 'sell', posSide: 'net', tdMode: 'cross', sz: '10', closeFraction: '', slTriggerPx: '2700', slTriggerPxType: 'mark', slOrdPx: '-1', tpTriggerPx: '' });
+      expect(heard.length).toBeGreaterThan(0);
+      expect(deps.hub.hello().algoOrders?.orders.map((a) => a.algoId)).toEqual([stop.algoId]);
+
+      // a move on the wrong side of the mark, to where it already is, or of an unknown stop is refused before the exchange
+      const mark = Number(deps.market.liveMarkPrice(ETH));
+      const wrong = await api<unknown>('POST', '/api/algo-orders/amend', { instId: ETH, algoId: stop.algoId, slTriggerPx: String(Math.ceil(mark) + 100) });
+      expect(wrong.status).toBe(400);
+      if (!wrong.body.ok) expect(wrong.body.error.code).toBe('VALIDATION');
+      expect((await api<unknown>('POST', '/api/algo-orders/amend', { instId: ETH, algoId: stop.algoId, slTriggerPx: '2700' })).status).toBe(400);
+      const unknown = await api<unknown>('POST', '/api/algo-orders/amend', { instId: ETH, algoId: '999', slTriggerPx: '2800' });
+      expect(unknown.status).toBe(404);
+      if (!unknown.body.ok) expect(unknown.body.error.code).toBe('ALGO_NOT_FOUND');
+      expect(mock.getState().stops).toMatchObject([{ algoId: stop.algoId, slTriggerPx: '2700' }]);
+
+      // the move: rounded to the tick towards the price, only the trigger changes
+      const moved = data(await api<{ algoId: string; slTriggerPx: string; previous: string }>('POST', '/api/algo-orders/amend', { instId: ETH, algoId: stop.algoId, slTriggerPx: '2800.004' }));
+      expect(moved).toEqual({ algoId: stop.algoId, instId: ETH, slTriggerPx: '2800.01', previous: '2700' });
+      expect(mock.getState().stops).toMatchObject([{ algoId: stop.algoId, sz: '10', slTriggerPx: '2800.01', slTriggerPxType: 'mark' }]);
+      expect(deps.account.algoOrders?.orders).toMatchObject([{ algoId: stop.algoId, slTriggerPx: '2800.01' }]);
+
+      // the cancel: the stop is gone at the exchange and in the mirror, the position stays
+      const before = heard.length;
+      expect(data(await api<{ algoId: string }>('POST', '/api/algo-orders/cancel', { instId: ETH, algoId: stop.algoId }))).toEqual({ algoId: stop.algoId, instId: ETH });
+      expect(mock.getState().stops).toEqual([]);
+      expect(deps.account.algoOrders?.orders).toEqual([]);
+      expect(heard.length).toBeGreaterThan(before);
+      expect(deps.account.positionList().some((p) => p.instId === ETH)).toBe(true);
+      // cancelling it again is the exchange's refusal, passed on with its code
+      const again = await api<unknown>('POST', '/api/algo-orders/cancel', { instId: ETH, algoId: stop.algoId });
+      expect(again.status).toBe(502);
+      if (!again.body.ok) expect(again.body.error).toMatchObject({ code: 'EXCHANGE', details: { okxCode: '51400' } });
+    } finally {
+      deps.account.off('algoOrders', onList);
+      data(await api<unknown>('POST', '/api/positions/close', { instId: ETH, mgnMode: 'cross' }));
+      await waitFor(() => !deps.account.positionList().some((p) => p.instId === ETH), 5000, 'position closed');
+    }
+  });
+
+  it('places a stop for a position that has none, only for what its stops leave uncovered and only on the losing side of the mark', async () => {
+    const ETH = 'ETH-USDT-SWAP';
+    type Placed = { algoId: string; instId: string; slTriggerPx: string; sz: string };
+    try {
+      // no position: nothing to protect
+      const none = await api<unknown>('POST', '/api/algo-orders', { instId: ETH, mgnMode: 'cross', slTriggerPx: '2700' });
+      expect(none.status).toBe(400);
+      if (!none.body.ok) expect(none.body.error.message).toContain('no open cross position in ETH-USDT-SWAP');
+
+      data(await api<unknown>('POST', '/api/orders', { instId: ETH, side: 'buy', ordType: 'market', size: { unit: 'contracts', value: '10' } }));
+      await waitFor(() => deps.account.positionList().find((p) => p.instId === ETH), 5000, 'position');
+      expect(mock.getState().stops).toEqual([]);
+
+      const mark = Number(deps.market.liveMarkPrice(ETH));
+      const wrong = await api<unknown>('POST', '/api/algo-orders', { instId: ETH, mgnMode: 'cross', slTriggerPx: String(Math.ceil(mark) + 100) });
+      expect(wrong.status).toBe(400);
+      if (!wrong.body.ok) expect(wrong.body.error).toMatchObject({ code: 'VALIDATION', details: { markPx: deps.market.liveMarkPrice(ETH) } });
+      const tooMany = await api<unknown>('POST', '/api/algo-orders', { instId: ETH, mgnMode: 'cross', slTriggerPx: '2700', sz: '11' });
+      expect(tooMany.status).toBe(400);
+      expect(mock.getState().stops).toEqual([]);
+
+      // part of the position first, then the rest without naming a size; the trigger is rounded towards the price
+      const first = await api<Placed>('POST', '/api/algo-orders', { instId: ETH, mgnMode: 'cross', slTriggerPx: '2700.004', sz: '4' });
+      expect(first.status).toBe(201);
+      expect(data(first)).toMatchObject({ instId: ETH, slTriggerPx: '2700.01', sz: '4' });
+      expect(mock.getState().stops).toMatchObject([{ algoId: data(first).algoId, ordId: '', side: 'sell', posSide: 'net', sz: '4', slTriggerPx: '2700.01', slTriggerPxType: 'mark' }]);
+      expect(mock.getState().stops[0]?.algoClOrdId).toMatch(/^sl[a-z0-9]+$/);
+      const rest = data(await api<Placed>('POST', '/api/algo-orders', { instId: ETH, mgnMode: 'cross', slTriggerPx: '2650' }));
+      expect(rest.sz).toBe('6');
+      expect(deps.account.algoOrders?.orders.map((a) => [a.sz, a.slTriggerPx]).sort()).toEqual([['4', '2700.01'], ['6', '2650']]);
+
+      // fully covered: one more is refused before the exchange
+      const covered = await api<unknown>('POST', '/api/algo-orders', { instId: ETH, mgnMode: 'cross', slTriggerPx: '2600' });
+      expect(covered.status).toBe(400);
+      if (!covered.body.ok) expect(covered.body.error).toMatchObject({ code: 'VALIDATION', details: { covered: '10', size: '10' } });
+      expect(mock.getState().stops).toHaveLength(2);
+
+      // allowed while the kill switch is on: a stop only takes risk away
+      data(await api<unknown>('POST', '/api/algo-orders/cancel', { instId: ETH, algoId: rest.algoId }));
+      data(await api<unknown>('POST', '/api/risk/kill-switch', { enabled: true, reason: 'test' }));
+      try {
+        expect((await api<Placed>('POST', '/api/algo-orders', { instId: ETH, mgnMode: 'cross', slTriggerPx: '2650' })).status).toBe(201);
+      } finally {
+        data(await api<unknown>('POST', '/api/risk/kill-switch', { enabled: false }));
+      }
+    } finally {
+      data(await api<unknown>('POST', '/api/positions/close', { instId: ETH, mgnMode: 'cross' }));
+      await waitFor(() => !deps.account.positionList().some((p) => p.instId === ETH), 5000, 'position closed');
+    }
+    expect(mock.getState().stops).toEqual([]);
   });
 
   it('the kill switch cancel sweep leaves an active attached stop alone', async () => {

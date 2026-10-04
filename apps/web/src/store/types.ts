@@ -1,5 +1,6 @@
 import type {
   AccountConfig,
+  AlgoOrderList,
   Balance,
   Candle,
   CandleBar,
@@ -38,7 +39,10 @@ export type ToastKind = 'info' | 'success' | 'error';
 export interface Toast {
   id: number;
   kind: ToastKind;
+  /** The text as it was pushed: in the language of the page at that time, or the English one when `zh` is set */
   message: string;
+  /** The Chinese text of a message that was pushed in both languages; shown instead of `message` while the page is in Chinese */
+  zh?: string;
   ts: number;
   /** Never dropped to make room for newer toasts (the lost-stop notice) */
   sticky?: true;
@@ -69,6 +73,8 @@ export type TicketPrefillInput = Omit<TicketPrefill, 'nonce'>;
 export interface TerminalState {
   token: string | null;
   demo: boolean;
+  /** Paper trading: orders and positions are simulated on OKX's live prices */
+  paper: boolean;
   instruments: Instrument[];
   account: AccountConfig | null;
   riskConfig: RiskConfig | null;
@@ -85,6 +91,8 @@ export interface TerminalState {
   /** Newest first, capped */
   fills: Fill[];
   positions: Position[];
+  /** Stop-loss / take-profit algo orders as the server last read them from the exchange; null until it has read them once */
+  algoOrders: AlgoOrderList | null;
   balance: Balance | null;
   /** Whether the server had the account loaded when it last sent its whole state; an empty list means a flat account only then */
   accountLoaded: boolean;
@@ -127,6 +135,7 @@ export function initialState(token: string | null): TerminalState {
   return {
     token,
     demo: true,
+    paper: false,
     instruments: [],
     account: null,
     riskConfig: null,
@@ -139,6 +148,7 @@ export function initialState(token: string | null): TerminalState {
     orderHistory: [],
     fills: [],
     positions: [],
+    algoOrders: null,
     balance: null,
     accountLoaded: false,
     risk: null,

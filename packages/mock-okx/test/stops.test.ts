@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import type { MockOkxHandle, OkxBookData, OkxOrder, OkxOrderAck, OkxPosition, OkxTicker } from '../src/index.js';
+import type { MockOkxHandle, OkxAlgoAck, OkxAlgoOrder, OkxBookData, OkxOrder, OkxOrderAck, OkxPosition, OkxTicker } from '../src/index.js';
 import { CREDS, WsProbe, isData, isEvent, rest, start, wsLoginArgs } from './helpers.js';
 
 const BTC = 'BTC-USDT-SWAP';
@@ -216,6 +216,131 @@ describe('attached stop-loss', () => {
     h.setMarkPrice(BTC, '58990');
     expect(await positions(h)).toEqual([]);
     expect(h.getState().stops).toEqual([]);
+  });
+
+  it('lists the active stops as conditional algo orders, newest first, with the filters of the endpoint', async () => {
+    h = await start({ seed: 7 });
+    h.setPrice(BTC, '60000');
+    const pending = (query: string) => rest<OkxAlgoOrder>(h, 'GET', `/api/v5/trade/orders-algo-pending?${query}`);
+    expect(await pending('instType=SWAP')).toMatchObject({ code: '50014', data: [] });
+    expect((await pending('ordType=conditional,oco&instType=SWAP')).data).toEqual([]);
+
+    const first = await place(h, { side: 'buy', ordType: 'market', sz: '10', ...stop('59000', { attachAlgoClOrdId: 'slone' }) });
+    const second = await place(h, { side: 'buy', ordType: 'market', sz: '4', ...stop('58000') });
+    expect([first.sCode, second.sCode]).toEqual(['0', '0']);
+    const all = (await pending('ordType=conditional,oco&instType=SWAP')).data;
+    expect(all.map((a) => [a.sz, a.slTriggerPx])).toEqual([['4', '58000'], ['10', '59000']]);
+    expect(all[1]).toMatchObject({
+      instType: 'SWAP', instId: BTC, algoClOrdId: 'slone', ordType: 'conditional', side: 'sell', posSide: 'net', tdMode: 'cross', sz: '10', closeFraction: '',
+      state: 'live', slTriggerPx: '59000', slTriggerPxType: 'mark', slOrdPx: '-1', tpTriggerPx: '',
+    });
+    expect(Number(all[1]?.cTime)).toBeGreaterThan(0);
+    const [newest, oldest] = all;
+    if (!newest || !oldest) throw new Error('two stops expected');
+    // the filters: another order type, another instrument type, one algoId, a page size, and `after` (older than)
+    expect((await pending('ordType=trigger')).data).toEqual([]);
+    expect((await pending('ordType=conditional&instType=SPOT')).data).toEqual([]);
+    expect((await pending(`ordType=conditional&algoId=${oldest.algoId}`)).data.map((a) => a.algoId)).toEqual([oldest.algoId]);
+    expect((await pending('ordType=conditional&limit=1')).data.map((a) => a.algoId)).toEqual([newest.algoId]);
+    expect((await pending(`ordType=conditional&after=${newest.algoId}`)).data.map((a) => a.algoId)).toEqual([oldest.algoId]);
+    expect((await pending('ordType=conditional&instId=ETH-USDT-SWAP')).data).toEqual([]);
+  });
+
+  it('amends the trigger of a stop, and refuses one on the wrong side, off the tick, removed or unknown', async () => {
+    h = await start({ seed: 7 });
+    h.setPrice(BTC, '60000');
+    await place(h, { side: 'buy', ordType: 'market', sz: '10', ...stop('59000') });
+    const algoId = h.getState().stops[0]?.algoId ?? '';
+    const amend = async (body: Record<string, unknown>) => (await rest<OkxAlgoAck>(h, 'POST', '/api/v5/trade/amend-algos', { instId: BTC, algoId, ...body })).data[0];
+
+    expect(await amend({ newSlTriggerPx: '59500', reqId: 'r1' })).toMatchObject({ algoId, reqId: 'r1', sCode: '0' });
+    expect(h.getState().stops).toMatchObject([{ algoId, sz: '10', slTriggerPx: '59500', slTriggerPxType: 'mark' }]);
+    // the amended stop is the one that triggers
+    h.setMarkPrice(BTC, '59200');
+    expect(await positions(h)).toEqual([]);
+    h.setMarkPrice(BTC, null);
+
+    h.setPrice(BTC, '60000');
+    await place(h, { side: 'buy', ordType: 'market', sz: '10', ...stop('59000') });
+    const second = h.getState().stops[0]?.algoId ?? '';
+    const amend2 = async (body: Record<string, unknown>) => (await rest<OkxAlgoAck>(h, 'POST', '/api/v5/trade/amend-algos', { instId: BTC, algoId: second, ...body })).data[0];
+    // at or above the mark a stop that sells would fire at once
+    expect(await amend2({ newSlTriggerPx: '61000' })).toMatchObject({ sCode: '51304', sMsg: 'SL trigger price cannot be higher than the mark price' });
+    expect((await amend2({ newSlTriggerPx: '59000.05' }))?.sCode).toBe('51000');
+    expect((await amend2({ newSlTriggerPx: '0' }))?.sCode).toBe('51526');
+    expect((await amend2({}))?.sCode).toBe('51000');
+    expect((await amend2({ newTpTriggerPx: '65000' }))?.sCode).toBe('51000');
+    // OKX refuses a change of the trigger price type; naming the type the stop already has changes nothing
+    expect(await amend2({ newSlTriggerPx: '59100', newSlTriggerPxType: 'last' })).toMatchObject({ sCode: '51528', sMsg: 'Unable to modify trigger price type' });
+    expect((await amend2({ newSlTriggerPxType: 'mark' }))?.sCode).toBe('0');
+    expect((await amend2({ newSz: '4' }))?.sCode).toBe('0');
+    expect((await rest<OkxAlgoAck>(h, 'POST', '/api/v5/trade/amend-algos', { instId: BTC, algoId: '999', newSlTriggerPx: '59500' })).data[0]).toMatchObject({
+      sCode: '51527',
+      sMsg: 'Order modification unsuccessful. The stop order does not exist.',
+    });
+    // nothing but the size changed
+    expect(h.getState().stops).toMatchObject([{ algoId: second, sz: '4', slTriggerPx: '59000' }]);
+  });
+
+  it('cancels a stop by its algoId or its client id and leaves the position open; an unknown one fails per item', async () => {
+    h = await start({ seed: 7 });
+    h.setPrice(BTC, '60000');
+    await place(h, { side: 'buy', ordType: 'market', sz: '10', ...stop('59000', { attachAlgoClOrdId: 'slone' }) });
+    await place(h, { side: 'buy', ordType: 'market', sz: '4', ...stop('58000') });
+    const byClient = h.getState().stops.find((s) => s.algoClOrdId === 'slone');
+    const other = h.getState().stops.find((s) => s.algoClOrdId !== 'slone');
+    if (!byClient || !other) throw new Error('two stops expected');
+    const cancel = (body: unknown) => rest<OkxAlgoAck>(h, 'POST', '/api/v5/trade/cancel-algos', body);
+
+    expect(await cancel({ instId: BTC, algoId: other.algoId })).toMatchObject({ code: '51000', data: [] }); // an array is required
+    const mixed = await cancel([{ instId: BTC, algoClOrdId: 'slone' }, { instId: BTC, algoId: '999' }]);
+    expect(mixed.code).toBe('2');
+    expect(mixed.data).toMatchObject([{ algoId: byClient.algoId, sCode: '0' }, { algoId: '999', sCode: '51400' }]);
+    expect(h.getState().stops.map((s) => s.algoId)).toEqual([other.algoId]);
+    expect((await cancel([{ instId: BTC, algoId: other.algoId }])).data[0]).toMatchObject({ algoId: other.algoId, sCode: '0' });
+    expect(h.getState().stops).toEqual([]);
+    // the position is untouched, and no longer protected: the mark can fall through the old triggers
+    h.setMarkPrice(BTC, '57000');
+    expect(await positions(h)).toEqual([['net', '14']]);
+  });
+
+  it('places a stop on its own for an open position; it is listed, can be moved, and fires like an attached one', async () => {
+    h = await start({ seed: 7 });
+    h.setPrice(BTC, '60000');
+    await place(h, { side: 'buy', ordType: 'market', sz: '10' });
+    const algo = async (body: Record<string, unknown>) =>
+      (await rest<OkxAlgoAck>(h, 'POST', '/api/v5/trade/order-algo', { instId: BTC, tdMode: 'cross', side: 'sell', ordType: 'conditional', sz: '10', slTriggerPx: '59000', slOrdPx: '-1', slTriggerPxType: 'mark', ...body })).data[0];
+
+    // what the simulator does not do, and what cannot protect anything
+    expect((await algo({ ordType: 'trigger' }))?.sCode).toBe('51000');
+    expect((await algo({ closeFraction: '1' }))?.sCode).toBe('51000');
+    expect((await algo({ tpTriggerPx: '65000' }))?.sCode).toBe('51000');
+    expect((await algo({ sz: '0.05' }))?.sCode).toBe('51121');
+    expect((await algo({ slTriggerPx: '59000.05' }))?.sCode).toBe('51000');
+    expect(await algo({ slTriggerPx: '61000' })).toMatchObject({ sCode: '51304', sMsg: 'SL trigger price cannot be higher than the mark price' });
+    expect(await algo({ side: 'buy', slTriggerPx: '61000' })).toMatchObject({ sCode: '51023' }); // a buy stop closes a short: there is none
+    expect(await algo({ sz: '11' })).toMatchObject({ sCode: '51119' });
+    expect((await algo({ instId: 'ETH-USDT-SWAP' }))?.sCode).toBe('51023');
+    expect(h.getState().stops).toEqual([]);
+
+    const ack = await algo({ sz: '6', algoClOrdId: 'slmanual1', reduceOnly: true, cxlOnClosePos: true });
+    expect(ack).toMatchObject({ algoClOrdId: 'slmanual1', sCode: '0' });
+    expect((await algo({ sz: '4', algoClOrdId: 'slmanual1' }))?.sCode).toBe('51016');
+    expect(h.getState().stops).toMatchObject([{ algoId: ack?.algoId, algoClOrdId: 'slmanual1', ordId: '', instId: BTC, side: 'sell', posSide: 'net', sz: '6', slTriggerPx: '59000', slTriggerPxType: 'mark' }]);
+    expect((await rest<OkxAlgoOrder>(h, 'GET', '/api/v5/trade/orders-algo-pending?ordType=conditional')).data).toMatchObject([{ algoId: ack?.algoId, sz: '6', slTriggerPx: '59000' }]);
+    expect((await rest<OkxAlgoAck>(h, 'POST', '/api/v5/trade/amend-algos', { instId: BTC, algoId: ack?.algoId, newSlTriggerPx: '59500' })).data[0]?.sCode).toBe('0');
+
+    h.setMarkPrice(BTC, '59500');
+    expect(await positions(h)).toEqual([['net', '4']]); // it closed its 6 contracts
+    expect(h.getState().stops).toEqual([]);
+  });
+
+  it('a read-only key can list the stops but neither amend nor cancel them', async () => {
+    h = await start({ seed: 7, perm: 'read_only' });
+    expect((await rest<OkxAlgoOrder>(h, 'GET', '/api/v5/trade/orders-algo-pending?ordType=conditional')).code).toBe('0');
+    expect((await rest(h, 'POST', '/api/v5/trade/amend-algos', { instId: BTC, algoId: '1', newSlTriggerPx: '1' })).code).toBe('1');
+    expect((await rest(h, 'POST', '/api/v5/trade/cancel-algos', [{ instId: BTC, algoId: '1' }])).code).toBe('1');
+    expect((await rest(h, 'POST', '/api/v5/trade/order-algo', { instId: BTC, tdMode: 'cross', side: 'sell', ordType: 'conditional', sz: '1', slTriggerPx: '1', slOrdPx: '-1' })).code).toBe('1');
   });
 
   it('accepts attachAlgoOrds on the WebSocket order op and pushes the mark it is pinned at', async () => {

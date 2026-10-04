@@ -9,6 +9,10 @@
     ".": {
       "types": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./engine": {
+      "types": "./src/engine-api.ts",
+      "default": "./src/engine-api.ts"
     }
   },
   "scripts": {

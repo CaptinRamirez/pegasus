@@ -172,7 +172,7 @@ export class MockWsServer {
   private initialPush(conn: Conn, arg: OkxWsArg): void {
     const e = this.engine;
     const instId = arg.instId ?? '';
-    const market = e.markets.get(instId);
+    const market = e.sims.get(instId);
     switch (arg.channel) {
       case 'tickers': {
         const t = e.ticker(instId);
@@ -215,7 +215,7 @@ export class MockWsServer {
   }
 
   private topOfBook(instId: string, depth: number): unknown {
-    const market = this.engine.markets.get(instId);
+    const market = this.engine.sims.get(instId);
     if (!market) return {};
     const { asks, bids } = market.book.levels(depth);
     return { asks, bids, ts: String(this.engine.now()), seqId: market.book.seqId };

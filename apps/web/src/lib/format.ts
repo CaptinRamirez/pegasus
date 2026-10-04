@@ -38,9 +38,6 @@ export function isDecimalText(s: string): boolean {
   return DECIMAL_STRING_RE.test(s);
 }
 
-/** Tooltip of the "untracked" tag on a table row whose instrument is not in the tracked list. */
-export const UNTRACKED_TITLE = 'Not one of the tracked instruments: prices and sizes are shown as OKX reports them, and the coin amount is unknown.';
-
 /** Significant digits of a price whose instrument (and so its tick size) is unknown. */
 const UNTRACKED_PX_DIGITS = 8;
 const UNTRACKED_PX_INTEGER = D(10).pow(UNTRACKED_PX_DIGITS);

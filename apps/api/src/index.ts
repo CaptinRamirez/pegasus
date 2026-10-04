@@ -22,10 +22,11 @@ async function main(): Promise<void> {
     log.fatal({ err }, 'uncaught exception; exiting');
     process.exit(1);
   });
-  log.info({ version: config.version, demo: config.okx.demo, rest: config.okx.endpoints.rest, wsTrading: config.okx.wsTrading, logDir: config.logDir, instruments: config.instruments, host: config.server.host, port: config.server.port }, 'pegasus api starting');
+  log.info({ version: config.version, demo: config.okx.demo, paper: config.okx.paper, rest: config.okx.endpoints.rest, wsTrading: config.okx.wsTrading, logDir: config.logDir, instruments: config.instruments, host: config.server.host, port: config.server.port }, 'pegasus api starting');
   if (config.server.token === 'change-me') log.warn('API_TOKEN is the default value; set a real secret in .env before exposing this server');
   if (!config.okx.credentials) log.warn('no OKX credentials configured: running in market-data-only mode (no trading)');
-  if (!config.okx.demo && config.okx.credentials) log.warn('LIVE TRADING MODE: orders will use real funds');
+  if (config.okx.paper) log.info({ paperExchange: config.okx.endpoints.restPrivate }, 'PAPER TRADING MODE: orders, positions and balance are simulated by the paper exchange; market data is OKX live data; nothing is sent to an OKX account');
+  else if (!config.okx.demo && config.okx.credentials) log.warn('LIVE TRADING MODE: orders will use real funds');
 
   let store: Store;
   if (config.databaseUrl) {

@@ -1,7 +1,10 @@
 import type {
   AccountConfig,
+  AlgoOrderList,
+  AmendAlgoOrderRequest,
   Balance,
   Candle,
+  CancelAlgoOrderRequest,
   CancelAllRequest,
   CancelOrderRequest,
   CandlesQuery,
@@ -11,12 +14,14 @@ import type {
   FillsQuery,
   Instrument,
   KillSwitchRequest,
+  Lang,
   OrdType,
   Order,
   OrderBook,
   OrderPreview,
   OrdersHistoryQuery,
   PlaceOrderRequest,
+  PlaceStopRequest,
   PosSide,
   Position,
   RiskCheckResult,
@@ -35,6 +40,7 @@ export type { OrderPreview };
 export interface HealthResponse {
   ok: true;
   demo: boolean;
+  paper: boolean;
   connection: ConnectionStatus;
   serverTime: number;
 }
@@ -68,6 +74,8 @@ export type SignalsQuery = {
   equity?: string;
   riskPct?: string;
   maxNotionalPct?: string;
+  /** Language of the reasons and sizing notes the server writes; English when absent */
+  lang?: Lang;
 };
 
 export const api = {
@@ -90,6 +98,12 @@ export const api = {
   cancelOrder: (body: CancelOrderRequest) =>
     http<{ ordId: string; clOrdId: string }>('/api/orders/cancel', { body }),
   cancelAll: (body: CancelAllRequest) => http<{ canceled: number }>('/api/orders/cancel-all', { body }),
+  /** A fresh read of the stop-loss / take-profit algo orders from the exchange. */
+  algoOrders: () => http<AlgoOrderList>('/api/algo-orders'),
+  placeStop: (body: PlaceStopRequest) => http<{ algoId: string; instId: string; slTriggerPx: string; sz: string }>('/api/algo-orders', { body }),
+  amendAlgoOrder: (body: AmendAlgoOrderRequest) =>
+    http<{ algoId: string; instId: string; slTriggerPx: string; previous: string }>('/api/algo-orders/amend', { body }),
+  cancelAlgoOrder: (body: CancelAlgoOrderRequest) => http<{ algoId: string; instId: string }>('/api/algo-orders/cancel', { body }),
   candles: (query: CandlesQuery) => http<Candle[]>('/api/candles', { query }),
   book: (instId: string) => http<OrderBook>('/api/book', { query: { instId } }),
   ticker: (instId: string) => http<Ticker>('/api/ticker', { query: { instId } }),

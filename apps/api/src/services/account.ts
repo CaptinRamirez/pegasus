@@ -1,17 +1,19 @@
 import { EventEmitter } from 'node:events';
-import { OkxApiError, OkxWsError, type OkxAccountConfig, type OkxBalance, type OkxLeverageInfo, type OkxOrder, type OkxPosition, type OkxSetLeverageParams, type OkxWsData } from '@pegasus/okx';
-import { D, ZERO, type AccountConfig, type AccountError, type AccountStatus, type Balance, type ConnState, type Fill, type Order, type Position, type TdMode } from '@pegasus/shared';
+import { OkxApiError, OkxWsError, type OkxAccountConfig, type OkxAlgoOrder, type OkxBalance, type OkxLeverageInfo, type OkxOrder, type OkxPosition, type OkxSetLeverageParams, type OkxWsData } from '@pegasus/okx';
+import { D, ZERO, type AccountConfig, type AccountError, type AccountStatus, type AlgoOrderList, type Balance, type ConnState, type Fill, type Order, type Position, type TdMode } from '@pegasus/shared';
 import type { Store } from '../db/store.js';
 import { NotConnectedError, ReadOnlyKeyError } from '../errors.js';
 import type { Logger } from '../logger.js';
 import type { OkxClients } from '../okx/clients.js';
-import { failedAttachedStop, fillFromOrderPush, mapBalance, mapFill, mapOrder, mapPosition, positionKey } from '../okx/mappers.js';
+import { failedAttachedStop, fillFromOrderPush, mapAlgoOrder, mapBalance, mapFill, mapOrder, mapPosition, positionKey } from '../okx/mappers.js';
 
 export interface AccountEvents {
   order: [Order];
   fill: [Fill];
   positions: [Position[]];
   balance: [Balance];
+  /** The stop-loss / take-profit algo orders were read from the exchange; emitted after every read, changed or not. */
+  algoOrders: [AlgoOrderList];
   /** The account config was loaded for the first time or changed on the exchange. */
   config: [AccountConfig];
   /** The private socket state or the account status (state, error, read-only) changed. */
@@ -24,6 +26,16 @@ const RECONCILE_MS = 60_000;
 const LEVERAGE_TTL_MS = 30_000;
 /** An order the exchange no longer knows (51603) is dropped at once when older than this; a younger one may just not be queryable yet. */
 const VANISHED_ORDER_AGE_MS = 120_000;
+/** The two TP/SL algo order types; OKX lists them together in one call. */
+const ALGO_ORD_TYPES = 'conditional,oco';
+const ALGO_PAGE_SIZE = 100;
+const ALGO_MAX_PAGES = 5;
+/**
+ * A fill, a cancel or a position change may have created, consumed or orphaned a stop. Algo orders are not on
+ * the private socket, so the list is read again this long after such an event, and once more for an exchange
+ * that was slow to act on it.
+ */
+const ALGO_REFRESH_DELAYS_MS = [1_000, 5_000] as const;
 
 function mapConfig(c: OkxAccountConfig): AccountConfig {
   const perms = (c.perm ?? '').split(',').map((p) => p.trim()).filter((p) => p !== '');
@@ -48,6 +60,12 @@ export class AccountService extends EventEmitter<AccountEvents> {
   balance: Balance | null = null;
   readonly positions = new Map<string, Position>();
   readonly openOrders = new Map<string, Order>();
+  /** The stop-loss / take-profit algo orders as last read over REST; null until the first read succeeded. */
+  algoOrders: AlgoOrderList | null = null;
+  /** The algo order read in flight, if any. */
+  private algoSyncing: Promise<AlgoOrderList> | null = null;
+  /** Pending delayed reads of the algo orders, by their delay. */
+  private readonly algoTimers = new Map<number, NodeJS.Timeout>();
   private readonly seenFills = new Set<string>();
   /** Orders already seen in a terminal state; guards against a late local insert after the fill push raced the order ack. */
   private readonly closedOrders = new Set<string>();
@@ -159,6 +177,8 @@ export class AccountService extends EventEmitter<AccountEvents> {
     this.retryTimer = null;
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     this.reconcileTimer = null;
+    for (const timer of this.algoTimers.values()) clearTimeout(timer);
+    this.algoTimers.clear();
     await this.clients.wsPrivate?.close();
   }
 
@@ -380,6 +400,71 @@ export class AccountService extends EventEmitter<AccountEvents> {
       this.noteFailure(err);
       throw err;
     }
+    // Apart from the account itself: a failed read of the stops must not fail the reconcile of balance, positions and orders.
+    await this.readAlgoOrdersQuietly();
+  }
+
+  // ---- algo orders (stops) ----
+
+  /**
+   * Reads the TP/SL algo orders from the exchange now and resolves with the list read; rejects with the reason
+   * when the read failed. Does not need the private stream.
+   */
+  async refreshAlgoOrders(): Promise<AlgoOrderList> {
+    if (!this.enabled) throw new NotConnectedError('OKX private API (no credentials configured)');
+    // A read already in flight may have started before the caller's last write: wait, then read again.
+    while (this.algoSyncing) await this.algoSyncing.catch(() => undefined);
+    const run = this.pullAlgoOrders().finally(() => {
+      if (this.algoSyncing === run) this.algoSyncing = null;
+    });
+    this.algoSyncing = run;
+    return run;
+  }
+
+  /** A read whose failure is only logged: the list keeps the time of the last successful read, which the terminal shows. */
+  private async readAlgoOrdersQuietly(): Promise<void> {
+    if (!this.enabled || this.stopped) return;
+    try {
+      await this.refreshAlgoOrders();
+    } catch (err) {
+      this.log.warn({ err: (err as Error).message, lastReadAt: this.algoOrders?.ts ?? null }, 'algo order read failed; the stops shown are the ones of the last successful read');
+    }
+  }
+
+  /** Something happened that may have created, consumed or orphaned a stop: read the list again shortly. */
+  expectAlgoChange(): void {
+    if (!this.enabled || this.stopped) return;
+    for (const delay of ALGO_REFRESH_DELAYS_MS) {
+      if (this.algoTimers.has(delay)) continue;
+      const timer = setTimeout(() => {
+        this.algoTimers.delete(delay);
+        void this.readAlgoOrdersQuietly();
+      }, delay);
+      timer.unref();
+      this.algoTimers.set(delay, timer);
+    }
+  }
+
+  private async pullAlgoOrders(): Promise<AlgoOrderList> {
+    const rows: OkxAlgoOrder[] = [];
+    let after: string | undefined;
+    for (let page = 1; ; page++) {
+      const params: { ordType: string; instType: 'SWAP'; limit: number; after?: string } = { ordType: ALGO_ORD_TYPES, instType: 'SWAP', limit: ALGO_PAGE_SIZE };
+      if (after !== undefined) params.after = after;
+      const batch = await this.clients.rest.getAlgoOrdersPending(params);
+      rows.push(...batch);
+      const last = batch[batch.length - 1];
+      if (batch.length < ALGO_PAGE_SIZE || !last) break;
+      if (page === ALGO_MAX_PAGES) {
+        this.log.warn({ read: rows.length }, 'more algo orders than are read; the stops shown are incomplete');
+        break;
+      }
+      after = last.algoId;
+    }
+    const list: AlgoOrderList = { orders: rows.map(mapAlgoOrder).sort((a, b) => b.cTime - a.cTime), ts: Date.now() };
+    this.algoOrders = list;
+    this.emit('algoOrders', list);
+    return list;
   }
 
   private applyBalance(b: OkxBalance): void {
@@ -394,9 +479,11 @@ export class AccountService extends EventEmitter<AccountEvents> {
     this.emit('balance', this.balance);
   }
 
+  /** Applies a position push; true when it changed the size of the position (opened, grew, shrank or closed). */
   private applyPosition(p: OkxPosition): boolean {
     const pos = mapPosition(p);
     const key = positionKey(pos);
+    const before = this.positions.get(key)?.pos;
     if (D(pos.pos).isZero()) {
       this.closedPositions.set(key, pos.uTime || this.exchangeNow());
       if (this.closedPositions.size > 1_000) this.closedPositions.delete(this.closedPositions.keys().next().value as string);
@@ -404,7 +491,7 @@ export class AccountService extends EventEmitter<AccountEvents> {
     }
     this.closedPositions.delete(key);
     this.positions.set(key, pos);
-    return true;
+    return before === undefined || !D(before).eq(pos.pos);
   }
 
   private onPrivateData(msg: OkxWsData): void {
@@ -414,8 +501,11 @@ export class AccountService extends EventEmitter<AccountEvents> {
         for (const raw of msg.data as OkxOrder[]) this.applyOrderPush(raw);
         return;
       case 'positions': {
-        for (const raw of msg.data as OkxPosition[]) this.applyPosition(raw);
+        let resized = false;
+        for (const raw of msg.data as OkxPosition[]) resized = this.applyPosition(raw) || resized;
         this.emit('positions', this.positionList());
+        // A position that changed size may have gained a stop (its entry filled) or lost one (it was closed).
+        if (resized) this.expectAlgoChange();
         return;
       }
       case 'account': {
@@ -461,6 +551,8 @@ export class AccountService extends EventEmitter<AccountEvents> {
       this.openOrders.set(order.ordId, order);
     } else {
       this.dropOrder(order.ordId);
+      // An order that ended may have generated its attached stop, or be the closing order of a stop that fired.
+      this.expectAlgoChange();
     }
     this.emit('order', order);
     void this.store.upsertOrder(order).catch((err: Error) => this.log.warn({ err: err.message }, 'store.upsertOrder failed'));

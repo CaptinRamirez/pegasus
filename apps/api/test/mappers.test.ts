@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import type { OkxInstrument, OkxOrder, OkxPosition } from '@pegasus/okx';
+import type { OkxAlgoOrder, OkxInstrument, OkxOrder, OkxPosition } from '@pegasus/okx';
 import { CANDLE_BARS } from '@pegasus/shared';
-import { failedAttachedStop, fillFromOrderPush, fromOkxBar, mapInstrument, mapOrder, mapPosition, toOkxBar } from '../src/okx/mappers.js';
+import { failedAttachedStop, fillFromOrderPush, fromOkxBar, mapAlgoOrder, mapInstrument, mapOrder, mapPosition, toOkxBar } from '../src/okx/mappers.js';
 
 const rawInst: OkxInstrument = {
   instType: 'SWAP', instId: 'BTC-USDT-SWAP', uly: 'BTC-USDT', instFamily: 'BTC-USDT', baseCcy: '', quoteCcy: '', settleCcy: 'USDT',
@@ -57,6 +57,27 @@ describe('mappers', () => {
     }
     expect(mapOrder(rawOrder)).not.toHaveProperty('slFailReason');
     expect(failedAttachedStop(rawOrder)).toBeNull();
+  });
+});
+
+describe('algo orders', () => {
+  const raw: OkxAlgoOrder = {
+    instType: 'SWAP', instId: 'BTC-USDT-SWAP', algoId: '2001', algoClOrdId: 'slpgabc', ordType: 'conditional', side: 'sell', posSide: 'net', tdMode: 'cross',
+    sz: '10', closeFraction: '', state: 'live', reduceOnly: 'true', tpTriggerPx: '', tpTriggerPxType: '', tpOrdPx: '',
+    slTriggerPx: '59000', slTriggerPxType: 'mark', slOrdPx: '-1', cTime: '1700000000000', uTime: '1700000000500',
+  };
+
+  it('maps a stop with its trigger price type and times', () => {
+    expect(mapAlgoOrder(raw)).toEqual({
+      algoId: '2001', algoClOrdId: 'slpgabc', instId: 'BTC-USDT-SWAP', side: 'sell', posSide: 'net', tdMode: 'cross', sz: '10', closeFraction: '',
+      slTriggerPx: '59000', slTriggerPxType: 'mark', slOrdPx: '-1', tpTriggerPx: '', cTime: 1700000000000, uTime: 1700000000500,
+    });
+  });
+
+  it('reads a stop without a trigger price type as last-triggered, and a take-profit only order as having no stop', () => {
+    expect(mapAlgoOrder({ ...raw, slTriggerPxType: '' }).slTriggerPxType).toBe('last');
+    expect(mapAlgoOrder({ ...raw, slTriggerPx: '', slTriggerPxType: '', slOrdPx: '', tpTriggerPx: '65000' })).toMatchObject({ slTriggerPx: '', slTriggerPxType: '', tpTriggerPx: '65000' });
+    expect(mapAlgoOrder({ ...raw, sz: '', closeFraction: '1', posSide: 'long', tdMode: 'isolated' })).toMatchObject({ sz: '', closeFraction: '1', posSide: 'long', tdMode: 'isolated' });
   });
 });
 

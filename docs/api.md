@@ -27,7 +27,7 @@ Request bodies are validated with the zod schemas in `packages/shared/src/schema
 
 | Method | Path | Body / query | Returns |
 | --- | --- | --- | --- |
-| GET | `/api/health` | – | `{ ok: true, version, demo, connection: { okxPublic, okxPrivate, okxBusiness }, serverTime }` (no auth, so only the three socket states; the full `ConnectionStatus` is sent over `/ws`). `version` is the short git commit the launcher started the stack from (`PEGASUS_VERSION`), `"unknown"` when the API was started another way |
+| GET | `/api/health` | – | `{ ok: true, version, demo, paper, connection: { okxPublic, okxPrivate, okxBusiness }, serverTime }` (no auth, so only the three socket states; the full `ConnectionStatus` is sent over `/ws`). `version` is the short git commit the launcher started the stack from (`PEGASUS_VERSION`), `"unknown"` when the API was started another way |
 | GET | `/api/instruments` | – | `Instrument[]` (tracked instruments) |
 | GET | `/api/account` | – | `{ config: AccountConfig \| null, balance: Balance \| null }` (`config` is null until the account was loaded) |
 | GET | `/api/account/leverage` | `?instId&mgnMode` | `{ instId, mgnMode, posSide, lever }[]` |
@@ -40,12 +40,16 @@ Request bodies are validated with the zod schemas in `packages/shared/src/schema
 | POST | `/api/orders/preview` | `PlaceOrderRequest` | `OrderPreview` (see below) |
 | POST | `/api/orders` | `PlaceOrderRequest` | `{ order: Order, preview: OrderPreview }` |
 | POST | `/api/orders/cancel` | `CancelOrderRequest` | `{ ordId, clOrdId }` |
-| POST | `/api/orders/cancel-all` | `CancelAllRequest` | `{ canceled: number }` |
+| POST | `/api/orders/cancel-all` | `CancelAllRequest` | `{ canceled: number }` (open orders only; algo orders are not touched) |
+| GET | `/api/algo-orders` | – | `AlgoOrderList`: `{ orders: AlgoOrder[], ts }`, the stop-loss / take-profit algo orders read from OKX for this request (see "Stops" below) |
+| POST | `/api/algo-orders` | `PlaceStopRequest` (`{ instId, mgnMode, posSide?, slTriggerPx, sz? }`) | `201` `{ algoId, instId, slTriggerPx, sz }`: a stop-loss was placed for an open position (see "Stops") |
+| POST | `/api/algo-orders/amend` | `AmendAlgoOrderRequest` (`{ instId, algoId, slTriggerPx }`) | `{ algoId, instId, slTriggerPx, previous }`: the stop was moved from `previous` to `slTriggerPx` (as rounded) |
+| POST | `/api/algo-orders/cancel` | `CancelAlgoOrderRequest` (`{ instId, algoId }`) | `{ algoId, instId }` |
 | GET | `/api/candles` | `CandlesQuery` | `Candle[]` ascending by `ts`; `6H`, `12H`, `1D` and `1W` are UTC-aligned (OKX `6Hutc` … `1Wutc`), also on the `candle` WS message |
 | GET | `/api/book` | `?instId` | `OrderBook` (top 50 each side) |
 | GET | `/api/ticker` | `?instId` | `Ticker` |
 | GET | `/api/risk` | – | `{ config: RiskConfig, state: RiskState }` |
-| GET | `/api/signals` | `?instId&phase&equity&riskPct&maxNotionalPct` (all optional; `phase` is `0` or `12`) | `SignalsResponse`: `{ generatedAt, equity, phases, sizingParams, reports: SignalReportRow[] }` — daily trend-framework signals, one row per instrument and daily cut; see below and `packages/shared/src/signals.ts` |
+| GET | `/api/signals` | `?instId&phase&equity&riskPct&maxNotionalPct&lang` (all optional; `phase` is `0` or `12`, `lang` is `en` or `zh`) | `SignalsResponse`: `{ generatedAt, equity, phases, sizingParams, reports: SignalReportRow[] }` — daily trend-framework signals, one row per instrument and daily cut; see below and `packages/shared/src/signals.ts` |
 | POST | `/api/risk/kill-switch` | `KillSwitchRequest` (`{ enabled, reason?, rebase? }`) | `RiskState` (`cancelSweep` already reflects the new switch position); `409 DAILY_LOSS_ACTIVE` for a release without `rebase` while the daily loss limit is breached |
 
 Daily PnL, its baseline and what survives a restart. `RiskState.dailyPnl` is `currentEquity - dayStartEquity`.
@@ -153,6 +157,12 @@ interface CancelSweep {
   change and the verdict.
 - `indicators.nextExitHigh` / `nextExitLow` are the exit channel including the last bar, the level the next close
   is tested against.
+- `?lang=zh` words the texts of the reports in Chinese: `signals.reasons`, the plans' `note` and `adjustments`
+  (`"做空 x0.5"`, `"危机 x0.5"`, `"拥挤 x0.75（…）"`). Without it, or with `lang=en`, they are in English as quoted in
+  this section; any other value is refused with `VALIDATION`. The decisions and every number are the same in both
+  languages. The terminal sends `lang=zh` while its page is switched to Chinese. An error row's `message` and every
+  other text of the API (error messages, `RiskCheckResult.message`, `killSwitchReason`, `cancelSweep.message`) stay
+  in English: the terminal explains them in Chinese from their codes and `details`.
 - `dataFetchedAt` is when the candles and funding behind a report were fetched from the exchange (the older of the
   two). Candles are cached for 5 minutes per instrument and cut, never across that cut's own close (00:00 UTC for
   `phase: 0`, 12:00 UTC for `phase: 12`); funding is cached for 5 minutes per instrument, never across either close.
@@ -216,7 +226,7 @@ market. Pegasus places no second order and does not watch the price itself.
   table says so in the Stop column (`stopAwaitsFullFill` in `@pegasus/shared`). When such an order ends `canceled`
   with `accFillSz > 0` (`stopUnconfirmedAfterCancel`), the documentation does not say whether a stop is generated
   for the filled part, so the terminal raises one error notice per order (it stays until it is clicked away)
-  telling the trader to check on OKX and place the stop by hand if it is missing.
+  telling the trader to check the Stops tab and place the stop on OKX by hand if it is missing.
 
 - Only an **opening** order may carry one. On an order that closes (reduce-only in net mode, the closing direction
   of a leg in long/short mode) the request is refused with `VALIDATION` (400). In net mode the same holds for an
@@ -244,10 +254,86 @@ market. Pegasus places no second order and does not watch the price itself.
   attached; not stored in the database either. The terminal shows one error notice per order (it stays until it is
   clicked away) telling the trader to place the stop on OKX; the notice is raised from the `order` message and from
   the open orders of `hello`, not once per push.
-- Pegasus does not list, amend or cancel algo orders. Once the entry has filled, the stop lives on OKX only: the
-  order leaves the open orders, and the terminal shows nothing about the stop any more. Moving it and checking that
-  it still exists is done on OKX. The kill switch's cancel sweep cancels open orders, not algo orders: an active
-  attached stop keeps protecting its position; the stop of an entry that is still resting goes with that entry.
+- Once the entry has filled, the order leaves the open orders and its stop is an algo order: it is listed, moved
+  and cancelled through `/api/algo-orders` (next section). The kill switch's cancel sweep and
+  `POST /api/orders/cancel-all` cancel open orders, not algo orders: an active stop keeps protecting its position;
+  the stop of an entry that is still resting goes with that entry.
+
+Stops (algo orders). An `AlgoOrder` is a take-profit / stop-loss order resting at OKX: an OKX algo order of type
+`conditional` (one-way) or `oco`, of a SWAP instrument, tracked by the server or not. That covers the stops generated from
+attached stops and the TP/SL orders placed on OKX itself; trigger, trailing, iceberg and TWAP orders are not read.
+
+```ts
+interface AlgoOrder {
+  algoId: string;
+  algoClOrdId: string;          // for a stop that came from an attached stop: 'sl' + the tail of the entry's clOrdId
+  instId: string;
+  side: 'buy' | 'sell';         // side of the closing order it sends: sell closes a long, buy closes a short
+  posSide: 'long' | 'short' | 'net';
+  tdMode: 'cross' | 'isolated';
+  sz: string;                   // contracts it closes; '' when closeFraction is set
+  closeFraction: string;        // '1': closes the whole position whatever its size then; '' when it closes sz
+  slTriggerPx: string;          // '' for a take-profit only order
+  slTriggerPxType: 'last' | 'index' | 'mark' | '';
+  slOrdPx: string;              // '-1': executed at market
+  tpTriggerPx: string;          // '' when none
+  cTime: number;
+  uTime: number;
+}
+interface AlgoOrderList { orders: AlgoOrder[]; ts: number }   // newest first; ts: when the server read it from OKX
+```
+
+- **How the list is kept.** Algo orders are not on the private socket Pegasus uses (their channel is on the
+  business socket and needs its own login), so they are read over REST (`GET /api/v5/trade/orders-algo-pending`,
+  `ordType=conditional,oco`, `instType=SWAP`): with every account reconcile (60 s, and when the private socket
+  becomes ready), 1 s and again 5 s after an order ended (filled or cancelled: its attached stop exists only then,
+  and the closing order of a stop that fired is an order too) or a position changed size, after every amend and
+  cancel made through this API, and for every `GET /api/algo-orders`. Up to 500 are read (5 pages); more is logged.
+  A change made on OKX itself is therefore seen within a minute, not at once.
+- Every successful read is sent to the terminals as `{ type: 'algoOrders', data: AlgoOrderList }`, changed or not,
+  so `ts` says how fresh the list is. `hello.algoOrders` is the last list, `null` until the first read succeeded
+  (and for good without an API key). A failed read is logged, does not fail the account reconcile and does not
+  change `ConnectionStatus`: the last list is kept with its `ts`. The terminal marks the list "not refreshed
+  since" once `ts` is older than 150 s.
+- `GET /api/algo-orders` always reads the exchange and answers with that read; a failure is the exchange's
+  (`EXCHANGE`, `EXCHANGE_UNREACHABLE`) or `NOT_CONNECTED` without an API key. It needs no trade permission.
+- `POST /api/algo-orders/amend` moves the stop-loss trigger and nothing else: OKX is sent `newSlTriggerPx` only, so
+  size, trigger price type and execution stay as they are (OKX refuses a change of the trigger price type, and of
+  the price or size of a stop that closes a whole position).
+  - The order is looked up in a fresh read first: `ALGO_NOT_FOUND` (404) when no resting algo order has that
+    `algoId` and `instId` (it triggered or was cancelled); `VALIDATION` (400) for an order without a stop-loss.
+  - The trigger is rounded to `tickSz` towards the price (up for a stop that closes a long, down for one that
+    closes a short: the smaller loss). The tick comes from the contract spec of any SWAP known at start-up; for an
+    instrument without one the price is sent as given.
+  - `VALIDATION` (400) when the rounded trigger equals the current one, or, for a **mark-triggered** stop, when it
+    is not on the losing side of the live mark price (`details: { slTriggerPx, markPx }`): it would fire at once.
+    Without a live mark price the request is refused with `NO_PRICE` (503). For a stop triggered by the last or the
+    index price the server does not check the side; the exchange decides.
+  - The server does not refuse a move that widens the loss; the terminal asks for a confirmation before sending one.
+- `POST /api/algo-orders` places a stop-loss for an open position that has none, or not for all of it: an OKX
+  `conditional` algo order, **mark-triggered**, executed at market, on the closing side of the position. In net
+  mode it is sent with `reduceOnly: true` and `cxlOnClosePos: true` (OKX cancels it when the position is fully
+  closed); in long/short mode with the position's `posSide` instead.
+  - The position is the one of `instId`, `mgnMode` and, in long/short mode, `posSide` (required there) in the
+    server's mirror; `VALIDATION` (400) when there is none.
+  - The stops are read fresh from the exchange and summed with `stopCoverage`. `sz` defaults to the contracts they
+    leave uncovered; `VALIDATION` (400, `details: { covered, size }`) when nothing is uncovered or `sz` is more
+    than that, so this route never creates more stop than position.
+  - The trigger is rounded and checked as for a move: to `tickSz` towards the price, and on the losing side of
+    the live mark price (`VALIDATION` with `details: { slTriggerPx, markPx }`; `NO_PRICE` without a live mark).
+  - `algoClOrdId` is `sl` followed by a generated id.
+- `POST /api/algo-orders/cancel` cancels whatever algo order rests under that `algoId`; like the cancel of an order
+  it needs neither a tracked instrument nor the order in the server's list. The exchange's refusal (an unknown or
+  already triggered order) is passed on as `EXCHANGE` with `details.okxCode`.
+- The three writes need credentials and the trade permission (`NOT_CONNECTED`, `READ_ONLY_KEY`), not the private
+  stream, and are accepted while the kill switch is on. Each is logged and recorded as a risk event
+  (`STOP_PLACED`, `STOP_AMENDED` with `from` and `to`, `STOP_CANCELED`).
+- Not offered: changing the size of a stop (cancel it and place a new one for the size wanted), take-profit
+  orders, and moving the stop of an entry that is still resting (cancel the entry and place it again).
+- `stopCoverage(position, algoOrders)` in `@pegasus/shared` sums the stops of a position (same instrument, margin
+  mode and leg, on the closing side; a `closeFraction` stop counts that fraction of the position) and reports
+  `none`, `partial`, `full` or `over`. The positions table shows it in its Stop column: the trigger prices, and a
+  tag unless the stops close exactly the position (`over`: a lot was closed and its stop was left resting).
 
 Exits. An order that can only reduce exposure (reduce-only in net mode, the closing direction of a leg in long/short
 mode) skips the leverage, slippage and exposure rules, so it is neither refused with `LEVERAGE_UNAVAILABLE` nor with
@@ -357,6 +443,24 @@ Open orders first.
 `Position.margin` is the posted margin of an isolated position and the initial margin requirement (`imr`) of a
 cross position; `""` when OKX reports neither.
 
+Paper trading. With `PAPER_EXCHANGE_URL` set (the launcher's `--paper`, or `PAPER_TRADING=1` in `.env`) the API
+keeps reading market data from OKX's live hosts (`OKX_DEMO` is ignored, `demo` is `false`) and sends every signed
+REST request and its private WebSocket to the paper exchange at that URL (`packages/paper`), which speaks the same
+OKX protocol. The contract of this document does not change: routes, messages and error codes are the same, an
+`EXCHANGE` error carries the paper exchange's code. What differs:
+
+- `hello.paper` and `GET /api/health` `paper` are `true`; the terminal shows the badge PAPER.
+- No OKX key is used. Credentials in the environment are ignored (the API signs with a placeholder and the paper
+  exchange checks no signature), so one or two of the three being set is not an error in this mode.
+- The account is the paper account in `PAPER_STATE_FILE` (default `data/paper-account.json`): balance, positions,
+  orders, stops and a funding ledger. Matching, the replay of the time it was not running, funding and what is
+  not simulated (liquidation, queue position, take-profit) are described in the README ("纸面交易") and in the
+  headers of `packages/paper/src/replay.ts`, `funding.ts` and `live-market.ts`.
+- The launcher gives the API its own `STATE_FILE` (`data/pegasus-state.paper.json`) and no `DATABASE_URL`, so the
+  kill switch, the day baseline and the journal of the paper account are not mixed with a real account's.
+- Order and fill times of events that were replayed are the times they happened at (the end of their candle),
+  not the time the program was started again.
+
 Error codes returned by the API:
 
 | code | meaning |
@@ -373,7 +477,8 @@ Error codes returned by the API:
 | `NOT_CONNECTED` | no API key configured, the account config (position mode) not loaded yet, or, for `POST /api/orders` only, the private stream not ready (503) |
 | `READ_ONLY_KEY` | the API key has no trade permission; nothing was sent to the exchange (403) |
 | `DAILY_LOSS_ACTIVE` | the kill switch was not released because the daily loss limit is still breached; repeat with `rebase: true` to release and restart the baseline (409, `details`: `dailyPnl`, `limit`, `equity`) |
-| `NO_PRICE` | no reference price for the instrument yet, or its market data is stale (503); also an order with an attached stop-loss while there is no live mark price |
+| `NO_PRICE` | no reference price for the instrument yet, or its market data is stale (503); also an order with an attached stop-loss, or a move of a mark-triggered stop, while there is no live mark price |
+| `ALGO_NOT_FOUND` | `POST /api/algo-orders/amend`: no resting algo order with that `algoId` and `instId` in a fresh read of the exchange (404) |
 | `NO_BOOK` | opening market order refused because the order book is not synced or is stale, so slippage cannot be estimated (503) |
 | `NO_DATA` | `/api/ticker` or `/api/book` has nothing yet for the instrument, or the book is stale (503) |
 | `LEVERAGE_UNAVAILABLE` | the leverage lookup failed or returned nothing; an opening order is refused rather than checked against an unknown leverage (503) |
@@ -386,14 +491,16 @@ Error codes returned by the API:
 Protocol types are in `packages/shared/src/ws-protocol.ts`. The upgrade request passes the same `Host` and
 `Origin` checks as every other request (a browser always sends `Origin` on a WebSocket handshake).
 
-1. On connect the server sends `hello` with instruments, account config, risk config/state,
-   connection status, balance, positions and open orders. `hello.account` is null while the account config
+1. On connect the server sends `hello` with `demo`, `paper` (see "Paper trading"), instruments, account config, risk config/state,
+   connection status, balance, positions, open orders and the algo orders (`algoOrders`, null until they were
+   read from the exchange once). `hello.account` is null while the account config
    is not loaded; `{ type: 'account', data: AccountConfig }` follows when it loads and whenever it changes.
 2. The client sends `{ type: 'subscribe', instId, bar? }` to start receiving `ticker`,
    `book` (top 50, throttled to ~10/s), `trades`, `candle`, `markPrice`, `fundingRate`
    for that instrument. `setBar` switches the candle interval; `unsubscribe` stops market data.
-3. Private pushes (`order`, `fill`, `positions`, `balance`, `account`, `risk`, `connection`) are sent to
-   every authenticated client regardless of subscriptions.
+3. Private pushes (`order`, `fill`, `positions`, `algoOrders`, `balance`, `account`, `risk`, `connection`) are
+   sent to every authenticated client regardless of subscriptions. `algoOrders` carries the whole list after
+   every read of the exchange (see "Stops" above).
 4. `connection` is sent every 5 s and at once when a socket state, the set of stale streams or the account
    status changes, so a client always hears from the server within 5 s. The terminal treats 20 s of silence on
    an open socket as a dead connection and reconnects, and shows a banner while the socket is down, an OKX feed

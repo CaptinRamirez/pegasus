@@ -84,6 +84,9 @@ export interface OkxTrade {
 /** [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm] */
 export type OkxCandleRow = [string, string, string, string, string, string, string, string, string];
 
+/** [ts, open, high, low, close, confirm] of the mark price candle endpoints */
+export type OkxMarkPriceCandleRow = [string, string, string, string, string, string];
+
 export interface OkxMarkPrice {
   instType: OkxInstType;
   instId: string;
@@ -319,6 +322,88 @@ export interface OkxAmendOrderParams {
   newPx?: string;
   cxlOnFail?: boolean;
   reqId?: string;
+}
+
+export type OkxAlgoOrderState = 'live' | 'pause' | 'partially_effective' | 'effective' | 'canceled' | 'order_failed' | 'partially_failed';
+
+/**
+ * A take-profit / stop-loss algo order (`conditional`: one-way, `oco`: both) of the algo order list. The stop
+ * attached to an order becomes one of these once that order is completely filled. Only the fields the terminal reads.
+ */
+export interface OkxAlgoOrder {
+  instType: OkxInstType;
+  instId: string;
+  algoId: string;
+  /** For an attached stop: the attachAlgoClOrdId of the order it came from */
+  algoClOrdId: string;
+  ordType: string;
+  /** Side of the order it sends when triggered */
+  side: OkxSide;
+  posSide: OkxPosSide;
+  tdMode: OkxTdMode;
+  /** Contracts; '' when the order closes a fraction of the position instead */
+  sz: string;
+  /** '1' closes the whole position, whatever its size when triggered; '' otherwise */
+  closeFraction: string;
+  state: OkxAlgoOrderState;
+  reduceOnly: string;
+  tpTriggerPx: string;
+  tpTriggerPxType: string;
+  tpOrdPx: string;
+  slTriggerPx: string;
+  slTriggerPxType: string;
+  /** '-1' executes at market */
+  slOrdPx: string;
+  cTime: string;
+  uTime: string;
+}
+
+/** A stop-loss placed on its own for an open position (`ordType` conditional). */
+export interface OkxPlaceAlgoParams {
+  instId: string;
+  tdMode: OkxTdMode;
+  /** Side of the closing order: sell for a long, buy for a short */
+  side: OkxSide;
+  ordType: 'conditional';
+  sz: string;
+  slTriggerPx: string;
+  /** '-1' executes at market */
+  slOrdPx: string;
+  slTriggerPxType: OkxTriggerPxType;
+  /** Long/short mode only */
+  posSide?: OkxPosSide;
+  /** Net mode only */
+  reduceOnly?: boolean;
+  /** Cancel the stop when its position is fully closed; OKX requires reduceOnly with it */
+  cxlOnClosePos?: boolean;
+  algoClOrdId?: string;
+}
+
+export interface OkxCancelAlgoParams {
+  instId: string;
+  algoId?: string;
+  algoClOrdId?: string;
+}
+
+/** Amend of a TP/SL algo order; only the fields that change are sent. */
+export interface OkxAmendAlgoParams {
+  instId: string;
+  algoId?: string;
+  algoClOrdId?: string;
+  newSz?: string;
+  newSlTriggerPx?: string;
+  newSlOrdPx?: string;
+  newSlTriggerPxType?: OkxTriggerPxType;
+  cxlOnFail?: boolean;
+  reqId?: string;
+}
+
+export interface OkxAlgoAck {
+  algoId: string;
+  algoClOrdId?: string;
+  reqId?: string;
+  sCode: string;
+  sMsg: string;
 }
 
 export interface OkxClosePositionParams {

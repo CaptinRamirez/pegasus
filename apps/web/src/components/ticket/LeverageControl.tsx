@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { Instrument, SetLeverageRequest, TdMode } from '@pegasus/shared';
+import { errorText, useLang, useT } from '../../i18n';
 import { api } from '../../lib/api';
-import { errorMessage } from '../../lib/http';
-import { blockTitle, getTradingBlock, useStore } from '../../store/store';
+import { getTradingBlock, useStore } from '../../store/store';
 
 interface Props {
   inst: Instrument;
@@ -13,6 +13,8 @@ interface Props {
 }
 
 export function LeverageControl({ inst, tdMode, posSide, longShort }: Props) {
+  const t = useT();
+  const lang = useLang();
   const pushToast = useStore((s) => s.pushToast);
   const riskMax = useStore((s) => s.riskConfig?.maxLeverage ?? null);
   const tradingBlock = useStore(getTradingBlock);
@@ -38,15 +40,15 @@ export function LeverageControl({ inst, tdMode, posSide, longShort }: Props) {
     mutationFn: (body: SetLeverageRequest) => api.setLeverage(body),
     onSuccess: (data) => {
       queryClient.setQueryData(queryKey, data);
-      pushToast('success', `Leverage set to ${data[0]?.lever ?? value}x on ${inst.instId}`);
+      pushToast('success', t.leverage.set(data[0]?.lever ?? value, inst.instId));
     },
-    onError: (e) => pushToast('error', errorMessage(e)),
+    onError: (e) => pushToast('error', errorText(e, t)),
   });
 
   const submit = () => {
     const lever = value.trim();
     if (!/^\d+(\.\d+)?$/.test(lever)) {
-      pushToast('error', 'Leverage must be a positive number');
+      pushToast('error', t.leverage.invalid);
       return;
     }
     const body: SetLeverageRequest = longShort
@@ -55,28 +57,27 @@ export function LeverageControl({ inst, tdMode, posSide, longShort }: Props) {
     set.mutate(body);
   };
 
-  const hint = `max ${inst.maxLever}x exchange${riskMax === null ? '' : `, ${riskMax}x risk`}`;
   return (
     <div className="field">
       <label>
-        Leverage <span className="dim">({hint})</span>
-        {failed && <span className="neg"> unavailable</span>}
+        {t.leverage.label} <span className="dim">({t.leverage.hint(inst.maxLever, riskMax)})</span>
+        {failed && <span className="neg"> {t.leverage.unavailable}</span>}
       </label>
       <div className="input-group">
         <input
           className="num"
           inputMode="decimal"
           value={value}
-          placeholder={current.isLoading ? '…' : failed ? 'unavailable' : '1'}
+          placeholder={current.isLoading ? '…' : failed ? t.leverage.unavailable : '1'}
           onChange={(e) => setValue(e.target.value)}
         />
         <button
           className="btn"
           onClick={submit}
           disabled={set.isPending || value.trim() === '' || tradingBlock !== null}
-          {...(tradingBlock === null ? {} : { title: blockTitle(tradingBlock) })}
+          {...(tradingBlock === null ? {} : { title: tradingBlock[lang] })}
         >
-          Set
+          {t.leverage.setButton}
         </button>
       </div>
     </div>

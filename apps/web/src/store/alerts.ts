@@ -1,12 +1,10 @@
-import { D, Decimal, floorToStep, notionalQuote, type ConnectionStatus, type InstId, type Instrument, type MarketStream, type Position, type PositionOverLimit, type RiskState } from '@pegasus/shared';
+import { D, Decimal, floorToStep, notionalQuote, type AlgoOrderList, type ConnState, type ConnectionStatus, type InstId, type Instrument, type Lang, type Localized, type MarketStream, type Position, type PositionOverLimit, type RiskState } from '@pegasus/shared';
 import { fmtNum, fmtTime } from '../lib/format';
 import type { TerminalState } from './types';
 
-/** One line of the banner under the header: English first, then a short Chinese line for the owner. */
-export interface Alert {
+/** One line of the banner under the header, in both languages: the banner shows the one of the page. */
+export interface Alert extends Localized {
   id: string;
-  en: string;
-  zh: string;
 }
 
 export type AlertInput = Pick<TerminalState, 'wsStatus' | 'wsDownSince' | 'lastMessageAt' | 'connection' | 'connectionAt' | 'privateDownSince'>;
@@ -16,7 +14,13 @@ type AlertCondition = (s: AlertInput, now: number) => Alert | null;
 /** A reconnect that succeeds within this time is not worth a banner. */
 export const BACKEND_DOWN_GRACE_MS = 3_000;
 const STREAMS_NAMED = 3;
-const STREAM_LABEL: Record<MarketStream, string> = { ticker: 'price', book: 'order book', mark: 'mark price' };
+const STREAM_LABEL: Record<MarketStream, Localized> = {
+  ticker: { en: 'price', zh: '价格' },
+  book: { en: 'order book', zh: '盘口' },
+  mark: { en: 'mark price', zh: '标记价格' },
+};
+/** A socket state as the Chinese lines name it; the English ones use the state's own word. */
+const CONN_ZH: Record<ConnState, string> = { connected: '已连接', connecting: '正在重连', disconnected: '已断开' };
 /** Account data older than this is labelled with the time it is from: the reconcile runs every 60 s. */
 export const ACCOUNT_STALE_MS = 90_000;
 /** The account stream reconnects by itself within seconds; only a longer outage is worth a banner. */
@@ -43,41 +47,44 @@ const backendDown: AlertCondition = (s, now) => {
     return {
       id: 'backend',
       en: `Cannot reach the backend (trying since ${fmtTime(s.wsDownSince)}). Nothing below is live.`,
-      zh: '无法连接后端，下方数据不是实时数据',
+      zh: `无法连接后端（自 ${fmtTime(s.wsDownSince)} 起持续重试）。下方数据都不是实时数据。`,
     };
   }
   return {
     id: 'backend',
     en: `Backend disconnected since ${fmtTime(s.lastMessageAt)}. Prices, order book and positions below are frozen.`,
-    zh: '与后端的连接已断开，下方数据已停止更新',
+    zh: `与后端的连接已于 ${fmtTime(s.lastMessageAt)} 断开。下方的价格、盘口和持仓已停止更新。`,
   };
 };
 
 /** " Oldest data: 14:03:22." when the server knows how old its market data is. */
-function oldestData(c: ConnectionStatus, at: number | null): string {
-  return at === null || c.dataAgeMs < 0 ? '' : ` Oldest data: ${fmtTime(at - c.dataAgeMs)}.`;
+function oldestData(c: ConnectionStatus, at: number | null): Localized {
+  if (at === null || c.dataAgeMs < 0) return { en: '', zh: '' };
+  const time = fmtTime(at - c.dataAgeMs);
+  return { en: ` Oldest data: ${time}.`, zh: `最旧的数据来自 ${time}。` };
 }
 
 const okxMarketDown: AlertCondition = (s) => {
   const c = s.connection;
   if (c === null || c.okxPublic === 'connected') return null;
+  const oldest = oldestData(c, s.connectionAt);
   return {
     id: 'okx-public',
-    en: `OKX market data feed ${c.okxPublic}. Prices and order books are frozen.${oldestData(c, s.connectionAt)}`,
-    zh: '与 OKX 的行情连接已断开，价格和盘口已停止更新',
+    en: `OKX market data feed ${c.okxPublic}. Prices and order books are frozen.${oldest.en}`,
+    zh: `OKX 行情连接${CONN_ZH[c.okxPublic]}，价格和盘口已停止更新。${oldest.zh}`,
   };
 };
 
 const okxCandlesDown: AlertCondition = (s) => {
   const c = s.connection;
   if (c === null || c.okxBusiness === 'connected') return null;
-  return { id: 'okx-business', en: `OKX candle feed ${c.okxBusiness}. The chart is not updating.`, zh: 'K线连接已断开，图表已停止更新' };
+  return { id: 'okx-business', en: `OKX candle feed ${c.okxBusiness}. The chart is not updating.`, zh: `OKX K线连接${CONN_ZH[c.okxBusiness]}，图表已停止更新。` };
 };
 
-function describeStream(key: string): string {
+function describeStream(key: string, lang: Lang): string {
   const i = key.lastIndexOf(':');
   const stream = key.slice(i + 1);
-  const label = stream === 'ticker' || stream === 'book' || stream === 'mark' ? STREAM_LABEL[stream] : stream;
+  const label = stream === 'ticker' || stream === 'book' || stream === 'mark' ? STREAM_LABEL[stream][lang] : stream;
   return `${key.slice(0, i)} ${label}`;
 }
 
@@ -85,12 +92,13 @@ const staleStreams: AlertCondition = (s) => {
   const c = s.connection;
   // With the feed itself down every stream is listed; the feed alert already says so.
   if (c === null || c.okxPublic !== 'connected' || c.staleStreams.length === 0) return null;
-  const named = c.staleStreams.slice(0, STREAMS_NAMED).map(describeStream).join(', ');
-  const more = c.staleStreams.length > STREAMS_NAMED ? ` (+${c.staleStreams.length - STREAMS_NAMED} more)` : '';
+  const named = (lang: Lang): string => c.staleStreams.slice(0, STREAMS_NAMED).map((key) => describeStream(key, lang)).join(lang === 'zh' ? '、' : ', ');
+  const extra = c.staleStreams.length - STREAMS_NAMED;
+  const oldest = oldestData(c, s.connectionAt);
   return {
     id: 'stale',
-    en: `Market data stopped updating: ${named}${more}. Those values are frozen.${oldestData(c, s.connectionAt)}`,
-    zh: '部分行情已停止更新，相关价格和盘口可能已过期',
+    en: `Market data stopped updating: ${named('en')}${extra > 0 ? ` (+${extra} more)` : ''}. Those values are frozen.${oldest.en}`,
+    zh: `部分行情已停止更新：${named('zh')}${extra > 0 ? `（另有 ${extra} 项）` : ''}。这些数值已不再变化。${oldest.zh}`,
   };
 };
 
@@ -105,7 +113,7 @@ const accountStreamDown: AlertCondition = (s, now) => {
   return {
     id: 'okx-private',
     en: `OKX account stream ${c.okxPrivate} since ${fmtTime(s.privateDownSince)}. Positions, orders and balance refresh only about once a minute.`,
-    zh: 'OKX 账户推送已断开，持仓、委托和余额约每分钟才刷新一次',
+    zh: `OKX 账户推送自 ${fmtTime(s.privateDownSince)} 起${CONN_ZH[c.okxPrivate]}。持仓、委托和余额约每分钟才刷新一次。`,
   };
 };
 
@@ -120,14 +128,14 @@ const accountFailed: AlertCondition = (s, now) => {
     return {
       id: 'account',
       en: `Account data is not updating${why.en} (${said}). Positions, orders and balance are NOT loaded: an empty table does not mean a flat account.`,
-      zh: `账户数据未更新${why.zh}。持仓、委托和余额尚未加载，空表不代表空仓`,
+      zh: `账户数据未更新${why.zh}（${said}）。持仓、委托和余额尚未加载：空表不代表空仓。`,
     };
   }
   if (now - a.lastSyncAt > ACCOUNT_STALE_MS) {
     return {
       id: 'account',
       en: `Account data is not updating since ${fmtTime(a.lastSyncAt)}${why.en} (${said}). Positions, orders and balance below are from that time.`,
-      zh: `账户数据已停止更新${why.zh}。下方持仓、委托和余额不是最新数据`,
+      zh: `账户数据自 ${fmtTime(a.lastSyncAt)} 起停止更新${why.zh}（${said}）。下方的持仓、委托和余额是那一刻的数据。`,
     };
   }
   // The data is still arriving one way or the other: say which half is missing instead of "not updating".
@@ -135,13 +143,13 @@ const accountFailed: AlertCondition = (s, now) => {
     return {
       id: 'account',
       en: `The last account refresh failed${why.en} (${said}). Live updates from the account stream still arrive.`,
-      zh: `账户定时刷新失败${why.zh}，实时推送仍在更新`,
+      zh: `最近一次账户刷新失败${why.zh}（${said}）。账户推送的实时更新仍在到达。`,
     };
   }
   return {
     id: 'account',
     en: `Live account stream unavailable${why.en} (${said}). Positions, orders and balance refresh about once a minute.`,
-    zh: `账户实时推送不可用${why.zh}。持仓、委托和余额约每分钟刷新一次`,
+    zh: `账户实时推送不可用${why.zh}（${said}）。持仓、委托和余额约每分钟刷新一次。`,
   };
 };
 
@@ -163,6 +171,17 @@ export function accountAsOf(connection: ConnectionStatus | null, now: number): n
   return at !== null && now - at > ACCOUNT_STALE_MS ? at : null;
 }
 
+/**
+ * Stops older than this are marked with the time they were read: the server reads them with every reconcile
+ * (60 s) and sends the list after each read, so a list this old means its reads are failing or the socket is down.
+ */
+export const STOPS_STALE_MS = 150_000;
+
+/** The time the stops were read, when that is worth a warning: once the list is older than STOPS_STALE_MS; null while fresh or not read. */
+export function stopsAsOf(list: AlgoOrderList | null, now: number): number | null {
+  return list !== null && now - list.ts > STOPS_STALE_MS ? list.ts : null;
+}
+
 export type AccountUnknown = 'waiting' | 'disabled' | 'loading' | 'failed' | 'unloaded';
 
 /**
@@ -182,17 +201,19 @@ export function accountUnknown(s: Pick<TerminalState, 'connection' | 'accountLoa
 }
 
 /** What the kill switch's cancel sweep will do, for the confirmation dialog: it must not promise a cancel that cannot happen. */
-export function killSwitchSweepNotice(s: Pick<TerminalState, 'connection' | 'account'>): string {
+export function killSwitchSweepNotice(s: Pick<TerminalState, 'connection' | 'account'>, lang: Lang = 'en'): string {
+  const zh = lang === 'zh';
   if (s.connection?.account.state === 'disabled') {
-    return 'No API key is configured, so Pegasus cannot cancel anything: your open orders on OKX stay as they are.';
+    return zh ? '未配置 API key，Pegasus 无法撤销任何委托：你在 OKX 上的当前委托保持不变。' : 'No API key is configured, so Pegasus cannot cancel anything: your open orders on OKX stay as they are.';
   }
   if (s.account === null) {
-    return 'The account is not loaded, so Pegasus may not be able to cancel your open orders: check them on OKX and cancel them there.';
+    return zh ? '账户尚未加载，Pegasus 可能无法撤销你的当前委托：请到 OKX 上查看并在那里撤单。' : 'The account is not loaded, so Pegasus may not be able to cancel your open orders: check them on OKX and cancel them there.';
   }
   // The sweep is not attempted with a key that cannot trade.
   if (!s.account.canTrade) {
-    return 'This API key is read-only, so Pegasus cannot cancel anything: your open orders on OKX stay as they are.';
+    return zh ? '该 API key 为只读，Pegasus 无法撤销任何委托：你在 OKX 上的当前委托保持不变。' : 'This API key is read-only, so Pegasus cannot cancel anything: your open orders on OKX stay as they are.';
   }
+  if (zh) return '账户上的全部当前委托都会被撤销，包括挂着的离场委托（止盈 / 止损限价单）和你直接在 OKX 上下的委托。OKX 上的条件（策略）止损单不受影响。持仓保持不变。';
   return (
     'ALL open orders on the account will be cancelled, including resting exit orders (take-profit / stop limit orders) and orders you placed on OKX directly. ' +
     'Conditional (algo) stop orders on OKX are not touched. Positions stay open.'
@@ -252,14 +273,21 @@ export function trimShares(positions: Position[], over: PositionOverLimit): Map<
 }
 
 /** The one-line advisory of the risk panel while a position has outgrown a notional limit; null while none has. */
-export function overLimitNotice(risk: Pick<RiskState, 'overLimit' | 'totalOverLimit'> | null): string | null {
+export function overLimitNotice(risk: Pick<RiskState, 'overLimit' | 'totalOverLimit'> | null, lang: Lang = 'en'): string | null {
   if (risk === null) return null;
+  const zh = lang === 'zh';
   const parts: string[] = [];
   if (risk.overLimit.length > 0) {
-    parts.push(`Over the per-instrument limit: ${risk.overLimit.map((o) => `${o.instId} by ${fmtNum(o.excess, 0)} USD`).join(', ')}.`);
+    parts.push(
+      zh
+        ? `超过单合约上限：${risk.overLimit.map((o) => `${o.instId} 超出 ${fmtNum(o.excess, 0)} USD`).join('、')}。`
+        : `Over the per-instrument limit: ${risk.overLimit.map((o) => `${o.instId} by ${fmtNum(o.excess, 0)} USD`).join(', ')}.`,
+    );
   }
-  if (risk.totalOverLimit !== '') parts.push(`Total position notional is ${fmtNum(risk.totalOverLimit, 0)} USD over the limit.`);
+  if (risk.totalOverLimit !== '') {
+    parts.push(zh ? `持仓总名义价值超出上限 ${fmtNum(risk.totalOverLimit, 0)} USD。` : `Total position notional is ${fmtNum(risk.totalOverLimit, 0)} USD over the limit.`);
+  }
   if (parts.length === 0) return null;
   // Advisory only: Pegasus never trades by itself and blocks nothing because of it.
-  return `${parts.join(' ')} Trim back to the limit; closing orders are always allowed.`;
+  return zh ? `${parts.join('')}请减仓至上限以内；平仓订单始终允许。` : `${parts.join(' ')} Trim back to the limit; closing orders are always allowed.`;
 }

@@ -84,6 +84,37 @@ export const cancelAllRequestSchema = z.object({
 });
 export type CancelAllRequest = z.infer<typeof cancelAllRequestSchema>;
 
+const algoIdSchema = z.string().regex(/^[A-Za-z0-9]{1,64}$/, 'algoId must be 1-64 alphanumeric chars');
+
+/** Move the stop-loss of an algo order to a new trigger price; nothing else about the order changes. */
+export const amendAlgoOrderRequestSchema = z.object({
+  instId: instIdSchema,
+  algoId: algoIdSchema,
+  slTriggerPx: positiveDecimalString,
+});
+export type AmendAlgoOrderRequest = z.infer<typeof amendAlgoOrderRequestSchema>;
+
+/**
+ * Place a stop-loss for an open position: mark-triggered, executed at market. Without `sz` it covers the
+ * contracts of the position that no stop covers yet.
+ */
+export const placeStopRequestSchema = z.object({
+  instId: instIdSchema,
+  mgnMode: tdModeSchema,
+  /** Required in long/short mode */
+  posSide: posSideSchema.optional(),
+  slTriggerPx: positiveDecimalString,
+  /** Contracts; at most what the position's stops leave uncovered */
+  sz: positiveDecimalString.optional(),
+});
+export type PlaceStopRequest = z.infer<typeof placeStopRequestSchema>;
+
+export const cancelAlgoOrderRequestSchema = z.object({
+  instId: instIdSchema,
+  algoId: algoIdSchema,
+});
+export type CancelAlgoOrderRequest = z.infer<typeof cancelAlgoOrderRequestSchema>;
+
 export const closePositionRequestSchema = z.object({
   instId: instIdSchema,
   mgnMode: tdModeSchema,

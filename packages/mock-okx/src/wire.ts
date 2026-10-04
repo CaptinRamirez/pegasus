@@ -286,6 +286,50 @@ export interface MockStop {
   slTriggerPxType: OkxTriggerPxType;
 }
 
+/**
+ * A stop-loss as OKX lists it among the algo orders (GET /api/v5/trade/orders-algo-pending, `ordType` conditional).
+ * Take-profit and OCO orders are not simulated.
+ */
+export interface OkxAlgoOrder {
+  instType: 'SWAP';
+  instId: string;
+  algoId: string;
+  algoClOrdId: string;
+  ordType: 'conditional';
+  side: OkxSide;
+  posSide: OkxPosSide;
+  tdMode: OkxMgnMode;
+  sz: string;
+  closeFraction: string;
+  state: 'live';
+  reduceOnly: string;
+  tpTriggerPx: string;
+  tpTriggerPxType: string;
+  tpOrdPx: string;
+  slTriggerPx: string;
+  slTriggerPxType: OkxTriggerPxType;
+  slOrdPx: string;
+  /** Orders the algo order has sent: empty until it triggers */
+  ordIdList: string[];
+  actualSz: string;
+  actualPx: string;
+  actualSide: string;
+  triggerTime: string;
+  failCode: string;
+  tag: string;
+  cTime: string;
+  uTime: string;
+}
+
+/** Per-item answer of cancel-algos and amend-algos. */
+export interface OkxAlgoAck {
+  algoId: string;
+  algoClOrdId: string;
+  reqId?: string;
+  sCode: string;
+  sMsg: string;
+}
+
 export interface OkxOrder {
   instType: OkxInstType;
   instId: string;

@@ -14,6 +14,11 @@ export type PosMode = 'net_mode' | 'long_short_mode';
 export type CtType = 'linear' | 'inverse';
 export type InstState = 'live' | 'suspend' | 'preopen' | 'test';
 
+/** Languages the terminal's texts exist in. */
+export type Lang = 'en' | 'zh';
+/** A text in every language of the terminal. */
+export type Localized = Record<Lang, string>;
+
 export type CandleBar =
   | '1m' | '3m' | '5m' | '15m' | '30m'
   | '1H' | '2H' | '4H' | '6H' | '12H'
@@ -155,6 +160,46 @@ export interface Order {
   slFailReason?: string;
   cTime: number;
   uTime: number;
+}
+
+export type TriggerPxType = 'last' | 'index' | 'mark';
+
+/**
+ * A take-profit / stop-loss order resting at the exchange (an OKX `conditional` or `oco` algo order). It is not
+ * an Order: it holds no margin, is not among the open orders and is not touched by a cancel-all. The stop
+ * attached to an order becomes one of these once that order is completely filled.
+ */
+export interface AlgoOrder {
+  algoId: string;
+  /** Client id; for a stop that came from an order's attached stop it is 'sl' + the tail of that order's clOrdId */
+  algoClOrdId: string;
+  instId: InstId;
+  /** Side of the order it sends when triggered: sell closes a long, buy closes a short */
+  side: Side;
+  posSide: PosSide;
+  tdMode: TdMode;
+  /** Contracts it closes; '' when it closes a fraction of the position instead (closeFraction) */
+  sz: string;
+  /** Fraction of the position it closes when triggered ('1': all of it, whatever its size then); '' when it closes `sz` contracts */
+  closeFraction: string;
+  /** Stop-loss trigger price; '' for a take-profit only order */
+  slTriggerPx: string;
+  /** Which price triggers the stop; '' when there is no stop-loss */
+  slTriggerPxType: TriggerPxType | '';
+  /** '-1': executed at market; otherwise the limit price of the closing order */
+  slOrdPx: string;
+  /** Take-profit trigger price; '' when none (Pegasus itself only places stops) */
+  tpTriggerPx: string;
+  cTime: number;
+  uTime: number;
+}
+
+/** The algo orders as last read from the exchange. They are read over REST: on every account reconcile, shortly after a fill, a cancel or a position change, and on request. */
+export interface AlgoOrderList {
+  /** Newest first */
+  orders: AlgoOrder[];
+  /** When the list was read, epoch ms (server clock) */
+  ts: number;
 }
 
 export interface Fill {

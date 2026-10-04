@@ -1,10 +1,10 @@
 import { fmt, type Dec } from '../num.js';
-import type { OkxExecType, OkxFill, OkxOrderAck, OkxPosition, OkxResponse, OkxTrade } from '../wire.js';
-import { isRejection, reject, type EngineContext, type Rejection } from './context.js';
-import type { MarketSim } from './market.js';
+import type { OkxAlgoAck, OkxExecType, OkxFill, OkxOrderAck, OkxPosition, OkxResponse, OkxTrade } from '../wire.js';
+import type { WalkFill } from './book.js';
+import { isRejection, reject, type EngineContext, type Market, type Rejection } from './context.js';
 import type { PositionRec } from './account.js';
 import { orderToWire, type OrderRec, type StopRec } from './orders.js';
-import { asRecord, str, validateAmend, validatePlace } from './validate.js';
+import { asRecord, str, validateAmend, validateAmendAlgo, validatePlace, validatePlaceAlgo } from './validate.js';
 
 /** OKX `cancelSource` codes. */
 const CANCEL_USER = '1';
@@ -25,7 +25,11 @@ export class Matcher {
     return { ordId: '', clOrdId: raw ? (str(raw, 'clOrdId') ?? '') : '', tag: raw ? (str(raw, 'tag') ?? '') : '', sCode: r.sCode, sMsg: r.sMsg, ts: String(this.ctx.now()) };
   }
 
-  place(body: unknown): OkxOrderAck {
+  /**
+   * `fillPx` is for the replay of a time the exchange did not see: the order is filled in full at that price
+   * instead of against the book (which holds the quotes of now, not of then).
+   */
+  place(body: unknown, fillPx?: Dec): OkxOrderAck {
     const v = validatePlace(body, this.ctx);
     if (isRejection(v)) return this.failAck(body, v);
     const order = v;
@@ -40,14 +44,27 @@ export class Matcher {
       this.cancel(order, CANCEL_IOC_FOK, 'FOK order could not be fully filled');
       return this.ack(order);
     }
-    this.execute(order, market, 'T');
+    this.execute(order, market, 'T', fillPx ? [{ px: fillPx, sz: order.sz }] : undefined);
     return this.ack(order);
   }
 
-  /** Walks the book for whatever is still open on the order and applies the fills. */
-  private execute(order: OrderRec, market: MarketSim, execType: OkxExecType): void {
+  /** Fills a resting order in full at `px` (the replay of a time the exchange did not see); false when it is no longer live. */
+  fillRestingAt(ordId: string, instId: string, px: Dec): boolean {
+    const order = this.ctx.orders.findLive(instId, ordId, undefined);
+    const market = this.ctx.markets.get(instId);
+    if (!order || !market) return false;
+    this.execute(order, market, 'M', [{ px, sz: order.sz.sub(order.accFillSz) }]);
+    return true;
+  }
+
+  /**
+   * Applies fills to whatever is still open on the order: the given ones, else what a resting order gets once
+   * the book crossed it (a market that says so), else what walking the book yields.
+   */
+  private execute(order: OrderRec, market: Market, execType: OkxExecType, forced?: WalkFill[]): void {
     const now = this.ctx.now();
-    const fills = market.book.walk(order.side, order.sz.sub(order.accFillSz), order.px ?? undefined);
+    const open = order.sz.sub(order.accFillSz);
+    const fills = forced ?? (execType === 'M' && order.px && market.restingFills ? market.restingFills(order.side, open, order.px) : market.book.walk(order.side, open, order.px ?? undefined));
     const trades: OkxTrade[] = [];
     let affected: OkxPosition | null = null;
     const feeRate = execType === 'T' ? this.ctx.takerFee : this.ctx.makerFee;
@@ -69,7 +86,7 @@ export class Matcher {
     }
     // OKX generates the attached stop only once the parent order is completely filled, for the whole order: a
     // partially filled order that is still resting has no stop.
-    if (order.state === 'filled' && order.attachSl) this.ctx.orders.addStop(order, order.attachSl);
+    if (order.state === 'filled' && order.attachSl) this.ctx.orders.addStop(order, order.attachSl, now);
     if (fills.length > 0) {
       this.ctx.emit('trades', { instId: order.instId, trades });
       const push = market.book.delta(now);
@@ -139,7 +156,7 @@ export class Matcher {
     // that as "a parent cancelled after a partial fill generates the stop for what has filled"; whether the exchange
     // does so is to be confirmed on demo trading.
     if (order.attachSl && order.accFillSz.gt(0)) {
-      this.ctx.orders.addStop(order, order.attachSl);
+      this.ctx.orders.addStop(order, order.attachSl, order.uTime);
       this.dropOrphanStops(order.instId);
     }
     this.ctx.emit('order', orderToWire(order, false));
@@ -186,6 +203,52 @@ export class Matcher {
     return this.ack(order, { reqId });
   }
 
+  /** Places a stop-loss on its own for an open position (POST /api/v5/trade/order-algo). */
+  placeAlgoRequest(body: unknown): OkxAlgoAck {
+    const v = validatePlaceAlgo(body, this.ctx);
+    if (isRejection(v)) {
+      const raw = asRecord(body);
+      return { algoId: '', algoClOrdId: raw ? (str(raw, 'algoClOrdId') ?? '') : '', sCode: v.sCode, sMsg: v.sMsg };
+    }
+    this.ctx.orders.addStandaloneStop(v);
+    return { algoId: v.algoId, algoClOrdId: v.algoClOrdId, sCode: '0', sMsg: '' };
+  }
+
+  /**
+   * Cancels one active stop (an item of POST /api/v5/trade/cancel-algos). OKX documents no code for an algo order
+   * that does not exist; the simulator answers with the one of an ordinary order (51400).
+   */
+  cancelAlgoRequest(body: unknown): OkxAlgoAck {
+    const raw = asRecord(body);
+    const algoId = raw ? (str(raw, 'algoId') ?? '') : '';
+    const algoClOrdId = raw ? (str(raw, 'algoClOrdId') ?? '') : '';
+    const fail = (sCode: string, sMsg: string): OkxAlgoAck => ({ algoId, algoClOrdId, sCode, sMsg });
+    if (!raw) return fail('51000', 'Parameter error');
+    const instId = str(raw, 'instId') ?? '';
+    if (!this.ctx.instruments.has(instId)) return fail('51001', 'Instrument ID does not exist.');
+    if (algoId === '' && algoClOrdId === '') return fail('51000', 'Either algoId or algoClOrdId is required');
+    const stop = this.ctx.orders.findStop(instId, algoId, algoClOrdId);
+    if (!stop) return fail('51400', 'Cancellation failed as the order does not exist.');
+    this.ctx.orders.removeStop(stop);
+    return { algoId: stop.algoId, algoClOrdId: stop.algoClOrdId, sCode: '0', sMsg: '' };
+  }
+
+  /** Amends one active stop (POST /api/v5/trade/amend-algos); the new trigger is checked against the price at once. */
+  amendAlgoRequest(body: unknown): OkxAlgoAck {
+    const v = validateAmendAlgo(body, this.ctx);
+    if (isRejection(v)) {
+      const raw = asRecord(body);
+      return { algoId: raw ? (str(raw, 'algoId') ?? '') : '', algoClOrdId: raw ? (str(raw, 'algoClOrdId') ?? '') : '', reqId: raw ? (str(raw, 'reqId') ?? '') : '', sCode: v.sCode, sMsg: v.sMsg };
+    }
+    const { stop } = v;
+    if (v.newSlTriggerPx) stop.slTriggerPx = v.newSlTriggerPx;
+    if (v.newSlOrdPx) stop.slOrdPx = v.newSlOrdPx;
+    if (v.newSlTriggerPxType) stop.slTriggerPxType = v.newSlTriggerPxType;
+    if (v.newSz) stop.sz = v.newSz;
+    stop.uTime = this.ctx.now();
+    return { algoId: stop.algoId, algoClOrdId: stop.algoClOrdId, reqId: v.reqId, sCode: '0', sMsg: '' };
+  }
+
   /** Re-checks resting limit orders against the (new) book; fills are maker fills. */
   matchResting(instId: string): void {
     const market = this.ctx.markets.get(instId);
@@ -218,26 +281,41 @@ export class Matcher {
     const market = this.ctx.markets.get(instId);
     if (!market) return;
     for (const stop of this.ctx.orders.activeStops(instId)) {
-      const position = this.stopPosition(stop);
-      if (!position) {
-        this.ctx.orders.removeStop(stop);
+      const px = stop.slTriggerPxType === 'last' ? market.lastPx : market.markPx;
+      // A market that has no price yet (zero) triggers nothing.
+      if (px.lte(0) || (stop.side === 'sell' ? px.gt(stop.slTriggerPx) : px.lt(stop.slTriggerPx))) {
+        if (!this.stopPosition(stop)) this.ctx.orders.removeStop(stop);
         continue;
       }
-      const px = stop.slTriggerPxType === 'last' ? market.lastPx : market.markPx;
-      if (stop.side === 'sell' ? px.gt(stop.slTriggerPx) : px.lt(stop.slTriggerPx)) continue;
-      const params: Record<string, unknown> = {
-        instId,
-        tdMode: stop.tdMode,
-        side: stop.side,
-        ordType: 'market',
-        sz: fmt(stop.sz.lt(position.qty) ? stop.sz : position.qty),
-        reduceOnly: true,
-      };
-      if (stop.posSide !== 'net') params['posSide'] = stop.posSide;
-      // A refused close leaves the position unprotected: the stop stays active (and visible in the state) and is
-      // tried again on the next price, instead of vanishing as if it had fired.
-      if (this.place(params).sCode === '0') this.ctx.orders.removeStop(stop);
+      this.fireStop(stop);
     }
+  }
+
+  /**
+   * Sends the closing order of a triggered stop: its size, at most the position, as a reduce-only market order
+   * (filled at `fillPx` when given, see place). The stop is removed once that order is accepted, or when its
+   * position is gone; returns whether it closed anything.
+   */
+  fireStop(stop: StopRec, fillPx?: Dec): boolean {
+    const position = this.stopPosition(stop);
+    if (!position) {
+      this.ctx.orders.removeStop(stop);
+      return false;
+    }
+    const params: Record<string, unknown> = {
+      instId: stop.instId,
+      tdMode: stop.tdMode,
+      side: stop.side,
+      ordType: 'market',
+      sz: fmt(stop.sz.lt(position.qty) ? stop.sz : position.qty),
+      reduceOnly: true,
+    };
+    if (stop.posSide !== 'net') params['posSide'] = stop.posSide;
+    // A refused close leaves the position unprotected: the stop stays active (and visible in the state) and is
+    // tried again on the next price, instead of vanishing as if it had fired.
+    if (this.place(params, fillPx).sCode !== '0') return false;
+    this.ctx.orders.removeStop(stop);
+    return true;
   }
 
   closePosition(body: unknown): ClosePositionResult {

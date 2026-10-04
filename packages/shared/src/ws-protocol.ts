@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type {
   AccountConfig,
+  AlgoOrderList,
   Balance,
   Candle,
   CandleBar,
@@ -39,6 +40,8 @@ export type ClientMessage = z.infer<typeof clientMessageSchema>;
 
 export interface HelloPayload {
   demo: boolean;
+  /** Paper trading: the account is simulated by the local paper exchange on OKX's live prices; nothing reaches an OKX account */
+  paper: boolean;
   instruments: Instrument[];
   /** null until the account bootstrap has loaded it (and for good without an API key); corrected by the `account` message */
   account: AccountConfig | null;
@@ -48,6 +51,8 @@ export interface HelloPayload {
   balance: Balance | null;
   positions: Position[];
   openOrders: Order[];
+  /** The stop-loss / take-profit algo orders; null until they were read from the exchange once (and for good without an API key) */
+  algoOrders: AlgoOrderList | null;
   serverTime: number;
 }
 
@@ -62,6 +67,8 @@ export type ServerMessage =
   | { type: 'order'; data: Order }
   | { type: 'fill'; data: Fill }
   | { type: 'positions'; data: Position[] }
+  /** The whole list, sent after every read from the exchange, changed or not: its `ts` is how fresh the list is */
+  | { type: 'algoOrders'; data: AlgoOrderList }
   | { type: 'balance'; data: Balance }
   | { type: 'account'; data: AccountConfig }
   | { type: 'risk'; data: RiskState }

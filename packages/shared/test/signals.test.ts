@@ -307,6 +307,34 @@ describe('short entries', () => {
   });
 });
 
+describe('texts of a report in Chinese', () => {
+  const falling = series(130, 50_000, -0.003, 0.002);
+  const withShorts = { ...DEFAULT_TREND_PARAMS, allowShort: true };
+
+  it('are the same decisions and numbers as in English, worded in Chinese', () => {
+    const now = Date.now();
+    const english = buildSignalReport('BTC-USDT-SWAP', falling, null, now, BTC, '100000', withShorts);
+    const chinese = buildSignalReport('BTC-USDT-SWAP', falling, null, now, BTC, '100000', withShorts, undefined, null, null, 0, 'zh');
+    // only the wording differs
+    expect({ ...chinese.signals, reasons: [] }).toEqual({ ...english.signals, reasons: [] });
+    expect(chinese.signals.reasons).toHaveLength(english.signals.reasons.length);
+    expect(chinese.sizing?.short.contracts).toBe(english.sizing?.short.contracts);
+    expect(chinese.signals.reasons).toContain(`收盘价对比 55 日低点 ${chinese.indicators.entryLow}：向下突破`);
+    expect(chinese.signals.reasons).toContain('资金费率：无数据（已跳过过滤）');
+    expect(chinese.signals.reasons).toContain('做空仓位：做空 x0.5');
+    expect(chinese.sizing?.short.adjustments).toEqual(['做空 x0.5']);
+    expect(chinese.sizing?.short.note).toContain('仓位 x0.5（做空 x0.5）');
+    expect(chinese.signals.reasons.join('\n')).not.toMatch(/breakout|regime|funding|exit:/);
+  });
+
+  it('English stays the default', () => {
+    expect(evaluateTrendSignals(computeIndicators(falling), 'trend', null).reasons[0]).toMatch(/^close /);
+    expect(evaluateTrendSignals(computeIndicators(falling), 'trend', null, DEFAULT_TREND_PARAMS, 'zh').reasons[0]).toMatch(/^收盘价 /);
+    expect(planSize('100000', '50000', '1500', BTC, undefined, undefined, 'zh').note).toBe('按止损距离计算仓位');
+    expect(sizeAdjustment('short', 'crisis', null, null, DEFAULT_TREND_PARAMS, 'zh')).toEqual({ multiplier: '0.25', adjustments: ['做空 x0.5', '危机 x0.5'] });
+  });
+});
+
 describe('second daily cut', () => {
   const H = 3_600_000;
   const day = Date.UTC(2026, 9, 3);

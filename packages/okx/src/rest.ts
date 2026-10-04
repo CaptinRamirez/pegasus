@@ -2,9 +2,13 @@ import { OkxApiError, OkxHttpError, OkxTransportError } from './errors.js';
 import { restAuthHeaders, type OkxCredentials } from './sign.js';
 import type {
   OkxAccountConfig,
+  OkxAlgoAck,
+  OkxAlgoOrder,
+  OkxAmendAlgoParams,
   OkxAmendOrderParams,
   OkxBalance,
   OkxBookData,
+  OkxCancelAlgoParams,
   OkxCancelOrderParams,
   OkxCandleRow,
   OkxClosePositionParams,
@@ -15,11 +19,13 @@ import type {
   OkxInstrument,
   OkxLeverageInfo,
   OkxMarkPrice,
+  OkxMarkPriceCandleRow,
   OkxOpenInterest,
   OkxOpenInterestHistoryRow,
   OkxOpenInterestVolumeRow,
   OkxOrder,
   OkxOrderAck,
+  OkxPlaceAlgoParams,
   OkxPlaceOrderParams,
   OkxPosition,
   OkxResponse,
@@ -30,6 +36,11 @@ import type {
 
 export interface OkxRestClientOptions {
   baseUrl: string;
+  /**
+   * Where the signed requests (account, orders) go when that is not `baseUrl`: paper trading keeps the market
+   * data on OKX and sends everything private to the local paper exchange. Nothing signed is sent to `baseUrl` then.
+   */
+  privateBaseUrl?: string | undefined;
   credentials?: OkxCredentials | undefined;
   /** Adds the `x-simulated-trading: 1` header for demo trading. */
   demo?: boolean;
@@ -58,6 +69,7 @@ function buildQuery(q: Query | undefined): string {
  */
 export class OkxRestClient {
   private readonly baseUrl: string;
+  private readonly privateBaseUrl: string;
   private readonly creds: OkxCredentials | undefined;
   private readonly demo: boolean;
   private readonly timeoutMs: number;
@@ -66,6 +78,7 @@ export class OkxRestClient {
 
   constructor(opts: OkxRestClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, '');
+    this.privateBaseUrl = (opts.privateBaseUrl ?? opts.baseUrl).replace(/\/+$/, '');
     this.creds = opts.credentials;
     this.demo = opts.demo ?? false;
     this.timeoutMs = opts.timeoutMs ?? 10_000;
@@ -102,7 +115,7 @@ export class OkxRestClient {
     let res: Response;
     let text: string;
     try {
-      res = await this.fetchImpl(`${this.baseUrl}${requestPath}`, init);
+      res = await this.fetchImpl(`${opts.auth ? this.privateBaseUrl : this.baseUrl}${requestPath}`, init);
       // The timer stays armed until the body is read: a response that stalls after its headers must time out too.
       text = await res.text();
     } catch (err) {
@@ -180,6 +193,16 @@ export class OkxRestClient {
   /** Older candles (up to 100 per call), newest first. */
   getHistoryCandles(instId: string, bar: string, opts: { after?: number; before?: number; limit?: number } = {}): Promise<OkxCandleRow[]> {
     return this.getData<OkxCandleRow>('/api/v5/market/history-candles', { instId, bar, after: opts.after, before: opts.before, limit: opts.limit });
+  }
+
+  /** Latest mark price candles (up to 100 per call), newest first: [ts, o, h, l, c, confirm]. */
+  getMarkPriceCandles(instId: string, bar: string, opts: { after?: number; before?: number; limit?: number } = {}): Promise<OkxMarkPriceCandleRow[]> {
+    return this.getData<OkxMarkPriceCandleRow>('/api/v5/market/mark-price-candles', { instId, bar, after: opts.after, before: opts.before, limit: opts.limit });
+  }
+
+  /** Older mark price candles (up to 100 per call), newest first. */
+  getHistoryMarkPriceCandles(instId: string, bar: string, opts: { after?: number; before?: number; limit?: number } = {}): Promise<OkxMarkPriceCandleRow[]> {
+    return this.getData<OkxMarkPriceCandleRow>('/api/v5/market/history-mark-price-candles', { instId, bar, after: opts.after, before: opts.before, limit: opts.limit });
   }
 
   getMarkPrice(instType: OkxInstType, instId?: string): Promise<OkxMarkPrice[]> {
@@ -274,6 +297,38 @@ export class OkxRestClient {
     const [ack] = await this.postData<OkxOrderAck>('/api/v5/trade/amend-order', params);
     if (!ack) throw new OkxApiError('EMPTY', 'no amend ack returned', '/api/v5/trade/amend-order');
     if (ack.sCode !== '0') throw new OkxApiError(ack.sCode, ack.sMsg, '/api/v5/trade/amend-order', ack);
+    return ack;
+  }
+
+  /**
+   * Untriggered algo orders, newest first, up to 100 per call; `after` pages to the ones older than that algoId.
+   * `ordType` is required; `conditional,oco` (the two TP/SL types) is the only combination OKX accepts in one call.
+   */
+  getAlgoOrdersPending(params: { ordType: string; instType?: OkxInstType; instId?: string; algoId?: string; after?: string; limit?: number }): Promise<OkxAlgoOrder[]> {
+    return this.getData<OkxAlgoOrder>('/api/v5/trade/orders-algo-pending', params, true);
+  }
+
+  /** Places a TP/SL algo order of its own (not attached to an order). */
+  async placeAlgoOrder(params: OkxPlaceAlgoParams): Promise<OkxAlgoAck> {
+    const [ack] = await this.postData<OkxAlgoAck>('/api/v5/trade/order-algo', params);
+    if (!ack) throw new OkxApiError('EMPTY', 'no algo order ack returned', '/api/v5/trade/order-algo');
+    if (ack.sCode !== '0') throw new OkxApiError(ack.sCode, ack.sMsg, '/api/v5/trade/order-algo', ack);
+    return ack;
+  }
+
+  /** Cancels one untriggered algo order (the endpoint takes an array of up to 10; one is sent). */
+  async cancelAlgoOrder(params: OkxCancelAlgoParams): Promise<OkxAlgoAck> {
+    const [ack] = await this.postData<OkxAlgoAck>('/api/v5/trade/cancel-algos', [params]);
+    if (!ack) throw new OkxApiError('EMPTY', 'no cancel ack returned', '/api/v5/trade/cancel-algos');
+    if (ack.sCode !== '0') throw new OkxApiError(ack.sCode, ack.sMsg, '/api/v5/trade/cancel-algos', ack);
+    return ack;
+  }
+
+  /** Amends an untriggered TP/SL or trigger algo order. */
+  async amendAlgoOrder(params: OkxAmendAlgoParams): Promise<OkxAlgoAck> {
+    const [ack] = await this.postData<OkxAlgoAck>('/api/v5/trade/amend-algos', params);
+    if (!ack) throw new OkxApiError('EMPTY', 'no amend ack returned', '/api/v5/trade/amend-algos');
+    if (ack.sCode !== '0') throw new OkxApiError(ack.sCode, ack.sMsg, '/api/v5/trade/amend-algos', ack);
     return ack;
   }
 

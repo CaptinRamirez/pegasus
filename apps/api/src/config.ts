@@ -23,6 +23,11 @@ const envSchema = z.object({
   OKX_WS_PUBLIC_URL: endpoint,
   OKX_WS_PRIVATE_URL: endpoint,
   OKX_WS_BUSINESS_URL: endpoint,
+  /**
+   * Paper trading: the local paper exchange (packages/paper) that keeps the account, e.g. http://127.0.0.1:9200.
+   * Market data stays on OKX (the live hosts); every signed request and the private socket go here instead.
+   */
+  PAPER_EXCHANGE_URL: endpoint,
   /** Must stay '0' (REST): '1' used to send order operations over the private WebSocket, see loadConfig. */
   OKX_WS_TRADING: z.enum(['0', '1']).default('0'),
 
@@ -58,6 +63,8 @@ export interface AppConfig {
   okx: {
     credentials: OkxCredentials | undefined;
     demo: boolean;
+    /** Orders, positions and balance are simulated by the paper exchange; nothing private is sent to OKX. */
+    paper: boolean;
     endpoints: OkxEndpoints;
     /** Submit and cancel orders over the private WebSocket instead of REST. Always false for now: OKX_WS_TRADING=1 is refused at start-up. */
     wsTrading: boolean;
@@ -91,14 +98,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error(`invalid configuration: ${issues}`);
   }
   const e = parsed.data;
-  const demo = e.OKX_DEMO === '1';
+  const paper = e.PAPER_EXCHANGE_URL !== '';
+  // Paper trades on the real market: its prices are OKX's live ones, never the demo environment's.
+  const demo = !paper && e.OKX_DEMO === '1';
   const defaults = defaultEndpoints(demo);
   // All three or none: a partial set would otherwise start silently without the account.
   const missing = (['OKX_API_KEY', 'OKX_API_SECRET', 'OKX_API_PASSPHRASE'] as const).filter((name) => e[name] === '');
-  if (missing.length === 1 || missing.length === 2) {
+  if (!paper && (missing.length === 1 || missing.length === 2)) {
     throw new Error(`invalid configuration: OKX credentials are incomplete: ${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} not set (set all three, or leave all three empty for market data only)`);
   }
   const hasCreds = missing.length === 0;
+  // The paper exchange checks no signature. A key configured for OKX is not used at all in paper mode: what is
+  // signed goes to the paper exchange only, and it is signed with this placeholder.
+  const credentials: OkxCredentials | undefined = paper
+    ? { apiKey: 'paper', apiSecret: 'paper', passphrase: 'paper' }
+    : hasCreds
+      ? { apiKey: e.OKX_API_KEY, apiSecret: e.OKX_API_SECRET, passphrase: e.OKX_API_PASSPHRASE }
+      : undefined;
   // All four or none: with a subset the API would talk to the mock on some sockets and to the real OKX on the others.
   const unset = ENDPOINT_OVERRIDES.filter((name) => e[name] === '');
   if (unset.length > 0 && unset.length < ENDPOINT_OVERRIDES.length) {
@@ -121,12 +137,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const signalPhases = SIGNAL_PHASE_HOURS.filter((h) => phaseNames.includes(String(h)));
   // An Origin header never ends in a slash; one typed into .env is dropped rather than left to never match.
   const webOrigins = e.WEB_ORIGINS.split(',').map((s) => s.trim().replace(/\/$/, '')).filter((s) => s.length > 0);
+  const endpoints: OkxEndpoints = overridden ? { rest: e.OKX_REST_URL, wsPublic: e.OKX_WS_PUBLIC_URL, wsPrivate: e.OKX_WS_PRIVATE_URL, wsBusiness: e.OKX_WS_BUSINESS_URL } : defaults;
+  if (paper) {
+    const base = new URL(e.PAPER_EXCHANGE_URL);
+    endpoints.restPrivate = base.origin;
+    endpoints.wsPrivate = `${base.protocol === 'https:' ? 'wss' : 'ws'}://${base.host}/ws/v5/private`;
+  }
   return {
     okx: {
-      credentials: hasCreds ? { apiKey: e.OKX_API_KEY, apiSecret: e.OKX_API_SECRET, passphrase: e.OKX_API_PASSPHRASE } : undefined,
+      credentials,
       demo,
+      paper,
       wsTrading: false,
-      endpoints: overridden ? { rest: e.OKX_REST_URL, wsPublic: e.OKX_WS_PUBLIC_URL, wsPrivate: e.OKX_WS_PRIVATE_URL, wsBusiness: e.OKX_WS_BUSINESS_URL } : defaults,
+      endpoints,
     },
     server: { host: e.API_HOST, port: e.API_PORT, token: e.API_TOKEN, webOrigins, logLevel: e.LOG_LEVEL },
     instruments,

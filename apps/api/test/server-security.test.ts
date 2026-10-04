@@ -226,7 +226,7 @@ describe('API access control', () => {
     it('says only whether the server and its three sockets are up', async () => {
       const res = await app.inject({ method: 'GET', url: '/api/health' });
       const body = res.json() as { serverTime: number };
-      expect(body).toEqual({ ok: true, version: 'unknown', demo: false, connection: { okxPublic: 'connected', okxPrivate: 'connecting', okxBusiness: 'disconnected' }, serverTime: body.serverTime });
+      expect(body).toEqual({ ok: true, version: 'unknown', demo: false, paper: false, connection: { okxPublic: 'connected', okxPrivate: 'connecting', okxBusiness: 'disconnected' }, serverTime: body.serverTime });
       expect(typeof body.serverTime).toBe('number');
       expect(res.body).not.toMatch(/50105|PASSPHRASE|readOnly|lastSyncAt|SOL-USDT-SWAP/);
     });

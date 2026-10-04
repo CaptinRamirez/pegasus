@@ -14,6 +14,7 @@ import {
   type Candle,
   type FundingRecord,
   type Instrument,
+  type Lang,
   type OpenInterestMetrics,
   type OpenInterestPoint,
   type SignalPhase,
@@ -37,6 +38,8 @@ export interface SignalsOptions {
   maxNotionalPct?: string | undefined;
   /** Report this cut only; the sizing stays split across all the cuts the service computes */
   phase?: SignalPhase | undefined;
+  /** Language of the reasons and sizing notes; English by default */
+  lang?: Lang | undefined;
 }
 
 /** Daily candles of one instrument at one cut, oldest first, the forming bar included. */
@@ -197,7 +200,7 @@ export class SignalsService {
               const confirmed = data.candles.filter((c) => c.confirm).map((c) => c.ts);
               const oiChanges = history ? barOiChanges(history.snapshots, confirmed) : null;
               const crowding = oiChange10d(history, confirmed[confirmed.length - 1]);
-              const report = buildSignalReport(instId, data.candles, funding.funding, now, inst, equity, this.params, sizing, crowding, oiChanges, phase);
+              const report = buildSignalReport(instId, data.candles, funding.funding, now, inst, equity, this.params, sizing, crowding, oiChanges, phase, opts.lang ?? 'en');
               const book = this.market.book(instId, 20);
               report.structure = { book: book ? computeBookMetrics(book, inst, 20) : null, openInterest };
               report.dataFetchedAt = Math.min(data.at, funding.at);

@@ -15,7 +15,8 @@ export interface OkxClients {
 export function createOkxClients(cfg: AppConfig, log: Logger): OkxClients {
   const clock = { offsetMs: 0 };
   const clockOffsetMs = () => clock.offsetMs;
-  const rest = new OkxRestClient({ baseUrl: cfg.okx.endpoints.rest, credentials: cfg.okx.credentials, demo: cfg.okx.demo, clockOffsetMs });
+  // In paper mode the signed requests go to the paper exchange (restPrivate); the market data stays on OKX.
+  const rest = new OkxRestClient({ baseUrl: cfg.okx.endpoints.rest, privateBaseUrl: cfg.okx.endpoints.restPrivate, credentials: cfg.okx.credentials, demo: cfg.okx.demo, clockOffsetMs });
   const wsPublic = new OkxWsClient({ url: cfg.okx.endpoints.wsPublic, name: 'public', logger: okxLogger(log.child({ ws: 'public' })) });
   const wsBusiness = new OkxWsClient({ url: cfg.okx.endpoints.wsBusiness, name: 'business', logger: okxLogger(log.child({ ws: 'business' })) });
   const wsPrivate = cfg.okx.credentials

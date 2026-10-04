@@ -11,6 +11,8 @@ const query = z.object({
   maxNotionalPct: z.string().regex(/^0?\.\d+$/).optional(),
   /** One daily cut only (UTC hour of its close) */
   phase: z.enum(['0', '12']).optional(),
+  /** Language of the texts in the reports (reasons, sizing notes); English when absent */
+  lang: z.enum(['en', 'zh']).optional(),
 });
 
 export async function registerSignalRoutes(app: FastifyInstance, deps: Deps): Promise<void> {
@@ -22,6 +24,7 @@ export async function registerSignalRoutes(app: FastifyInstance, deps: Deps): Pr
     if (q.riskPct !== undefined) opts.riskPct = q.riskPct;
     if (q.maxNotionalPct !== undefined) opts.maxNotionalPct = q.maxNotionalPct;
     if (q.phase !== undefined) opts.phase = q.phase === '0' ? 0 : 12;
+    if (q.lang !== undefined) opts.lang = q.lang;
     return ok(await deps.signals.report(instIds, opts));
   });
 }

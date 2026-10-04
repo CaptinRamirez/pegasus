@@ -1,0 +1,31 @@
+{
+  "name": "@pegasus/paper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "start": "tsx src/cli.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "build": "echo 'source package, nothing to build'"
+  },
+  "dependencies": {
+    "@pegasus/mock-okx": "workspace:*",
+    "@pegasus/okx": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  }
+}

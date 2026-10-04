@@ -1,4 +1,5 @@
 import type {
+  OkxAlgoOrder,
   OkxAttachAlgoOrd,
   OkxBalance,
   OkxCandleRow,
@@ -11,7 +12,7 @@ import type {
   OkxTicker,
   OkxTrade,
 } from '@pegasus/okx';
-import { CANDLE_BARS, type Balance, type Candle, type CandleBar, type Fill, type FundingRate, type Instrument, type MarkPrice, type Order, type OrdType, type PosSide, type Position, type Ticker, type Trade } from '@pegasus/shared';
+import { CANDLE_BARS, type AlgoOrder, type Balance, type Candle, type CandleBar, type Fill, type FundingRate, type Instrument, type MarkPrice, type Order, type OrdType, type PosSide, type Position, type Ticker, type Trade } from '@pegasus/shared';
 
 const num = (s: string | undefined): number => (s === undefined || s === '' ? 0 : Number(s));
 
@@ -161,6 +162,28 @@ export function mapOrder(o: OkxOrder): Order {
   const lost = attached.find(stopFailed);
   if (lost !== undefined) order.slFailReason = `${lost.failCode ?? ''}: ${lost.failReason ?? ''}`;
   return order;
+}
+
+export function mapAlgoOrder(a: OkxAlgoOrder): AlgoOrder {
+  const slTriggerPx = a.slTriggerPx ?? '';
+  const type = a.slTriggerPxType;
+  return {
+    algoId: a.algoId,
+    algoClOrdId: a.algoClOrdId ?? '',
+    instId: a.instId,
+    side: a.side,
+    posSide: mapPosSide(a.posSide),
+    tdMode: a.tdMode === 'isolated' ? 'isolated' : 'cross',
+    sz: a.sz ?? '',
+    closeFraction: a.closeFraction ?? '',
+    slTriggerPx,
+    // OKX triggers on the last price when the order names no type.
+    slTriggerPxType: slTriggerPx === '' ? '' : type === 'mark' || type === 'index' ? type : 'last',
+    slOrdPx: a.slOrdPx ?? '',
+    tpTriggerPx: a.tpTriggerPx ?? '',
+    cTime: num(a.cTime),
+    uTime: num(a.uTime),
+  };
 }
 
 /** Builds a Fill from an `orders` channel push that carries a fill; returns null when the push has no fill. */

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import type { Fill, Instrument, Order, Position, RiskState } from '@pegasus/shared';
+import type { AlgoOrder, Fill, Instrument, Order, Position, RiskState } from '@pegasus/shared';
 import { api } from '../lib/api';
 import { ApiError } from '../lib/http';
 import { useHistorySeed } from '../hooks/useSession';
@@ -16,7 +16,7 @@ import { PositionsTable } from './PositionsTable';
 
 vi.mock('../lib/api', async (importOriginal) => {
   const mod = await importOriginal<typeof import('../lib/api')>();
-  return { ...mod, api: { orderHistory: vi.fn(), fills: vi.fn() } };
+  return { ...mod, api: { orderHistory: vi.fn(), fills: vi.fn(), placeStop: vi.fn() } };
 });
 
 const btc: Instrument = {
@@ -210,12 +210,13 @@ describe('rows of an instrument outside the tracked list', () => {
     expect(untracked[0]).toBe('PEPE-USDT-SWAPuntracked');
     expect(untracked[2]).toBe('0.5'); // contracts
     expect(untracked[4]).toBe('0.0000085'); // avg px
-    expect(untracked[9]).toBe('0.0000031'); // liq px
-    expect(untracked[10]).toBe('–'); // margin: OKX reported none
+    expect(untracked[6]).toBe('?'); // stop: the stops were not read yet
+    expect(untracked[10]).toBe('0.0000031'); // liq px
+    expect(untracked[11]).toBe('–'); // margin: OKX reported none
     const tracked = cells(rows[1]);
     expect(tracked[0]).toBe('BTC-USDT-SWAP');
     expect(tracked[4]).toBe('60,000');
-    expect(tracked[10]).toBe('610.00');
+    expect(tracked[11]).toBe('610.00');
     expect(rows[1]?.querySelector('.untracked-tag')).toBeNull();
     // no risk state, or nothing over the limit: no row is marked
     expect(container.querySelector('.over-limit')).toBeNull();
@@ -244,7 +245,7 @@ describe('rows of an instrument outside the tracked list', () => {
     expect(rows[0]?.querySelector('.over-limit-tag')).toBeNull();
     expect(rows[1]?.classList.contains('over-limit')).toBe(true);
     expect(rows[1]?.querySelector('.over-limit-tag')?.textContent).toBe('over limit: trim 6,600 USD (10 ct)');
-    expect(rows[1]?.querySelectorAll('td')[11]?.textContent).toBe('36,600over limit: trim 6,600 USD (10 ct)');
+    expect(rows[1]?.querySelectorAll('td')[12]?.textContent).toBe('36,600over limit: trim 6,600 USD (10 ct)');
     expect(rows[1]?.querySelector('button')?.disabled).toBe(false);
   });
 
@@ -272,5 +273,156 @@ describe('rows of an instrument outside the tracked list', () => {
     expect(rows[0]?.querySelector('.over-limit-tag')).toBeNull();
     expect(rows[1]?.querySelector('.over-limit-tag')?.textContent).toBe('over limit: trim 6,600 USD (10 ct)');
     expect(container.querySelectorAll('.over-limit-tag')).toHaveLength(1);
+  });
+});
+
+describe('the stop column of the positions table', () => {
+  let root: Root;
+  let container: HTMLDivElement;
+  const long: Position = { ...pepe, instId: 'BTC-USDT-SWAP', posSide: 'net', pos: '10', avgPx: '60000', markPx: '61000', liqPx: '', margin: '610' };
+  const stop = (overrides: Partial<AlgoOrder> = {}): AlgoOrder => ({
+    algoId: 'a1', algoClOrdId: '', instId: 'BTC-USDT-SWAP', side: 'sell', posSide: 'net', tdMode: 'cross', sz: '10', closeFraction: '', slTriggerPx: '59000', slTriggerPxType: 'mark', slOrdPx: '-1', tpTriggerPx: '', cTime: 1, uTime: 1,
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    useStore.setState({ ...initialState('tok'), instruments: [btc], account: { posMode: 'net_mode', acctLv: '2', canTrade: true }, accountLoaded: true, positions: [long] });
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    container.remove();
+    useStore.setState({ ...initialState(null) });
+  });
+
+  const stopCell = async (orders: AlgoOrder[] | null): Promise<{ text: string; tag: string | null }> => {
+    await act(async () => {
+      useStore.setState({ algoOrders: orders === null ? null : { orders, ts: Date.now() } });
+    });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={qc}>
+          <PositionsTable />
+        </QueryClientProvider>,
+      );
+    });
+    const col = [...container.querySelectorAll('th')].map((th) => th.textContent).indexOf('Stop');
+    const td = container.querySelectorAll('tbody tr td')[col];
+    return { text: td?.textContent ?? '', tag: td?.querySelector('.stop-tag')?.textContent ?? null };
+  };
+
+  it('is unknown until the stops were read: a missing read is not a missing stop', async () => {
+    expect(await stopCell(null)).toEqual({ text: '?', tag: null });
+  });
+
+  it('shows the stop price when the position is covered and says so when it has no stop', async () => {
+    expect(await stopCell([stop()])).toEqual({ text: '59,000', tag: null });
+    expect(await stopCell([])).toEqual({ text: 'no stopadd stop', tag: 'no stop' });
+    // the stop of another instrument or of the other side does not count
+    expect((await stopCell([stop({ instId: 'ETH-USDT-SWAP' }), stop({ algoId: 'a2', side: 'buy' })])).tag).toBe('no stop');
+  });
+
+  it('shows both lots of two cuts, a position that is only partly covered, and stops left over from a closed lot', async () => {
+    expect(await stopCell([stop({ sz: '5' }), stop({ algoId: 'a2', sz: '5', slTriggerPx: '58000' })])).toEqual({ text: '59,000 / 58,000', tag: null });
+    expect(await stopCell([stop({ sz: '4' })])).toEqual({ text: '59,000covers 4 of 10 ctadd stop', tag: 'covers 4 of 10 ct' });
+    expect(await stopCell([stop(), stop({ algoId: 'a2', sz: '5', slTriggerPx: '58000' })])).toEqual({ text: '59,000 / 58,000stops 15 ct > position 10 ct', tag: 'stops 15 ct > position 10 ct' });
+  });
+});
+
+describe('adding a stop from the positions table', () => {
+  let root: Root;
+  let container: HTMLDivElement;
+  const placeStop = vi.mocked(api.placeStop);
+  const prompt = vi.spyOn(window, 'prompt');
+  const long: Position = { ...pepe, instId: 'BTC-USDT-SWAP', posSide: 'net', pos: '10', avgPx: '60000', markPx: '61000', liqPx: '', margin: '610' };
+  const stop = (sz: string): AlgoOrder => ({
+    algoId: `a${sz}`, algoClOrdId: '', instId: 'BTC-USDT-SWAP', side: 'sell', posSide: 'net', tdMode: 'cross', sz, closeFraction: '', slTriggerPx: '59000', slTriggerPxType: 'mark', slOrdPx: '-1', tpTriggerPx: '', cTime: 1, uTime: 1,
+  });
+
+  beforeEach(() => {
+    placeStop.mockReset();
+    prompt.mockReset();
+    useStore.setState({ ...initialState('tok'), instruments: [btc], account: { posMode: 'net_mode', acctLv: '2', canTrade: true }, accountLoaded: true, positions: [long] });
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    container.remove();
+    useStore.setState({ ...initialState(null) });
+  });
+
+  const render = async (orders: AlgoOrder[] | null) => {
+    useStore.setState({ algoOrders: orders === null ? null : { orders, ts: Date.now() } });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={qc}>
+          <PositionsTable />
+        </QueryClientProvider>,
+      );
+    });
+  };
+  const addButton = (): HTMLButtonElement | undefined => [...container.querySelectorAll('button')].find((b) => b.textContent === 'add stop');
+  const click = async () => {
+    await act(async () => {
+      addButton()?.click();
+    });
+  };
+  const toasts = (): string[] => useStore.getState().toasts.map((t) => `${t.kind}: ${t.message}`);
+
+  it('offers it only where part of the position has no stop, and only once the stops are known', async () => {
+    await render(null);
+    expect(addButton()).toBeUndefined();
+    await render([stop('10')]);
+    expect(addButton()).toBeUndefined();
+    await render([stop('10'), stop('5')]); // over: cancel one instead
+    expect(addButton()).toBeUndefined();
+    await render([]);
+    expect(addButton()).toBeDefined();
+    await render([stop('4')]);
+    expect(addButton()).toBeDefined();
+  });
+
+  it('asks for the price, names the uncovered contracts and sends the position, not a size', async () => {
+    placeStop.mockResolvedValue({ algoId: 'a9', instId: 'BTC-USDT-SWAP', slTriggerPx: '59000', sz: '6' });
+    await render([stop('4')]);
+    prompt.mockReturnValue(' 59000 ');
+    await click();
+    expect(prompt.mock.calls[0]?.[0]).toContain('the 6 contracts of the long position in BTC-USDT-SWAP that have no stop');
+    expect(placeStop).toHaveBeenCalledWith({ instId: 'BTC-USDT-SWAP', mgnMode: 'cross', slTriggerPx: '59000' });
+    expect(toasts()).toEqual(['success: Stop placed: BTC-USDT-SWAP 6 contracts at 59000']);
+  });
+
+  it('sends nothing when the prompt is dismissed or the price is not a positive number, and names the leg in long/short mode', async () => {
+    await render([]);
+    prompt.mockReturnValue(null);
+    await click();
+    prompt.mockReturnValue('abc');
+    await click();
+    expect(placeStop).not.toHaveBeenCalled();
+    expect(toasts()).toEqual(['error: Enter the stop price as a positive number']);
+
+    placeStop.mockRejectedValue(new ApiError('VALIDATION', 'the stop-loss trigger 62000 must be below the mark price 61000', undefined, 400));
+    await act(async () => {
+      useStore.setState({ account: { posMode: 'long_short_mode', acctLv: '2', canTrade: true }, positions: [{ ...long, posSide: 'long' }] });
+    });
+    prompt.mockReturnValue('62000');
+    await click();
+    expect(placeStop).toHaveBeenCalledWith({ instId: 'BTC-USDT-SWAP', mgnMode: 'cross', slTriggerPx: '62000', posSide: 'long' });
+    expect(toasts()[1]).toContain('error: Stop NOT placed:');
+  });
+
+  it('a read-only key is not offered it', async () => {
+    useStore.setState({ account: { posMode: 'net_mode', acctLv: '2', canTrade: false } });
+    await render([]);
+    expect(addButton()).toBeUndefined();
+    expect(container.querySelector('.stop-tag')?.textContent).toBe('no stop');
   });
 });

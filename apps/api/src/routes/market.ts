@@ -16,6 +16,7 @@ export async function registerMarketRoutes(app: FastifyInstance, deps: Deps): Pr
       // The commit this process was started from: a page built from another commit is talking to an older or newer API.
       version: deps.config.version,
       demo: deps.config.okx.demo,
+      paper: deps.config.okx.paper,
       connection: { okxPublic, okxPrivate, okxBusiness },
       serverTime: Date.now(),
     };

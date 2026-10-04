@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type {
+  AlgoOrder,
   Balance,
   Candle,
   ConnectionStatus,
@@ -13,8 +14,8 @@ import type {
   Ticker,
   Trade,
 } from '@pegasus/shared';
-import { accountAsOf, accountUnknown, activeAlerts, isStreamStale, killSwitchSweepNotice, overLimitNotice, trimAdvice, trimShares } from './alerts';
-import { LOST_STOP_RECENT_MS, applyOrderHistorySeed, applyServerMessage, applyWsStatus, pushToast, stampMessage } from './reducers';
+import { STOPS_STALE_MS, accountAsOf, accountUnknown, activeAlerts, isStreamStale, killSwitchSweepNotice, overLimitNotice, stopsAsOf, trimAdvice, trimShares } from './alerts';
+import { LOST_STOP_RECENT_MS, applyAlgoOrders, applyOrderHistorySeed, applyServerMessage, applyWsStatus, pushToast, stampMessage } from './reducers';
 import { ACCOUNT_NOT_LOADED_BLOCK, READ_ONLY_KEY_BLOCK, getTradingBlock } from './store';
 import { LIMITS, initialState, type TerminalState } from './types';
 
@@ -134,6 +135,8 @@ const hello: HelloPayload = {
   balance,
   positions: [position('BTC-USDT-SWAP', '1')],
   openOrders: [order('o1')],
+  algoOrders: null,
+  paper: false,
   serverTime: 123,
 };
 
@@ -261,6 +264,9 @@ describe('applyServerMessage', () => {
     expect(message).toContain('STOP-LOSS NOT CREATED: BTC-USDT-SWAP order o2 (buy 1 contracts)');
     expect(message).toContain('did NOT create the stop attached to it (51279: TP trigger price error)');
     expect(message).toContain('Place the stop on OKX now.');
+    // kept in Chinese as well: the notice stays up until it is clicked away, whatever language the page is switched to
+    expect(s.toasts[0]?.zh).toContain('止损单未创建：BTC-USDT-SWAP 订单 o2（买入 1 张）');
+    expect(s.toasts[0]?.zh).toContain('51279: TP trigger price error');
     expect(s.orders['o2']?.slFailReason).toBe(lost.slFailReason);
 
     // the next pushes of that order, its last one and a reconnect's hello repeat the reason: no second toast
@@ -314,7 +320,7 @@ describe('applyServerMessage', () => {
     const message = s.toasts[0]?.message ?? '';
     expect(message).toContain('STOP-LOSS MAY BE MISSING: BTC-USDT-SWAP order o2 (buy) was cancelled after filling 0.4 of 1 contracts');
     expect(message).toContain('the filled part may have no stop');
-    expect(message).toContain('Check on OKX now and place the stop by hand if it is missing.');
+    expect(message).toContain('Check the Stops tab now and place the stop on OKX by hand if it is missing.');
     expect(s.lostStopNotified).toEqual(['o2']);
 
     // a repeated push and the history seed of the same order do not repeat it
@@ -513,7 +519,7 @@ describe('activeAlerts', () => {
     const alerts = activeAlerts(down, at + 23_001);
     expect(alerts).toHaveLength(1);
     expect(alerts[0]?.en).toBe('Backend disconnected since 14:03:22. Prices, order book and positions below are frozen.');
-    expect(alerts[0]?.zh).toBe('与后端的连接已断开，下方数据已停止更新');
+    expect(alerts[0]?.zh).toBe('与后端的连接已于 14:03:22 断开。下方的价格、盘口和持仓已停止更新。');
     // still trying to reconnect counts as not open
     expect(activeAlerts({ ...down, wsStatus: 'connecting' }, at + 60_000)).toHaveLength(1);
     // never connected at all
@@ -527,15 +533,17 @@ describe('activeAlerts', () => {
     expect(pub[0]?.en).toBe('OKX market data feed disconnected. Prices and order books are frozen. Oldest data: 14:02:22.');
     const biz = activeAlerts({ ...live, connection: { ...healthy, okxBusiness: 'connecting' } }, at);
     expect(biz.map((a) => a.id)).toEqual(['okx-business']);
-    expect(biz[0]?.zh.length).toBeGreaterThan(0);
+    expect(biz[0]?.zh).toBe('OKX K线连接正在重连，图表已停止更新。');
   });
 
   it('reports stale streams by name', () => {
     const one = activeAlerts({ ...live, connection: { ...healthy, dataAgeMs: 95_000, staleStreams: ['SOL-USDT-SWAP:book'] } }, at);
     expect(one.map((a) => a.id)).toEqual(['stale']);
     expect(one[0]?.en).toBe('Market data stopped updating: SOL-USDT-SWAP order book. Those values are frozen. Oldest data: 14:01:47.');
+    expect(one[0]?.zh).toBe('部分行情已停止更新：SOL-USDT-SWAP 盘口。这些数值已不再变化。最旧的数据来自 14:01:47。');
     const many = activeAlerts({ ...live, connection: { ...healthy, staleStreams: ['A:mark', 'B:mark', 'C:ticker', 'D:book', 'E:book'] } }, at);
     expect(many[0]?.en).toContain('A mark price, B mark price, C price (+2 more)');
+    expect(many[0]?.zh).toContain('A 标记价格、B 标记价格、C 价格（另有 2 项）');
   });
 
   it('reports an account stream that stays down while the account itself is fine', () => {
@@ -549,7 +557,7 @@ describe('activeAlerts', () => {
     const alerts = activeAlerts(down('disconnected', 'ok'), at + 10_001);
     expect(alerts.map((a) => a.id)).toEqual(['okx-private']);
     expect(alerts[0]?.en).toBe('OKX account stream disconnected since 14:03:22. Positions, orders and balance refresh only about once a minute.');
-    expect(alerts[0]?.zh).toBe('OKX 账户推送已断开，持仓、委托和余额约每分钟才刷新一次');
+    expect(alerts[0]?.zh).toBe('OKX 账户推送自 14:03:22 起已断开。持仓、委托和余额约每分钟才刷新一次。');
     expect(activeAlerts(down('connecting', 'ok'), at + 60_000)[0]?.en).toContain('OKX account stream connecting since 14:03:22');
     // without an API key the private socket is never connected, and while the account still loads the panels say so
     expect(activeAlerts(down('disconnected', 'disabled'), at + 60_000)).toEqual([]);
@@ -566,7 +574,7 @@ describe('activeAlerts', () => {
     expect(never[0]?.en).toBe(
       'Account data is not updating: the API passphrase is wrong (OKX: [50105] Invalid OK-ACCESS-PASSPHRASE.). Positions, orders and balance are NOT loaded: an empty table does not mean a flat account.',
     );
-    expect(never[0]?.zh).toBe('账户数据未更新：API 密码短语（passphrase）错误。持仓、委托和余额尚未加载，空表不代表空仓');
+    expect(never[0]?.zh).toBe('账户数据未更新：API 密码短语（passphrase）错误（OKX: [50105] Invalid OK-ACCESS-PASSPHRASE.）。持仓、委托和余额尚未加载：空表不代表空仓。');
 
     // it worked before: say since when the numbers on screen are frozen
     const frozen = failed('50110', 'Invalid IP', at - 300_000);
@@ -574,7 +582,7 @@ describe('activeAlerts', () => {
     expect(frozen[0]?.en).toBe(
       "Account data is not updating since 13:58:22: this computer's IP address is not on the API key's allow-list (OKX: [50110] Invalid IP). Positions, orders and balance below are from that time.",
     );
-    expect(frozen[0]?.zh).toBe('账户数据已停止更新：本机 IP 不在 API key 的白名单内。下方持仓、委托和余额不是最新数据');
+    expect(frozen[0]?.zh).toBe('账户数据自 13:58:22 起停止更新：本机 IP 不在 API key 的白名单内（OKX: [50110] Invalid IP）。下方的持仓、委托和余额是那一刻的数据。');
 
     // the login of the stream is rejected but the reconcile succeeds every minute: the data IS updating, only slower
     const slow = failed('60009', 'login failed: Login failed.', at - 30_000);
@@ -586,7 +594,7 @@ describe('activeAlerts', () => {
     // one reconcile failed while pushes keep arriving
     const pushed = failed('', 'fetch failed', at - 5_000, 'connected');
     expect(pushed[0]?.en).toBe('The last account refresh failed (fetch failed). Live updates from the account stream still arrive.');
-    expect(pushed[0]?.zh).toBe('账户定时刷新失败，实时推送仍在更新');
+    expect(pushed[0]?.zh).toBe('最近一次账户刷新失败（fetch failed）。账户推送的实时更新仍在到达。');
     // exactly 90 s old still counts as updating, like the "as of" label
     expect(failed('', 'fetch failed', at - 90_000)[0]?.en).toContain('Live account stream unavailable');
     expect(failed('', 'fetch failed', at - 90_001)[0]?.en).toContain('Account data is not updating since');
@@ -598,7 +606,7 @@ describe('activeAlerts', () => {
     // a code the notes do not document, and a failure that did not come from OKX: verbatim, no guess
     expect(failed('59999', 'Something new', null)[0]?.en).toContain('Account data is not updating (OKX: [59999] Something new). ');
     expect(failed('', 'could not reach OKX (ENOTFOUND)', null)[0]?.en).toContain('Account data is not updating (could not reach OKX (ENOTFOUND)). ');
-    expect(failed('59999', 'Something new', null)[0]?.zh).toBe('账户数据未更新。持仓、委托和余额尚未加载，空表不代表空仓');
+    expect(failed('59999', 'Something new', null)[0]?.zh).toBe('账户数据未更新（OKX: [59999] Something new）。持仓、委托和余额尚未加载：空表不代表空仓。');
 
     // no banner while the account is fine, still starting, or not configured
     for (const state of ['ok', 'starting', 'disabled'] as const) {
@@ -644,6 +652,9 @@ describe('activeAlerts', () => {
     const notLoaded = killSwitchSweepNotice({ connection: { ...healthy, account: { state: 'error', error: { code: '50105', message: 'x', ts: at }, lastSyncAt: null, readOnly: false } }, account: null });
     expect(notLoaded).toContain('The account is not loaded');
     expect(notLoaded).not.toContain('will be cancelled');
+    // the dialog of a Chinese page makes the same distinction
+    expect(killSwitchSweepNotice({ connection: healthy, account }, 'zh')).toContain('全部当前委托都会被撤销');
+    expect(killSwitchSweepNotice({ connection: healthy, account: { ...account, canTrade: false } }, 'zh')).not.toContain('都会被撤销');
   });
 
   it('overLimitNotice: one line naming each instrument and the total, nothing while within the limits', () => {
@@ -657,6 +668,9 @@ describe('activeAlerts', () => {
     expect(both).toContain('BTC-USDT-SWAP by 6,500 USD, ETH-USDT-SWAP by 120 USD.');
     expect(both).toContain('Total position notional is 1,500 USD over the limit.');
     expect(overLimitNotice({ overLimit: [], totalOverLimit: '1500' })).toBe('Total position notional is 1,500 USD over the limit. Trim back to the limit; closing orders are always allowed.');
+    expect(overLimitNotice({ overLimit: [over], totalOverLimit: '1500' }, 'zh')).toBe(
+      '超过单合约上限：BTC-USDT-SWAP 超出 6,500 USD。持仓总名义价值超出上限 1,500 USD。请减仓至上限以内；平仓订单始终允许。',
+    );
   });
 
   it('trimAdvice: the excess in quote and in contracts rounded down to the lot', () => {
@@ -701,5 +715,38 @@ describe('activeAlerts', () => {
     expect(isStreamStale({ connection: c }, 'SOL-USDT-SWAP', 'ticker')).toBe(false);
     expect(isStreamStale({ connection: c }, 'BTC-USDT-SWAP', 'book')).toBe(false);
     expect(isStreamStale({ connection: null }, 'BTC-USDT-SWAP', 'book')).toBe(true);
+  });
+});
+
+describe('algo orders (stops)', () => {
+  const stop: AlgoOrder = {
+    algoId: 'a1', algoClOrdId: '', instId: 'BTC-USDT-SWAP', side: 'sell', posSide: 'net', tdMode: 'cross', sz: '10', closeFraction: '', slTriggerPx: '59000', slTriggerPxType: 'mark', slOrdPx: '-1', tpTriggerPx: '', cTime: 1, uTime: 1,
+  };
+
+  it('hello replaces the list wholesale: null after a server restart means "not read yet", not "no stops"', () => {
+    const loaded = { ...initialState('tok'), ...applyServerMessage(initialState('tok'), { type: 'hello', data: { ...hello, algoOrders: { orders: [stop], ts: 1_000 } } }) };
+    expect(loaded.algoOrders).toEqual({ orders: [stop], ts: 1_000 });
+    expect(applyServerMessage(loaded, { type: 'hello', data: hello }).algoOrders).toBeNull();
+  });
+
+  it('every list the server sends replaces the one shown, also an empty one', () => {
+    let s: TerminalState = initialState('tok');
+    s = { ...s, ...applyServerMessage(s, { type: 'algoOrders', data: { orders: [stop], ts: 1_000 } }) };
+    expect(s.algoOrders?.orders).toEqual([stop]);
+    s = { ...s, ...applyServerMessage(s, { type: 'algoOrders', data: { orders: [], ts: 2_000 } }) };
+    expect(s.algoOrders).toEqual({ orders: [], ts: 2_000 });
+  });
+
+  it('an older read never replaces a newer one: the reply of a slow HTTP read after a push', () => {
+    const s: TerminalState = { ...initialState('tok'), algoOrders: { orders: [], ts: 2_000 } };
+    expect(applyAlgoOrders(s, { orders: [stop], ts: 1_000 })).toEqual({});
+    expect(applyAlgoOrders(s, { orders: [stop], ts: 2_000 })).toEqual({ algoOrders: { orders: [stop], ts: 2_000 } });
+  });
+
+  it('the list is marked with its read time only once it is older than two reconciles and a half', () => {
+    const list = { orders: [stop], ts: 1_000_000 };
+    expect(stopsAsOf(null, 5_000_000)).toBeNull();
+    expect(stopsAsOf(list, 1_000_000 + STOPS_STALE_MS)).toBeNull();
+    expect(stopsAsOf(list, 1_000_000 + STOPS_STALE_MS + 1)).toBe(1_000_000);
   });
 });

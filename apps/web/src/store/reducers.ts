@@ -1,4 +1,4 @@
-import { stopUnconfirmedAfterCancel, type Candle, type Fill, type HelloPayload, type Order, type RiskState, type ServerMessage, type Trade } from '@pegasus/shared';
+import { stopUnconfirmedAfterCancel, type AlgoOrderList, type Candle, type Fill, type HelloPayload, type Localized, type Order, type RiskState, type ServerMessage, type Trade } from '@pegasus/shared';
 import type { WsStatus } from '../lib/ws';
 import { LIMITS, emptyMarket, type MarketData, type TerminalState, type Toast, type ToastKind } from './types';
 
@@ -29,6 +29,8 @@ export function applyServerMessage(state: TerminalState, msg: ServerMessage): Pa
       return { fills: mergeFills(state.fills, [msg.data]) };
     case 'positions':
       return { positions: msg.data };
+    case 'algoOrders':
+      return applyAlgoOrders(state, msg.data);
     case 'balance':
       return { balance: msg.data };
     case 'account':
@@ -93,6 +95,7 @@ export function applyHello(state: TerminalState, data: HelloPayload): Partial<Te
     ...notices,
     helloSeq: state.helloSeq + 1,
     demo: data.demo,
+    paper: data.paper,
     instruments: data.instruments,
     account: data.account,
     riskConfig: data.riskConfig,
@@ -102,11 +105,18 @@ export function applyHello(state: TerminalState, data: HelloPayload): Partial<Te
     // hello replaces positions, orders and balance wholesale, so it also decides whether they are loaded
     accountLoaded: data.connection.account.lastSyncAt !== null,
     positions: data.positions,
+    // like positions and orders, replaced wholesale: after a server restart null says "not read yet"
+    algoOrders: data.algoOrders,
     orders,
     serverTime: data.serverTime,
     selectedInstId,
     market,
   };
+}
+
+/** A list of the algo orders, from the socket or from the reply of a read asked over HTTP: an older read never replaces a newer one. */
+export function applyAlgoOrders(state: TerminalState, list: AlgoOrderList): Partial<TerminalState> {
+  return state.algoOrders !== null && state.algoOrders.ts > list.ts ? {} : { algoOrders: list };
 }
 
 export function updateMarket(
@@ -171,15 +181,15 @@ export function noteLostStop(state: TerminalState, order: Order): Partial<Termin
   let zh: string;
   if (order.slFailReason !== undefined) {
     en = `STOP-LOSS NOT CREATED: ${order.instId} order ${order.ordId} (${order.side} ${order.sz} contracts). The exchange did NOT create the stop attached to it (${order.slFailReason}): the position has no stop. Place the stop on OKX now.`;
-    zh = `止损单未创建：${order.instId} 订单 ${order.ordId} 的仓位没有止损，请立即在 OKX 上设置止损`;
+    zh = `止损单未创建：${order.instId} 订单 ${order.ordId}（${order.side === 'buy' ? '买入' : '卖出'} ${order.sz} 张）。交易所没有创建它附带的止损（${order.slFailReason}）：该仓位没有止损，请立即在 OKX 上设置止损。`;
   } else if (stopUnconfirmedAfterCancel(order)) {
-    en = `STOP-LOSS MAY BE MISSING: ${order.instId} order ${order.ordId} (${order.side}) was cancelled after filling ${order.accFillSz} of ${order.sz} contracts. OKX creates the attached stop only when an order is completely filled: the filled part may have no stop. Check on OKX now and place the stop by hand if it is missing.`;
-    zh = `止损单可能缺失：${order.instId} 订单 ${order.ordId} 部分成交（${order.accFillSz}/${order.sz} 张）后被撤销，已成交部分可能没有止损，请立即在 OKX 上核对，缺失则手动补上`;
+    en = `STOP-LOSS MAY BE MISSING: ${order.instId} order ${order.ordId} (${order.side}) was cancelled after filling ${order.accFillSz} of ${order.sz} contracts. OKX creates the attached stop only when an order is completely filled: the filled part may have no stop. Check the Stops tab now and place the stop on OKX by hand if it is missing.`;
+    zh = `止损单可能缺失：${order.instId} 订单 ${order.ordId}（${order.side === 'buy' ? '买入' : '卖出'}）在成交 ${order.accFillSz}/${order.sz} 张后被撤销。OKX 只在订单完全成交后才创建附带的止损：已成交部分可能没有止损。请立即在“止损单”标签页核对，缺失则在 OKX 上手动补上。`;
   } else {
     return {};
   }
   return {
-    ...pushToast(state, 'error', `${en}\n${zh}`, true),
+    ...pushToast(state, 'error', { en, zh }, true),
     lostStopNotified: [...state.lostStopNotified, order.ordId].slice(-LIMITS.lostStopNotified),
   };
 }
@@ -222,10 +232,12 @@ export function mergeFills(fills: Fill[], incoming: Fill[]): Fill[] {
 
 /**
  * Appends a toast and keeps the newest LIMITS.toasts of those that may be dropped. A sticky toast (the
- * lost-stop notice) is outside the cap: it leaves only when the trader clicks it away.
+ * lost-stop notice) is outside the cap: it leaves only when the trader clicks it away. A message given in
+ * both languages is kept in both, so the toast follows a later switch of the language.
  */
-export function pushToast(state: TerminalState, kind: ToastKind, message: string, sticky = false): Partial<TerminalState> {
-  const toast: Toast = { id: state.nextToastId, kind, message, ts: Date.now() };
+export function pushToast(state: TerminalState, kind: ToastKind, message: string | Localized, sticky = false): Partial<TerminalState> {
+  const toast: Toast = { id: state.nextToastId, kind, message: typeof message === 'string' ? message : message.en, ts: Date.now() };
+  if (typeof message !== 'string') toast.zh = message.zh;
   if (sticky) toast.sticky = true;
   const all = [...state.toasts, toast];
   const droppable = all.filter((t) => t.sticky !== true);

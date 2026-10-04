@@ -3,6 +3,7 @@ import type { Prng } from '../prng.js';
 import type { OkxCandleRow, OkxFundingRate, OkxInstrument, OkxMarkPrice, OkxSide, OkxTicker, OkxTrade } from '../wire.js';
 import { SyntheticBook, type BooksPush } from './book.js';
 import { BAR_MS, BARS, barStart, CandleSeries, candleRow, type Bar } from './candles.js';
+import type { Market } from './context.js';
 
 const HISTORY_BARS = 300;
 const HISTORY_VOL_PER_MINUTE = 0.0005;
@@ -26,7 +27,7 @@ export interface MarketSimOptions {
 }
 
 /** Price process, synthetic book, prints, candles and ticker for one instrument. */
-export class MarketSim {
+export class MarketSim implements Market {
   readonly book: SyntheticBook;
   readonly candles = new Map<Bar, CandleSeries>();
   private mid: Dec;

@@ -1,13 +1,15 @@
 import { useState, type FormEvent } from 'react';
+import { errorText, useT } from '../i18n';
 import { api } from '../lib/api';
-import { errorMessage } from '../lib/http';
 import { useStore } from '../store/store';
+import { LangSwitch } from './LangSwitch';
 
 export function TokenGate() {
+  const t = useT();
   const setToken = useStore((s) => s.setToken);
   const [value, setValue] = useState('');
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -19,7 +21,7 @@ export function TokenGate() {
       await api.instruments(token);
       setToken(token);
     } catch (err) {
-      setError(errorMessage(err));
+      setError(err);
     } finally {
       setBusy(false);
     }
@@ -28,10 +30,13 @@ export function TokenGate() {
   return (
     <div className="gate">
       <form className="gate-card form" onSubmit={(e) => void submit(e)}>
-        <h1>PEGASUS</h1>
-        <p>Enter the API token (API_TOKEN of the pegasus server).</p>
+        <div className="row">
+          <h1 className="grow">PEGASUS</h1>
+          <LangSwitch />
+        </div>
+        <p>{t.gate.prompt}</p>
         <div className="field">
-          <label htmlFor="token">API token</label>
+          <label htmlFor="token">{t.gate.tokenLabel}</label>
           <input
             id="token"
             type="password"
@@ -42,9 +47,9 @@ export function TokenGate() {
             disabled={busy}
           />
         </div>
-        {error !== null && <div className="notice notice-danger">{error}</div>}
+        {error !== null && <div className="notice notice-danger">{errorText(error, t)}</div>}
         <button className="btn btn-primary" type="submit" disabled={busy || value.trim() === ''}>
-          {busy ? 'Checking…' : 'Sign in'}
+          {busy ? t.gate.checking : t.gate.signIn}
         </button>
       </form>
     </div>

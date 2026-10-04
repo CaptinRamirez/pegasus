@@ -1,0 +1,485 @@
+import type { CancelSweepState } from '@pegasus/shared';
+import { safeDecimal } from '../lib/format';
+import type { Messages, RiskDetails } from './en';
+
+const SIDE = { buy: '买入', sell: '卖出' };
+const POS_SIDE = { long: '多', short: '空', flat: '无持仓', net: '净持仓' };
+const ORD_TYPE = { market: '市价', limit: '限价', post_only: '只做 Maker', fok: 'FOK', ioc: 'IOC' };
+const ORDER_STATE = { live: '未成交', partially_filled: '部分成交', filled: '完全成交', canceled: '已撤销' };
+const INTENT = { 'Open long': '开多', 'Open short': '开空', 'Close long': '平多', 'Close short': '平空' };
+const SWEEP: Record<CancelSweepState, string> = { idle: '', pending: '进行中', done: '已完成', failed: '失败', skipped: '已跳过' };
+
+const OTHER_LOT_TITLE = '该方向已有持仓或入场委托。每个日线切点各自交易一份仓位：只有当已开的是另一个切点的仓位、而本切点的仓位尚未建立时，才应用本行。Pegasus 不记录哪份仓位属于哪个切点。';
+
+/** A value of the risk details as text; '' when the server did not send it. */
+const val = (d: RiskDetails, key: string): string => {
+  const v = d[key];
+  return typeof v === 'string' || typeof v === 'number' ? String(v) : '';
+};
+
+/** A fraction of the risk details as a percentage ("0.0632" -> "6.32%"). */
+const pct = (d: RiskDetails, key: string, dp: number): string => {
+  const v = safeDecimal(val(d, key));
+  return v === null ? val(d, key) : `${v.mul(100).toFixed(dp)}%`;
+};
+
+/** Coarse age, as fmtAgeCoarse: "12 分钟", "5 小时", "3 天". */
+function ageCoarse(ms: number): string {
+  if (ms < 3_600_000) return `${Math.max(0, Math.floor(ms / 60_000))} 分钟`;
+  if (ms < 48 * 3_600_000) return `${Math.floor(ms / 3_600_000)} 小时`;
+  return `${Math.floor(ms / 86_400_000)} 天`;
+}
+
+export const zh: Messages = {
+  common: {
+    waitingServer: '等待服务器…',
+    accountNotLoaded: '账户未加载',
+    untracked: '未跟踪',
+    untrackedTitle: '不在跟踪的合约列表中：价格和数量按 OKX 返回的原样显示，币的数量未知。',
+    stale: '已停更',
+    asOf: (time) => `截至 ${time}`,
+    couldNotLoad: (what) => `无法加载${what}：`,
+    retry: '重试',
+    retrying: '重试中…',
+    refresh: '刷新',
+    cancel: '撤销',
+    market: '市价',
+    coin: '币',
+    contracts: '张',
+    quote: '计价货币',
+    time: '时间',
+    instrument: '合约',
+    side: '方向',
+    price: '价格',
+    size: '数量',
+    fee: '手续费',
+    stop: '止损',
+    priceStopped: '价格已停止更新',
+    na: '无',
+  },
+
+  enums: {
+    side: SIDE,
+    posSide: POS_SIDE,
+    mgnMode: { cross: '全仓', isolated: '逐仓' },
+    ordType: ORD_TYPE,
+    orderState: ORDER_STATE,
+    posMode: { net_mode: '买卖模式（单向持仓）', long_short_mode: '开平仓模式（双向持仓）' },
+    instState: { live: '交易中', suspend: '暂停交易', preopen: '预上线', test: '测试' },
+    conn: { connected: '已连接', connecting: '连接中', disconnected: '已断开', open: '已连接', closed: '已断开', unknown: '未知' },
+    regime: { trend: '趋势', neutral: '中性', range: '震荡', crisis: '危机' },
+    intent: INTENT,
+    triggerPx: { last: '最新价', index: '指数价', mark: '标记价' },
+    exec: { T: '吃单', M: '挂单' },
+  },
+
+  header: {
+    equity: '权益',
+    dailyPnl: '当日盈亏',
+    killSwitch: '紧急停止',
+    killSwitchOn: '紧急停止已开启',
+    haltAll: '暂停全部交易',
+    signOut: '退出登录',
+    badge: { paper: '纸面交易', demo: '模拟盘', live: '实盘' },
+    paperTitle: '纸面交易：订单、持仓和资金都由 Pegasus 按 OKX 实盘行情模拟，不会向任何 OKX 账户发送指令。',
+    dots: { ws: '后端', public: '行情', private: '账户', business: 'K线' },
+    dotTitle: (label, state) => `${label}：${state}`,
+    released: '紧急停止已解除',
+    releasedRebased: '紧急停止已解除：当日盈亏从当前权益重新计算',
+    engaged: '紧急停止已开启：交易已暂停',
+    confirmEngage: (sweepNotice) => `确定开启紧急停止？\n\n${sweepNotice}\n\n在解除之前，通过 Pegasus 提交的新开仓订单都会被拒绝。`,
+    confirmRelease: '确定解除紧急停止并恢复交易？',
+    rebaseQuestion: (v) =>
+      [
+        `当日亏损限额仍在生效：今日盈亏 ${v.dailyPnl} USD，限额 -${v.limit} USD。`,
+        `仍要解除吗？解除后，今天至此的亏损不再计入：当日盈亏从当前权益（${v.equity} USD）重新从 0 计算，限额也从该处重新生效。`,
+        '仅当权益下降并非交易亏损时才这样做，例如从账户划出了资金。',
+      ].join('\n\n'),
+  },
+
+  gate: {
+    prompt: '请输入 API 令牌（Pegasus 服务器的 API_TOKEN）。',
+    tokenLabel: 'API 令牌',
+    checking: '验证中…',
+    signIn: '登录',
+    tokenRejected: '服务器拒绝了该令牌',
+  },
+
+  toasts: { dismiss: '点击关闭' },
+
+  instruments: { title: '合约' },
+
+  book: {
+    title: '盘口',
+    staleTitle: '盘口已停止更新，这些档位不是最新数据',
+    empty: '暂无盘口数据',
+    sizeIn: (ccy) => `数量（${ccy}）`,
+    total: '累计',
+    spread: '价差',
+    pickTitle: '将此价格填入下单面板',
+  },
+
+  trades: {
+    title: '最新成交',
+    staleTitle: '成交已停止更新，此列表不是最新数据',
+    empty: '暂无成交',
+  },
+
+  chart: {
+    title: '图表',
+    last: '最新价',
+    mark: '标记价',
+    funding: '资金费率',
+    vol24h: '24h 成交量',
+    markStopped: '标记价格已停止更新',
+    historyFailed: '历史数据加载失败',
+    loading: '加载中…',
+  },
+
+  tabs: { positions: '持仓', orders: '当前委托', stops: '止损单', history: '历史委托', fills: '成交记录', signals: '信号' },
+
+  account: {
+    title: '账户',
+    loading: '正在加载账户…',
+    failed: '账户未加载（见上方警告）',
+    noKey: '未配置 API key，仅显示行情',
+    totalEquity: '总权益',
+    posMode: '持仓模式',
+    level: '账户等级',
+    ccy: '币种',
+    equity: '权益',
+    avail: '可用',
+    cash: '现金余额',
+    upl: '未实现盈亏',
+    noBalance: '暂无余额',
+  },
+
+  risk: {
+    title: '风控',
+    noConfig: '尚无风控配置',
+    killSwitchOn: (reason) => `紧急停止已开启${reason !== '' ? ` — ${reason}` : ''}`,
+    reasonHint: (reason) =>
+      reason.startsWith('STATE_FILE_UNREADABLE')
+        ? '状态文件无法读取，为安全起见已暂停开仓；确认账户无误后可手动解除。'
+        : reason.startsWith('DAILY_LOSS_LIMIT')
+          ? '当日亏损已触及限额，已暂停开仓。'
+          : reason === 'manual (terminal)' || reason === 'MANUAL'
+            ? '已在终端手动开启。'
+            : null,
+    sweep: (state, message) => `撤销全部委托：${SWEEP[state]}（${message}）${state === 'failed' || state === 'skipped' ? '。委托并未撤销，请到 OKX 上撤单。' : ''}`,
+    dailyPnl: (since) => `当日盈亏${since !== null ? `（自 ${since} 起）` : ''}`,
+    positionNotional: '持仓名义价值',
+    openOrders: '当前委托',
+    maxOrderNotional: '单笔名义价值上限',
+    maxPerInstrument: '单合约上限',
+    maxLeverage: '最大杠杆',
+    priceBand: '价格偏离限制',
+    maxSlippage: '最大滑点',
+    baselineEquity: '基准权益',
+    dayStartEquity: '日初权益',
+    currentEquity: '当前权益',
+  },
+
+  orders: {
+    loading: '正在加载委托…',
+    failed: '委托未加载（见上方警告）',
+    noKey: '未配置 API key，不显示委托',
+    stopNotActiveTitle: 'OKX 只在订单完全成交后才创建附带的止损单。已成交的部分是一个没有止损的仓位：等待订单全部成交，或撤销剩余部分，并在“止损单”标签页确认已成交部分的止损存在。',
+    cancelRequested: (ordId) => `已请求撤销 ${ordId}`,
+    cancelFailed: (err) => `撤单失败：${err}`,
+    canceledN: (n) => `已撤销 ${n} 笔委托`,
+    cancelAllFailed: (err) => `全部撤单失败：${err}`,
+    confirmCancelAll: (n) => `确定撤销全部 ${n} 笔当前委托？`,
+    empty: '没有当前委托',
+    emptyHistory: '没有历史委托',
+    whatHistory: '历史委托',
+    whatEarlier: '更早的委托',
+    type: '类型',
+    stopTitle: '订单附带的止损：OKX 只在订单完全成交后才创建（标记价格触发，市价执行）',
+    filled: '已成交',
+    avgPx: '成交均价',
+    state: '状态',
+    pnl: '盈亏',
+    cancelAll: '全部撤销',
+    reduceOnlyTag: '只减仓',
+    notActive: '未生效',
+  },
+
+  fills: {
+    empty: '没有成交',
+    what: '成交记录',
+    whatEarlier: '更早的成交',
+    exec: '流动性',
+    order: '订单',
+  },
+
+  positions: {
+    loading: '正在加载持仓…',
+    failed: '持仓未加载（见上方警告）',
+    noKey: '未配置 API key，不显示持仓',
+    stopTitle: {
+      none: '交易所没有该仓位的止损（止盈止损委托）。订单附带的止损要等订单完全成交后才会出现；否则请在这里补一个。计划委托和移动止损不在读取范围内。',
+      partial: 'OKX 上的止损所平的张数少于该仓位的持仓：有一部分没有止损。',
+      full: 'OKX 上的止损覆盖了整个仓位（见“止损单”标签页）。',
+      over: 'OKX 上的止损合计张数多于该仓位的持仓。如果平掉了一份仓位，请在“止损单”标签页撤销它的止损。',
+    },
+    stopsUnread: '尚未从 OKX 读取止损单',
+    nStops: (n) => `${n} 个止损`,
+    noStop: '无止损',
+    covers: (covered, size) => `覆盖 ${covered} / ${size} 张`,
+    stopsOver: (covered, size) => `止损 ${covered} 张 > 持仓 ${size} 张`,
+    addStop: '添加止损',
+    addStopTitle: '为尚无止损覆盖的张数下一个标记价格触发的市价止损',
+    closeRequested: (instId, posSide) => `已请求平仓：${instId}${posSide === 'net' ? '' : ` ${POS_SIDE[posSide]}`}`,
+    closeFailed: (err) => `平仓失败：${err}`,
+    stopPlaced: (instId, sz, px) => `止损已下：${instId} ${sz} 张，触发价 ${px}`,
+    stopNotPlaced: (err) => `止损未下成功：${err}`,
+    stopPrompt: (uncovered, side, instId) => `${instId} ${POS_SIDE[side]}仓中尚无止损的 ${uncovered} 张的止损价（标记价格触发，市价执行）：`,
+    stopPriceInvalid: '止损价必须是正数',
+    confirmClose: (side, instId) => `确定以市价平掉 ${instId} 的${POS_SIDE[side]}仓？`,
+    empty: '没有持仓',
+    caption: '持仓',
+    contracts: '张数',
+    coin: '币数量',
+    avgPx: '开仓均价',
+    mark: '标记价',
+    stopHeaderTitle: '该仓位在 OKX 上的止损单，以最近一次读取为准（见“止损单”标签页）',
+    upl: '未实现盈亏',
+    uplPct: '收益率',
+    lever: '杠杆',
+    liqPx: '强平价',
+    margin: '保证金',
+    notional: '名义价值',
+    overLimitTitle: (instId, notional, limit) => `${instId} 的持仓名义价值 ${notional} USD 超过单合约上限 ${limit} USD：请减仓至上限以内`,
+    overLimitTag: (quote, contracts) => `超限：需减仓 ${quote} USD${contracts !== null ? `（${contracts} 张）` : ''}`,
+    close: '平仓',
+  },
+
+  stops: {
+    loading: '正在加载止损单…',
+    failed: '止损单未加载（见上方警告）',
+    noKey: '未配置 API key，不显示止损单',
+    noPositionTitle: '没有与该止损匹配的持仓（合约、保证金模式、方向）。如果仓位已平，这是遗留的止损：请撤销，否则价格触及时它会反向开仓。',
+    readFailed: (err) => `无法从 OKX 读取止损单：${err}`,
+    moved: (instId, from, to) => `止损已移动：${instId} ${from} → ${to}`,
+    notMoved: (err) => `止损未移动：${err}`,
+    cancelled: (instId, algoId) => `止损已撤销：${instId} ${algoId}`,
+    notCancelled: (err) => `止损未撤销：${err}`,
+    newPriceInvalid: '新的止损价必须是正数',
+    confirmLoosen: (instId, from, to) => `这会把 ${instId} 的止损移到离现价更远的位置（${from} → ${to}）：仓位可能亏得更多。仍要移动吗？`,
+    confirmCancel: (instId, px, hasPosition) => `确定撤销 ${instId} 在 ${px} 的止损？${hasPosition ? '撤销后该仓位将失去这个止损。' : ''}`,
+    reading: '读取中…',
+    unread: '尚未从 OKX 读取止损单',
+    readAt: '从 OKX 读取于',
+    notRefreshed: '（此后未刷新）',
+    none: 'OKX 上没有止损单：',
+    caption: '止损单',
+    closes: '平仓方向',
+    stopTitle: '止损触发价及其触发价类型',
+    exec: '执行价',
+    execTitle: '触发后平仓委托的执行方式',
+    tp: '止盈',
+    tpTitle: '同一策略委托的止盈触发价',
+    newStop: '新止损价',
+    noPosition: '无持仓',
+    wholePosition: '全部仓位',
+    pctOfPosition: (p) => `仓位的 ${p}%`,
+    newStopAria: (instId, algoId) => `${instId} ${algoId} 的新止损价`,
+    pricePlaceholder: '价格',
+    move: '移动',
+  },
+
+  ticket: {
+    title: '下单',
+    selectInstrument: '请选择合约',
+    killSwitchNotice: '紧急停止已开启：只接受平仓或减仓的订单',
+    buyLong: '买入 / 做多',
+    sellShort: '卖出 / 做空',
+    buyCloseShort: '买入 / 平空',
+    sellCloseLong: '卖出 / 平多',
+    type: '类型',
+    margin: '保证金模式',
+    closeExisting: '平仓 / 减少现有仓位',
+    tick: (tickSz) => `（最小变动 ${tickSz}）`,
+    sizeHint: (minSz, lotSz) => `（最小 ${minSz} 张 / 每手 ${lotSz} 张）`,
+    stopTitle: '订单附带的止损：OKX 只在订单完全成交后才创建；订单部分成交期间，已成交部分没有止损。由标记价格触发，以市价执行。不需要则留空。',
+    stopMark: '止损（标记价）',
+    stopHint: (tickSz) => `（可选，最小变动 ${tickSz}）`,
+    none: '无',
+    reduceOnly: '只减仓',
+    completeForm: '请填写完整',
+    submitting: '提交中…',
+    submitLabel: (intent, side, ccy, ordType) => `${intent === null ? '' : `${INTENT[intent]}：`}${SIDE[side]} ${ccy} ${ordType}`,
+    placed: (o, intent) =>
+      `订单${ORDER_STATE[o.state] ?? o.state}：${intent === null ? '' : `${INTENT[intent]}，`}${SIDE[o.side]} ${o.sz} 张 ${o.instId}${o.px !== '' ? ` @ ${o.px}` : ''}${
+        o.slTriggerPx === undefined ? '' : `，止损 ${o.slTriggerPx}（标记价）`
+      } (${o.ordId})`,
+    describe: (req, intent) =>
+      `${intent === null ? '' : `${INTENT[intent]}：`}${SIDE[req.side]} ${req.size.value} ${req.size.unit === 'contracts' ? '张' : req.size.unit === 'coin' ? '币' : '计价货币'} ${req.instId} ${
+        req.px === undefined ? '市价' : `@ ${req.px}`
+      }${req.slTriggerPx === undefined ? '' : `，止损 ${req.slTriggerPx}（标记价）`}`,
+    errDuplicate: '上一次下单已到达 OKX，本次重试被判定为重复而拒绝，请查看当前委托。',
+    errUnknown: (err) => `订单状态未知：重试前请先查看持仓、成交和当前委托（${err}）`,
+    errRejected: (err, risk) => `订单被拒绝：${err}${risk === null ? '' : ` — ${risk}`}`,
+  },
+
+  leverage: {
+    set: (lever, instId) => `${instId} 的杠杆已设为 ${lever}x`,
+    invalid: '杠杆必须是正数',
+    hint: (maxLever, riskMax) => `交易所上限 ${maxLever}x${riskMax === null ? '' : `，风控上限 ${riskMax}x`}`,
+    label: '杠杆',
+    unavailable: '不可用',
+    setButton: '设置',
+  },
+
+  preview: {
+    previewing: '预览中…',
+    enterSize: '输入数量以预览订单',
+    action: '操作',
+    contracts: '张数',
+    coin: '币数量',
+    refPrice: '参考价',
+    notional: '名义价值',
+    estSlippage: '预估滑点',
+    lossAtStop: '止损时亏损',
+    closingOk: '平仓订单：不受限额约束',
+    riskOk: '风控检查通过',
+  },
+
+  signals: {
+    ticketFilled: (side, contracts, instId, px, cut, noStop) =>
+      `已填入下单面板：${SIDE[side]} ${contracts} 张 ${instId} @ ${px}${cut === null ? '' : `（${cut} 切点）`}${noStop ? '。未带入止损（该方案没有正的止损价）：请自行设置止损' : ''}`,
+    refreshing: '刷新中…',
+    riskTitle: (cuts) => `单笔风险占权益的比例。框架在前三个月使用 0.5%，之后使用 0.75%。${cuts > 1 ? `这是一个单位的风险，由 ${cuts} 个日线切点平分。` : ''}`,
+    risk: '风险',
+    barClosedTitle: '计算信号所用的最近一根日K线；每个切点各有一根（见各行）。当某一行本应已有更新的K线时以警告色显示。',
+    barClosed: (time, ageMs) => `K线收于 ${time}，${ageCoarse(ageMs)}前`,
+    updated: '更新于',
+    equity: '权益',
+    lotTitle: (riskPct, capPct) => `单个切点的仓位：风险为权益的 ${riskPct}，名义价值上限 ${capPct}。同一合约各切点的仓位合计为一个单位。`,
+    perUnit: (riskPct, capPct, cuts) => `每单位风险为权益的 ${riskPct} · 名义价值上限 ${capPct} · 每个切点按 1/${cuts} 单位下单`,
+    perTrade: (riskPct, capPct) => `单笔风险为权益的 ${riskPct} · 名义价值上限 ${capPct}`,
+    summary: (cuts, utcDaily, p, shortsOff) =>
+      `${cuts.length > 1 ? `日线收盘于 ${cuts.join(' 和 ')}` : utcDaily ? 'UTC 日线收盘' : `日线收盘于 ${cuts[0] ?? ''}`} · ${p.entryChannel} 日突破 · MA${p.trendMaPeriod} · ${p.atrStopMultiple}×ATR(${p.atrPeriod}) 止损${
+        shortsOff ? ' · 做空已关闭' : ''
+      } · 每 5 分钟自动刷新`,
+    unavailable: '信号不可用',
+    loading: '正在加载信号…',
+    noInstruments: '没有可报告的合约',
+    outdated: (time) => `信号自 ${time} 起未更新。下方表格可能已过期；“应用”已禁用。`,
+    regime: '市场状态',
+    close: '收盘价',
+    distAtr: '距离（ATR）',
+    atrPct: 'ATR %',
+    dHigh: (n) => `${n} 日高点`,
+    dLow: (n) => `${n} 日低点`,
+    exitTitle: '最近一次收盘所对比的离场通道。下一交易日的位置见展开行。',
+    erTitle: (n) => `${n} 日效率比：|净变动| / 路径长度`,
+    volRatio: '波动率比',
+    volRatioTitle: (short, long) => `${short} 日 / ${long} 日已实现波动率`,
+    funding3d: '3 日资金费率',
+    annualised: '年化',
+    book: '盘口',
+    bookTitle: '可见盘口的深度不平衡 (买 − 卖) / (买 + 卖)；仅作执行参考，不是方向信号',
+    spreadDepth: '价差 · 深度',
+    oi: '持仓量',
+    oiTitle: '该合约的持仓量：当前水平；最近 10 个已完成 UTC 日的变化（括号内为最近一个已完成日的变化），按币计量',
+    oiSub: '10 日变化（1 日）',
+    signals: '信号',
+    stopLong: '多头止损',
+    stopShort: '空头止损',
+    stopPct: '止损 %',
+    contractsTitle: (shortsOff) => (shortsOff ? '新开多仓的数量。做空入场已关闭（allowShort = false）。' : '新开多仓的数量；副行为新开空仓的数量（空仓按一半计）'),
+    contractsLong: '多头张数',
+    short: '空头',
+    coinLong: '多头币数量',
+    notionalTitle: '所示张数的名义价值（已向下取整到整手）',
+    notionalLong: '多头名义价值',
+    riskLong: '多头风险',
+  },
+
+  row: {
+    inPositionTitle: '该方向已有持仓。对已有仓位加仓（金字塔加仓）目前不在框架之内。',
+    entryPendingTitle: '该方向已有尚未成交的入场委托。再次应用信号之前，请先撤销它或等它成交，否则仓位会加倍。',
+    otherLotTitle: OTHER_LOT_TITLE,
+    unitFullTitle: '该方向的持仓和入场委托合计已达到全部日线切点的仓位（一个单位）。继续加仓（金字塔加仓）目前不在框架之内。',
+    outdatedTitle: '信号未能刷新，本行可能已过期。应用前请先刷新。',
+    fundingUncheckedTitle: '资金费率历史不可用，本次入场跳过了资金费率过滤。操作前请到 OKX 查看资金费率。',
+    latestCutTitle: '该切点的日K线最近收盘：现在应当按这一行操作。',
+    shortsOffTitle: '做空入场已关闭（allowShort = false）。空头离场信号和已有空仓的止损仍会显示。',
+    capped: '封顶',
+    noEquity: '无权益',
+    shortOff: '做空关闭',
+    bookTitle: (levels) => `${levels} 档可见深度；仅作执行参考，不是方向信号。`,
+    oiUnit: { usd: 'USD', contracts: '张' },
+    oiTitleLive: (unit) => `该合约的实时持仓量（${unit}）。其日线历史暂不可用，无法显示 1 日和 10 日变化。`,
+    oiTitleHistory: (unit, points) =>
+      `该合约的持仓量（${unit}）：水平为今日截至目前的数值。变化对比的是已完成的 UTC 日（OKX 日线历史，${points} 天）：最近一个已完成日对比其 10 天前（括号内对比其前一天），按币计量，因此单纯的价格变动不计入。`,
+    liveNoHistory: '实时 · 无历史',
+    structureLabel: '市场结构：',
+    bookNa: '盘口 无',
+    bookLine: (imbalance, spread, depth) => `盘口不平衡 ${imbalance}，价差 ${spread}，深度 ${depth}`,
+    oiNa: '持仓量 无',
+    oiLive: (level) => `持仓量 ${level}（实时水平；历史和变化不可用）`,
+    oiLine: (level, change1d, change10d, percentile) => `持仓量 ${level}，1 日 ${change1d}，10 日 ${change10d}，分位 ${percentile}`,
+    latestClose: ' · 最近收盘',
+    volTitle: (short, volShort, long, volLong) => `${short} 日波动率 ${volShort} / ${long} 日波动率 ${volLong}（年化）`,
+    perAnnum: (p) => `年化 ${p}`,
+    fundingUnchecked: '资金费率未检查',
+    inPosition: '已有持仓',
+    entryPending: '入场委托未成交',
+    sizeAdjust: (multiplier, adjustments) => `仓位 ×${multiplier}：${adjustments.join('，')}`,
+    noEquityTitle: '无权益：无法计算仓位',
+    fillTicketTitle: (side, contracts, close, otherLot) => `填入下单面板：${SIDE[side]} ${contracts} 张 @ ${close}${otherLot ? `。${OTHER_LOT_TITLE}` : ''}`,
+    apply: '应用',
+    sizingNoEquity: '仓位：没有可用的权益（请用有资金的账户登录，或传入 ?equity）',
+    sizingLong: '多头仓位：',
+    sizingShort: '空头仓位：',
+    sizingShortOff: '空头仓位：关闭（做空入场已关闭，allowShort = false）',
+    nextSession: (exitChannel, longStop, shortStop) =>
+      `下一交易日（含最近一根K线的 ${exitChannel} 日通道）：多仓在交易所的止损上移至 ${longStop}，空仓下移至 ${shortStop}；止损只能朝有利于仓位的方向移动`,
+    barClosed: (time) => `K线收于 ${time}`,
+    dataFetched: (time) => ` · 交易所数据获取于 ${time}`,
+    longEntry: '做多入场',
+    shortEntry: '做空入场',
+    longExit: '多头离场',
+    shortExit: '空头离场',
+  },
+
+  apiErrors: {
+    NETWORK: '网络错误，无法连接后端',
+    INTERNAL: '服务器内部错误',
+    UNAUTHORIZED: '令牌缺失或无效',
+    NOT_FOUND: '接口不存在',
+    FORBIDDEN_HOST: '请求的 Host 不是本机',
+    FORBIDDEN_ORIGIN: '页面来源不在 WEB_ORIGINS 允许的范围内',
+    VALIDATION: '请求参数无效',
+    UNKNOWN_INSTRUMENT: '服务器未跟踪该合约',
+    SIZING: '数量或价格无法换算',
+    RISK_REJECTED: '风控拒绝',
+    EXCHANGE: 'OKX 返回了错误',
+    EXCHANGE_UNREACHABLE: '无法连接 OKX 或请求超时；超时后请求可能已被处理，也可能没有',
+    NOT_CONNECTED: '未配置 API key、账户配置尚未加载，或账户推送尚未就绪',
+    READ_ONLY_KEY: 'API key 没有交易权限，未向交易所发送任何指令',
+    DAILY_LOSS_ACTIVE: '当日亏损限额仍在生效，紧急停止未解除',
+    NO_PRICE: '暂无该合约的参考价格，或其行情已过期',
+    NO_BOOK: '盘口未同步或已过期，无法估算滑点',
+    NO_DATA: '暂无数据',
+    LEVERAGE_UNAVAILABLE: '无法获取当前杠杆',
+    ORDER_STATUS_UNKNOWN: '订单状态未知',
+    ALGO_NOT_FOUND: '交易所上没有该止损单（可能已触发或已撤销）',
+    NOT_ENOUGH_DATA: '已确认的日K线数量不足',
+  },
+
+  riskReject: {
+    KILL_SWITCH: (_d, message) => `紧急停止已开启，只接受平仓或减仓的订单（${message}）`,
+    PRICE_BAND: (d) => `限价 ${val(d, 'px')} 与标记价格 ${val(d, 'refPrice')} 相差 ${pct(d, 'deviationPct', 2)}，超出价格偏离限制`,
+    MAX_ORDER_NOTIONAL: (d) => `订单名义价值 ${val(d, 'notional')} 超过单笔上限 ${val(d, 'limit')}`,
+    MAX_LEVERAGE: (d) => `杠杆 ${val(d, 'lever')}x 超过上限 ${val(d, 'limit')}x`,
+    MAX_OPEN_ORDERS: (d) => `已有 ${val(d, 'openOrders')} 笔当前委托（上限 ${val(d, 'limit')}）`,
+    MAX_SLIPPAGE: (d) => `预估滑点 ${pct(d, 'estSlippagePct', 3)} 超过上限 ${pct(d, 'limit', 3)}`,
+    EXPOSURE_UNKNOWN: (d) => `${val(d, 'instId')} 的挂单 ${val(d, 'ordId')} 无法估值（合约面值未知）；请撤销它或等它成交`,
+    MAX_POSITION_NOTIONAL: (d) => `预计该合约的敞口 ${val(d, 'projected')} 超过单合约上限 ${val(d, 'limit')}`,
+    MAX_TOTAL_NOTIONAL: (d) => `预计总敞口 ${val(d, 'projected')} 超过上限 ${val(d, 'limit')}`,
+  },
+};

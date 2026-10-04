@@ -18,6 +18,33 @@ export interface PositionRec {
   tradeId: string;
   realizedPnl: Dec;
   fee: Dec;
+  /** Funding received (positive) or paid (negative) while the position was open */
+  fundingFee: Dec;
+}
+
+/** The account as plain JSON: what the paper exchange keeps across restarts. Decimals are strings. */
+export interface AccountSnapshot {
+  cashBal: string;
+  posSeq: number;
+  /** [position key, leverage] */
+  leverage: Array<[string, string]>;
+  positions: Array<{
+    instId: string;
+    mgnMode: OkxMgnMode;
+    posId: string;
+    posSide: OkxPosSide;
+    dir: 1 | -1;
+    qty: string;
+    avgPx: string;
+    lever: string;
+    markPx: string;
+    cTime: number;
+    uTime: number;
+    tradeId: string;
+    realizedPnl: string;
+    fee: string;
+    fundingFee: string;
+  }>;
 }
 
 export interface FillOutcome {
@@ -103,7 +130,7 @@ export class Account {
     let p = this.positions.get(key);
     if (!p) {
       this.posSeq += 1;
-      p = { instId, mgnMode, posId: String(POS_ID_BASE + this.posSeq), posSide, dir, qty: ZERO, avgPx: ZERO, lever: this.leverFor(instId, mgnMode, posSide), markPx, cTime: now, uTime: now, tradeId, realizedPnl: ZERO, fee: ZERO };
+      p = { instId, mgnMode, posId: String(POS_ID_BASE + this.posSeq), posSide, dir, qty: ZERO, avgPx: ZERO, lever: this.leverFor(instId, mgnMode, posSide), markPx, cTime: now, uTime: now, tradeId, realizedPnl: ZERO, fee: ZERO, fundingFee: ZERO };
       this.positions.set(key, p);
     }
     const ctVal = this.ctVal(instId);
@@ -134,6 +161,43 @@ export class Account {
     const wire = this.positionWire(p, now);
     if (p.qty.isZero()) this.positions.delete(key);
     return { pnl, fee, position: wire };
+  }
+
+  /**
+   * A funding settlement: `amount` (negative when paid) goes to the cash balance, and to the funding total of
+   * the position it was charged on when that position is still open.
+   */
+  applyFunding(instId: string, mgnMode: OkxMgnMode, posSide: OkxPosSide, amount: Dec): void {
+    this.cashBal = this.cashBal.add(amount);
+    const p = this.positions.get(posKey(instId, mgnMode, posSide));
+    if (p) p.fundingFee = p.fundingFee.add(amount);
+  }
+
+  snapshot(): AccountSnapshot {
+    return {
+      cashBal: this.cashBal.toFixed(),
+      posSeq: this.posSeq,
+      leverage: [...this.leverage].map(([key, lever]) => [key, lever.toFixed()]),
+      positions: this.all().map((p) => ({
+        instId: p.instId, mgnMode: p.mgnMode, posId: p.posId, posSide: p.posSide, dir: p.dir, qty: p.qty.toFixed(), avgPx: p.avgPx.toFixed(), lever: p.lever.toFixed(),
+        markPx: p.markPx.toFixed(), cTime: p.cTime, uTime: p.uTime, tradeId: p.tradeId, realizedPnl: p.realizedPnl.toFixed(), fee: p.fee.toFixed(), fundingFee: p.fundingFee.toFixed(),
+      })),
+    };
+  }
+
+  /** Replaces the whole account with a snapshot taken earlier. */
+  restore(s: AccountSnapshot): void {
+    this.cashBal = d(s.cashBal);
+    this.posSeq = s.posSeq;
+    this.leverage.clear();
+    for (const [key, lever] of s.leverage) this.leverage.set(key, d(lever));
+    this.positions.clear();
+    for (const p of s.positions) {
+      this.positions.set(posKey(p.instId, p.mgnMode, p.posSide), {
+        instId: p.instId, mgnMode: p.mgnMode, posId: p.posId, posSide: p.posSide, dir: p.dir, qty: d(p.qty), avgPx: d(p.avgPx), lever: d(p.lever),
+        markPx: d(p.markPx), cTime: p.cTime, uTime: p.uTime, tradeId: p.tradeId, realizedPnl: d(p.realizedPnl), fee: d(p.fee), fundingFee: d(p.fundingFee),
+      });
+    }
   }
 
   markToMarket(instId: string, markPx: Dec): void {
@@ -203,10 +267,10 @@ export class Account {
       vegaPA: '',
       spotInUseAmt: '',
       spotInUseCcy: '',
-      realizedPnl: fmt(p.realizedPnl.add(p.fee)),
+      realizedPnl: fmt(p.realizedPnl.add(p.fee).add(p.fundingFee)),
       pnl: fmt(p.realizedPnl),
       fee: fmt(p.fee),
-      fundingFee: '0',
+      fundingFee: fmt(p.fundingFee),
       liqPenalty: '0',
       closeOrderAlgo: [],
       cTime: String(p.cTime),

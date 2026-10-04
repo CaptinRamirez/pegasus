@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { HelloPayload, Instrument, ServerMessage } from '@pegasus/shared';
 import { App } from './App';
+import { LANG_KEY, useLangStore } from './i18n';
 import { TOKEN_KEY } from './lib/http';
 import { useStore } from './store/store';
 import { initialState } from './store/types';
@@ -89,6 +90,8 @@ const hello: HelloPayload = {
     { instId: 'BTC-USDT-SWAP', posSide: 'net', mgnMode: 'cross', pos: '3', avgPx: '60000', markPx: '61000', upl: '30', uplRatio: '0.0166', lever: '5', liqPx: '50000', margin: '360', notionalUsd: '1830', cTime: 1, uTime: 2 },
   ],
   openOrders: [],
+  algoOrders: null,
+  paper: false,
   serverTime: 1,
 };
 
@@ -122,6 +125,7 @@ describe('App', () => {
     vi.unstubAllGlobals();
     localStorage.clear();
     useStore.setState({ ...initialState(null) });
+    useLangStore.setState({ lang: 'en' });
   });
 
   const render = async () => {
@@ -298,10 +302,8 @@ describe('App', () => {
       connection: { ...hello.connection, account: { ...hello.connection.account, readOnly: true } },
       openOrders: [order],
     });
-    const why = 'Read-only API key: trading from Pegasus is disabled / 只读 key：无法从 Pegasus 下单';
-    const notice = container.querySelector('.notice-warn');
-    expect(notice?.textContent).toContain('Read-only API key: trading from Pegasus is disabled');
-    expect(notice?.textContent).toContain('只读 key：无法从 Pegasus 下单');
+    const why = 'Read-only API key: trading from Pegasus is disabled';
+    expect(container.querySelector('.notice-warn')?.textContent).toBe(why);
     const submit = container.querySelector<HTMLButtonElement>('button.btn-buy');
     expect(submit?.disabled).toBe(true);
     expect(submit?.title).toBe(why);
@@ -313,6 +315,13 @@ describe('App', () => {
     });
     expect(button('Cancel')).toMatchObject({ disabled: true, title: why });
     expect(button('Cancel all')).toMatchObject({ disabled: true, title: why });
+
+    // on a Chinese page the same is said in Chinese
+    await act(async () => useLangStore.getState().setLang('zh'));
+    const whyZh = '只读 key：无法从 Pegasus 下单';
+    expect(container.querySelector('.notice-warn')?.textContent).toBe(whyZh);
+    expect(button('撤销')).toMatchObject({ disabled: true, title: whyZh });
+    expect(button('全部撤销')).toMatchObject({ disabled: true, title: whyZh });
   });
 
   it('before the account is loaded: no net-mode ticket is offered, and the account message fixes it without a reload', async () => {
@@ -386,7 +395,7 @@ describe('App', () => {
     });
     const banner = container.querySelector('.banner')?.textContent ?? '';
     expect(banner).toContain('OKX does not recognise the API key (OKX: [50111] Invalid OK-ACCESS-KEY)');
-    expect(banner).toContain('API key 无效');
+    expect(banner).not.toContain('API key 无效');
     expect(container.textContent).toContain('Positions not loaded');
     expect(container.textContent).not.toContain('No open positions');
 
@@ -395,8 +404,66 @@ describe('App', () => {
     });
     expect(container.querySelectorAll('.banner')).toHaveLength(0);
     expect(container.textContent).toContain('No API key configured: only market data is shown');
-    expect(container.textContent).toContain('未配置 API key，仅显示行情');
+    expect(container.textContent).not.toContain('未配置 API key，仅显示行情');
     expect(container.textContent).toContain('No API key configured: positions are not shown');
+  });
+
+  it('switches the whole page between English and Chinese from the header and remembers the choice', async () => {
+    const noAccount = { state: 'error', error: { code: '50111', message: 'Invalid OK-ACCESS-KEY', ts: 1 }, lastSyncAt: null, readOnly: false } as const;
+    const ws = await connect({ ...hello, account: null, balance: null, positions: [], connection: { ...hello.connection, okxPrivate: 'disconnected', account: noAccount } });
+    expect(container.textContent).toContain('Order ticket');
+    expect(localStorage.getItem(LANG_KEY)).toBeNull();
+
+    await act(async () => {
+      button('中文')?.click();
+    });
+    expect(localStorage.getItem(LANG_KEY)).toBe('zh');
+    expect([...container.querySelectorAll('button.tab')].map((b) => b.textContent)).toEqual(['持仓', '当前委托', '止损单', '历史委托', '成交记录', '信号']);
+    const banner = container.querySelector('.banner')?.textContent ?? '';
+    expect(banner).toContain('账户数据未更新：API key 无效（OKX: [50111] Invalid OK-ACCESS-KEY）');
+    expect(banner).not.toContain('Account data is not updating');
+    expect(container.textContent).toContain('持仓未加载');
+    expect(container.textContent).toContain('下单');
+    expect(container.textContent).not.toContain('Order ticket');
+    expect(button('退出登录')).toBeUndefined(); // a link, not a button
+    expect(container.querySelector('header a')?.textContent).toBe('退出登录');
+
+    await act(async () => {
+      ws.push({ type: 'connection', data: { ...hello.connection, okxPrivate: 'disconnected', account: { state: 'disabled', error: null, lastSyncAt: null, readOnly: false } } });
+    });
+    expect(container.textContent).toContain('未配置 API key，仅显示行情');
+
+    await act(async () => {
+      button('EN')?.click();
+    });
+    expect(localStorage.getItem(LANG_KEY)).toBe('en');
+    expect(container.textContent).toContain('No API key configured: only market data is shown');
+    expect(container.textContent).toContain('Order ticket');
+  });
+
+  it('the token gate offers the language switch before signing in', async () => {
+    useStore.setState({ token: null });
+    await render();
+    expect(container.textContent).toContain('Sign in');
+    await act(async () => {
+      button('中文')?.click();
+    });
+    expect(container.querySelector('label[for="token"]')?.textContent).toBe('API 令牌');
+    expect(container.querySelector('button[type="submit"]')?.textContent).toBe('登录');
+  });
+
+  it('asks the kill-switch question in the language of the page', async () => {
+    const confirm = vi.fn<(text?: string) => boolean>(() => false);
+    vi.stubGlobal('confirm', confirm);
+    await connect(hello);
+    await act(async () => useLangStore.getState().setLang('zh'));
+    await act(async () => {
+      button('紧急停止')?.click();
+    });
+    const asked = confirm.mock.calls[0]?.[0] ?? '';
+    expect(asked).toContain('确定开启紧急停止？');
+    expect(asked).toContain('账户上的全部当前委托都会被撤销');
+    expect(asked).not.toContain('Engage the kill switch');
   });
 
   it('the kill-switch dialog says that ALL open orders are cancelled, and the risk panel shows how the cancel sweep went', async () => {
@@ -499,7 +566,7 @@ describe('App', () => {
     const asked = confirm.mock.calls[1]?.[0] ?? '';
     expect(asked).toContain("today's PnL is -1,100.00 USD and the limit is -1,000 USD");
     expect(asked).toContain('restarts at 0 from the current equity (98,900.00 USD)');
-    expect(asked).toContain('当日亏损仍超过限额');
+    expect(asked).not.toContain('当日亏损');
     expect(useStore.getState().risk).toMatchObject({ killSwitch: false, dayStartEquity: '98900' });
     expect(container.textContent).not.toContain('DAILY_LOSS_ACTIVE');
 
@@ -507,7 +574,7 @@ describe('App', () => {
     await act(async () => {
       useStore.setState({ risk: halted });
     });
-    confirm.mockImplementation((text) => !(text ?? '').includes('当日亏损'));
+    confirm.mockImplementation((text) => !(text ?? '').includes('The daily loss limit is still in force'));
     fetchMock.mockClear();
     await act(async () => {
       button('KILL SWITCH ON')?.click();
@@ -539,7 +606,12 @@ describe('App', () => {
     await connect({ ...hello, risk: { ...hello.risk, killSwitch: true, killSwitchReason: 'STATE_FILE_UNREADABLE: the state file C:\\pegasus\\data\\pegasus-state.json could not be parsed (Unexpected end of JSON input); the saved halt and day baseline are unknown' } });
     const notice = [...container.querySelectorAll('.notice-danger')].map((el) => el.textContent ?? '').find((t) => t.startsWith('KILL SWITCH ON')) ?? '';
     expect(notice).toContain('pegasus-state.json could not be parsed');
-    expect(notice).toContain('状态文件无法读取');
+    expect(notice).not.toContain('状态文件无法读取');
+    // the server words the reason in English; the Chinese page adds what it means and what to do
+    await act(async () => useLangStore.getState().setLang('zh'));
+    const noticeZh = [...container.querySelectorAll('.notice-danger')].map((el) => el.textContent ?? '').find((t) => t.startsWith('紧急停止已开启 —')) ?? '';
+    expect(noticeZh).toContain('pegasus-state.json could not be parsed');
+    expect(noticeZh).toContain('状态文件无法读取');
   });
 
   it('with a read-only key the kill-switch dialog does not promise a cancel, and the panel says the sweep was skipped', async () => {

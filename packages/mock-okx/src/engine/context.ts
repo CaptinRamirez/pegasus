@@ -1,9 +1,42 @@
 import type { Dec } from '../num.js';
-import type { OkxBalance, OkxInstrument, OkxOrder, OkxPosMode, OkxPosition, OkxTrade } from '../wire.js';
+import type { OkxBalance, OkxInstrument, OkxOrder, OkxPosMode, OkxPosition, OkxSide, OkxTrade } from '../wire.js';
 import type { Account } from './account.js';
-import type { BooksPush } from './book.js';
-import type { CandlePush, MarketSim } from './market.js';
+import type { BooksPush, WalkFill } from './book.js';
+import type { CandlePush } from './market.js';
 import type { OrderStore } from './orders.js';
+
+/** The side of an order book the matching engine fills orders against. */
+export interface MatchingBook {
+  bestBid(): { px: Dec; sz: Dec } | undefined;
+  bestAsk(): { px: Dec; sz: Dec } | undefined;
+  /** Total size on the side an order of `side` takes from, within the limit price. */
+  available(side: OkxSide, limitPx?: Dec): Dec;
+  /** Whether an order of `side` at `limitPx` would trade against the best opposite quote. */
+  crosses(side: OkxSide, limitPx: Dec): boolean;
+  /** The fills an order of `side` for `sz` gets, never beyond `limitPx`. */
+  walk(side: OkxSide, sz: Dec, limitPx?: Dec): WalkFill[];
+  /** The public `books` update the fills caused, when the book publishes one. */
+  delta(ts: number): BooksPush | null;
+}
+
+/**
+ * What the matching engine needs from the market of one instrument. The simulator's own MarketSim is one;
+ * the paper exchange supplies another that is fed with the real exchange's quotes.
+ */
+export interface Market {
+  readonly inst: OkxInstrument;
+  readonly book: MatchingBook;
+  readonly markPx: Dec;
+  /** Price of the latest print. */
+  readonly lastPx: Dec;
+  recordTrade(px: Dec, sz: Dec, side: OkxSide, now: number): { trade: OkxTrade };
+  liveCandles(): CandlePush[];
+  /**
+   * How a resting order fills once the book has crossed its price. Absent: it walks the book like a taker
+   * (the simulator); the paper exchange fills it at its own limit price.
+   */
+  restingFills?(side: OkxSide, sz: Dec, limitPx: Dec): WalkFill[];
+}
 
 export interface EngineEvents {
   /** Full OkxOrder on every state change (one per fill). */
@@ -26,7 +59,7 @@ export type Listener<K extends EventName> = (payload: EngineEvents[K]) => void;
 export interface EngineContext {
   readonly posMode: OkxPosMode;
   readonly instruments: Map<string, OkxInstrument>;
-  readonly markets: Map<string, MarketSim>;
+  readonly markets: Map<string, Market>;
   readonly account: Account;
   readonly orders: OrderStore;
   readonly takerFee: Dec;

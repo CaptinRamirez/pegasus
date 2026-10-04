@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { OkxApiError, OkxTransportError, OkxWsError, type OkxCancelOrderParams, type OkxOrder, type OkxOrderAck, type OkxPlaceOrderParams } from '@pegasus/okx';
+import { OkxApiError, OkxTransportError, OkxWsError, type OkxCancelOrderParams, type OkxOrder, type OkxOrderAck, type OkxPlaceAlgoParams, type OkxPlaceOrderParams } from '@pegasus/okx';
 import {
   ceilToStep,
   contractsToCoin,
@@ -8,15 +8,22 @@ import {
   floorToStep,
   normalizePrice,
   notionalQuote,
+  positionDirection,
   sizeToContracts,
   SizingError,
+  stopCoverage,
   toPlainString,
+  type AlgoOrder,
+  type AlgoOrderList,
+  type AmendAlgoOrderRequest,
+  type CancelAlgoOrderRequest,
   type CancelOrderRequest,
   type ClosePositionRequest,
   type Instrument,
   type Order,
   type OrderPreview,
   type PlaceOrderRequest,
+  type PlaceStopRequest,
   type Position,
   type PosSide,
   type TdMode,
@@ -507,6 +514,142 @@ export class OrderService {
       }
     }
     return canceled;
+  }
+
+  // ---- stops (algo orders) ----
+
+  /**
+   * Place a stop-loss for an open position that has none, or not for all of it: mark-triggered, executed at
+   * market, for the contracts its stops do not cover yet (or fewer, when `sz` says so). The position comes from
+   * the mirror, the stops from a fresh read of the exchange; the trigger is rounded to the tick towards the price
+   * and must lie on the losing side of the live mark. A stop can only take risk away, so the kill switch does not
+   * refuse it.
+   */
+  async placeStop(req: PlaceStopRequest): Promise<{ algoId: string; instId: string; slTriggerPx: string; sz: string }> {
+    const longShort = this.account.requireRestTrading().posMode === 'long_short_mode';
+    if (longShort && req.posSide !== 'long' && req.posSide !== 'short') throw new AppError('VALIDATION', 'posSide (long|short) is required to place a stop in long/short mode');
+    const posSide: PosSide = longShort ? (req.posSide ?? 'net') : 'net';
+    const position = this.account.positionList().find((p) => p.instId === req.instId && p.mgnMode === req.mgnMode && p.posSide === posSide);
+    const direction = position ? positionDirection(position) : null;
+    if (!position || direction === null) throw new AppError('VALIDATION', `no open ${req.mgnMode} position in ${req.instId}${longShort ? ` on the ${posSide} side` : ''} to place a stop for`);
+    const coverage = stopCoverage(position, (await this.account.refreshAlgoOrders()).orders);
+    const uncovered = D(coverage.size).minus(coverage.covered);
+    if (uncovered.lte(0)) throw new AppError('VALIDATION', `the position is already covered by its stops (${coverage.covered} of ${coverage.size} contracts): move or cancel one in the Stops tab`, 400, { covered: coverage.covered, size: coverage.size });
+    const sz = req.sz === undefined ? uncovered : D(req.sz);
+    if (sz.gt(uncovered)) throw new AppError('VALIDATION', `a stop for ${sz.toFixed()} contracts is more than the ${uncovered.toFixed()} the position's stops leave uncovered`, 400, { covered: coverage.covered, size: coverage.size });
+
+    const closesLong = direction === 'long';
+    const inst = this.market.specOf(req.instId);
+    const trigger = inst ? (closesLong ? ceilToStep(req.slTriggerPx, inst.tickSz) : floorToStep(req.slTriggerPx, inst.tickSz)) : D(req.slTriggerPx);
+    const slTriggerPx = inst ? toPlainString(trigger, inst.tickSz) : trigger.toFixed();
+    if (trigger.lte(0)) throw new AppError('VALIDATION', 'the stop-loss trigger rounds to zero at this tick size', 400, { slTriggerPx });
+    const markPx = this.market.liveMarkPrice(req.instId);
+    if (markPx === undefined) throw new AppError('NO_PRICE', `no live mark price for ${req.instId}: a mark-triggered stop-loss cannot be checked against it; retry shortly`, 503);
+    if (closesLong ? !trigger.lt(markPx) : !trigger.gt(markPx)) {
+      throw new AppError('VALIDATION', `the stop-loss trigger ${slTriggerPx} must be ${closesLong ? 'below' : 'above'} the mark price ${markPx} for a ${direction} position: it would fire at once`, 400, { slTriggerPx, markPx });
+    }
+
+    const params: OkxPlaceAlgoParams = {
+      instId: req.instId,
+      tdMode: req.mgnMode,
+      side: closesLong ? 'sell' : 'buy',
+      ordType: 'conditional',
+      sz: sz.toFixed(),
+      slTriggerPx,
+      slOrdPx: '-1',
+      slTriggerPxType: 'mark',
+      algoClOrdId: attachAlgoClOrdIdFor(generateClOrdId()),
+    };
+    if (longShort) params.posSide = posSide;
+    else {
+      // The stop may only reduce, and goes with its position when that is fully closed.
+      params.reduceOnly = true;
+      params.cxlOnClosePos = true;
+    }
+    let algoId: string;
+    try {
+      algoId = (await this.clients.rest.placeAlgoOrder(params)).algoId;
+    } catch (err) {
+      this.log.warn({ params, err: (err as Error).message }, 'stop placement failed');
+      throw exchangeError(err);
+    }
+    this.log.info({ algoId, instId: req.instId, side: params.side, sz: params.sz, slTriggerPx }, 'stop placed');
+    void this.store.addRiskEvent('STOP_PLACED', { algoId, instId: req.instId, sz: params.sz, slTriggerPx });
+    await this.showAlgoChange();
+    return { algoId, instId: req.instId, slTriggerPx, sz: params.sz };
+  }
+
+  /**
+   * Move the stop-loss of an algo order to a new trigger price. The order is looked up in a fresh read of the
+   * exchange, the trigger is rounded to the tick towards the price (the smaller loss) and, for a mark-triggered
+   * stop, must lie on the losing side of the live mark: one on the wrong side of it would fire at once. Only the
+   * trigger price is sent; size, trigger price type and execution stay as they are.
+   */
+  async amendStop(req: AmendAlgoOrderRequest): Promise<{ algoId: string; instId: string; slTriggerPx: string; previous: string }> {
+    this.account.requireRestTrading();
+    const stop = (await this.account.refreshAlgoOrders()).orders.find((a) => a.algoId === req.algoId && a.instId === req.instId);
+    if (!stop) throw new AppError('ALGO_NOT_FOUND', `no resting algo order ${req.algoId} for ${req.instId}: it may have triggered or been cancelled`, 404, { algoId: req.algoId });
+    if (stop.slTriggerPx === '') throw new AppError('VALIDATION', `algo order ${req.algoId} has no stop-loss to move`);
+    // The contract spec of any SWAP will do for the tick; without one the price goes out as given and the exchange decides.
+    const inst = this.market.specOf(req.instId);
+    const closesLong = stop.side === 'sell';
+    const trigger = inst ? (closesLong ? ceilToStep(req.slTriggerPx, inst.tickSz) : floorToStep(req.slTriggerPx, inst.tickSz)) : D(req.slTriggerPx);
+    const slTriggerPx = inst ? toPlainString(trigger, inst.tickSz) : trigger.toFixed();
+    if (trigger.lte(0)) throw new AppError('VALIDATION', 'the stop-loss trigger rounds to zero at this tick size', 400, { slTriggerPx });
+    if (trigger.eq(stop.slTriggerPx)) throw new AppError('VALIDATION', `the stop is already at ${slTriggerPx}`, 400, { slTriggerPx });
+    this.checkStopSide(stop, trigger, slTriggerPx);
+    try {
+      await this.clients.rest.amendAlgoOrder({ instId: req.instId, algoId: req.algoId, newSlTriggerPx: slTriggerPx });
+    } catch (err) {
+      this.log.warn({ algoId: req.algoId, instId: req.instId, slTriggerPx, err: (err as Error).message }, 'stop amend failed');
+      throw exchangeError(err);
+    }
+    this.log.info({ algoId: req.algoId, instId: req.instId, from: stop.slTriggerPx, to: slTriggerPx }, 'stop moved');
+    void this.store.addRiskEvent('STOP_AMENDED', { algoId: req.algoId, instId: req.instId, from: stop.slTriggerPx, to: slTriggerPx });
+    await this.showAlgoChange();
+    return { algoId: req.algoId, instId: req.instId, slTriggerPx, previous: stop.slTriggerPx };
+  }
+
+  /** A mark-triggered stop must stay on the losing side of the live mark; for the other trigger price types the exchange decides. */
+  private checkStopSide(stop: AlgoOrder, trigger: Decimal, slTriggerPx: string): void {
+    if (stop.slTriggerPxType !== 'mark') return;
+    const markPx = this.market.liveMarkPrice(stop.instId);
+    if (markPx === undefined) {
+      throw new AppError('NO_PRICE', `no live mark price for ${stop.instId}: a mark-triggered stop-loss cannot be checked against it; retry shortly or move the stop on OKX`, 503);
+    }
+    const closesLong = stop.side === 'sell';
+    if (closesLong ? !trigger.lt(markPx) : !trigger.gt(markPx)) {
+      throw new AppError('VALIDATION', `the stop-loss trigger ${slTriggerPx} must be ${closesLong ? 'below' : 'above'} the mark price ${markPx} for a stop that closes a ${closesLong ? 'long' : 'short'}: it would fire at once`, 400, { slTriggerPx, markPx });
+    }
+  }
+
+  /**
+   * Cancel an algo order. Like the cancel of an order it needs neither the instrument to be tracked nor the
+   * order to be in the mirror: whatever rests at the exchange under that id is cancelled.
+   */
+  async cancelStop(req: CancelAlgoOrderRequest): Promise<{ algoId: string; instId: string }> {
+    this.account.requireRestTrading();
+    try {
+      await this.clients.rest.cancelAlgoOrder({ instId: req.instId, algoId: req.algoId });
+    } catch (err) {
+      this.log.warn({ algoId: req.algoId, instId: req.instId, err: (err as Error).message }, 'stop cancel failed');
+      throw exchangeError(err);
+    }
+    this.log.info({ algoId: req.algoId, instId: req.instId }, 'stop cancelled');
+    void this.store.addRiskEvent('STOP_CANCELED', { algoId: req.algoId, instId: req.instId });
+    await this.showAlgoChange();
+    return { algoId: req.algoId, instId: req.instId };
+  }
+
+  /** The exchange accepted a change of an algo order: read the list now for the terminals, and again shortly in case it was not applied yet. */
+  private async showAlgoChange(): Promise<AlgoOrderList | null> {
+    this.account.expectAlgoChange();
+    try {
+      return await this.account.refreshAlgoOrders();
+    } catch (err) {
+      this.log.warn({ err: (err as Error).message }, 'algo order read after a change failed');
+      return null;
+    }
   }
 
   async closePosition(req: ClosePositionRequest): Promise<{ instId: string; posSide: PosSide }> {

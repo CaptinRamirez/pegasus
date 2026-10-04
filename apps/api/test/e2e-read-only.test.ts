@@ -110,6 +110,9 @@ describe('api e2e with a read-only key', () => {
         ['/api/orders/cancel-all', {}],
         ['/api/positions/close', { instId: 'BTC-USDT-SWAP', mgnMode: 'cross', posSide: 'long' }],
         ['/api/account/leverage', { instId: 'BTC-USDT-SWAP', lever: '3', mgnMode: 'cross' }],
+        ['/api/algo-orders', { instId: 'BTC-USDT-SWAP', mgnMode: 'cross', posSide: 'long', slTriggerPx: '48000' }],
+        ['/api/algo-orders/amend', { instId: 'BTC-USDT-SWAP', algoId: '123', slTriggerPx: '48000' }],
+        ['/api/algo-orders/cancel', { instId: 'BTC-USDT-SWAP', algoId: '123' }],
       ];
       for (const [path, body] of writes) {
         const res = await api<unknown>('POST', path, body);

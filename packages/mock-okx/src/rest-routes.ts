@@ -4,7 +4,7 @@ import { BAR_MS, barStart, isBar } from './engine/candles.js';
 import type { Engine } from './engine/engine.js';
 import { d, isDecimalString } from './num.js';
 import type { MockCredentials } from './types.js';
-import type { OkxOrderAck, OkxResponse } from './wire.js';
+import type { OkxResponse } from './wire.js';
 
 export interface RestRequest {
   method: string;
@@ -49,7 +49,7 @@ function cursor(q: URLSearchParams, key: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-function acksResponse(acks: OkxOrderAck[], single: boolean): OkxResponse<OkxOrderAck> & { inTime: string; outTime: string } {
+function acksResponse<T extends { sCode: string }>(acks: T[], single: boolean): OkxResponse<T> & { inTime: string; outTime: string } {
   const failed = acks.filter((a) => a.sCode !== '0').length;
   let code = '0';
   let msg = '';
@@ -283,9 +283,9 @@ export class RestRouter {
   private registerTrade(): void {
     const e = this.engine;
     const m = e.matcher;
-    const batch = (body: unknown, fn: (item: unknown) => OkxOrderAck): OkxResponse<unknown> => {
+    const batch = <T extends { sCode: string }>(body: unknown, fn: (item: unknown) => T, max = 20): OkxResponse<unknown> => {
       if (!Array.isArray(body)) return err('51000', 'Parameter error: array body expected');
-      if (body.length === 0 || body.length > 20) return err('51000', 'Parameter error: 1-20 items expected');
+      if (body.length === 0 || body.length > max) return err('51000', `Parameter error: 1-${max} items expected`);
       return acksResponse(body.map((item: unknown) => fn(item)), false);
     };
     this.post('/api/v5/trade/order', (_q, body) => acksResponse([m.place(body)], true));
@@ -295,6 +295,24 @@ export class RestRouter {
     this.post('/api/v5/trade/amend-order', (_q, body) => acksResponse([m.amendRequest(body)], true));
     this.post('/api/v5/trade/amend-batch-orders', (_q, body) => batch(body, (item) => m.amendRequest(item)));
     this.post('/api/v5/trade/close-position', (_q, body) => m.closePosition(body));
+    // Algo orders: only the stop-losses generated from attachAlgoOrds exist here, all of type `conditional`.
+    this.get('/api/v5/trade/orders-algo-pending', true, (q) => {
+      const ordType = q.get('ordType');
+      if (!ordType) return err('50014', 'Parameter ordType cannot be empty.');
+      const instType = q.get('instType');
+      if (!ordType.split(',').includes('conditional') || (instType && instType !== 'SWAP')) return ok([]);
+      const algoId = q.get('algoId');
+      // `after`: only the algo orders older than that algoId.
+      const afterRaw = q.get('after') ?? '';
+      const after = /^\d+$/.test(afterRaw) ? BigInt(afterRaw) : null;
+      const rows = e
+        .algoOrdersPending(q.get('instId') ?? undefined)
+        .filter((a) => (!algoId || a.algoId === algoId) && (after === null || BigInt(a.algoId) < after));
+      return ok(rows.slice(0, limitOf(q, 100, 100)));
+    });
+    this.post('/api/v5/trade/order-algo', (_q, body) => acksResponse([m.placeAlgoRequest(body)], true));
+    this.post('/api/v5/trade/cancel-algos', (_q, body) => batch(body, (item) => m.cancelAlgoRequest(item), 10));
+    this.post('/api/v5/trade/amend-algos', (_q, body) => acksResponse([m.amendAlgoRequest(body)], true));
     this.get('/api/v5/trade/order', true, (q) => {
       const instId = q.get('instId');
       if (!instId) return err('50014', 'Parameter instId cannot be empty.');

@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { OkxApiError, OkxTransportError, OkxWsError, type OkxAccountConfig, type OkxBalance, type OkxLeverageInfo, type OkxOrder, type OkxPosition } from '@pegasus/okx';
-import type { AccountConfig, Balance, Order } from '@pegasus/shared';
+import { OkxApiError, OkxTransportError, OkxWsError, type OkxAccountConfig, type OkxAlgoOrder, type OkxBalance, type OkxLeverageInfo, type OkxOrder, type OkxPosition } from '@pegasus/okx';
+import type { AccountConfig, AlgoOrderList, Balance, Order } from '@pegasus/shared';
 import { pino } from 'pino';
 import { MemoryStore } from '../src/db/store.js';
 import type { OkxClients } from '../src/okx/clients.js';
@@ -38,6 +38,7 @@ function setup(opts: { credentials?: boolean } = {}) {
     getBalance: () => guarded(() => ({ totalEq: '1000', uTime: String(Date.now()), details: [] }) as unknown as OkxBalance),
     getPositions: () => guarded(() => []),
     getOrdersPending: () => guarded(() => []),
+    getAlgoOrdersPending: () => guarded(() => []),
   };
   const ws = new FakePrivateSocket();
   const clients = { rest, wsPrivate: opts.credentials === false ? null : ws, clock: { offsetMs: 0 }, demo: false } as unknown as OkxClients;
@@ -282,6 +283,7 @@ describe('AccountService mirror', () => {
       getBalance: async () => ({ totalEq: exchange.totalEq, uTime: String(Date.now()), details: [] }),
       getPositions: () => exchange.positions(),
       getOrdersPending: async () => exchange.pending,
+      getAlgoOrdersPending: async () => [],
       getOrder: async () => {
         exchange.lookups++;
         return exchange.lookup();
@@ -410,5 +412,157 @@ describe('AccountService mirror', () => {
     expect(await account.leverageFor(BTC, 'cross', 'short', true)).toBe('20');
     expect(await account.leverageFor(BTC, 'cross', 'short')).toBe('20');
     expect(exchange.leverageCalls).toBe(3);
+  });
+});
+
+describe('AccountService algo orders (stops)', () => {
+  const NOW = 1_700_000_000_000;
+  const BTC = 'BTC-USDT-SWAP';
+
+  beforeEach(() => {
+    vi.useFakeTimers({ now: NOW });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const rawStop = (algoId: string, slTriggerPx = '59000'): OkxAlgoOrder => ({
+    instType: 'SWAP', instId: BTC, algoId, algoClOrdId: '', ordType: 'conditional', side: 'sell', posSide: 'long', tdMode: 'cross', sz: '1', closeFraction: '', state: 'live', reduceOnly: 'true',
+    tpTriggerPx: '', tpTriggerPxType: '', tpOrdPx: '', slTriggerPx, slTriggerPxType: 'mark', slOrdPx: '-1', cTime: String(NOW + Number(algoId)), uTime: String(NOW + Number(algoId)),
+  });
+  const orderPush = (state: string) => ({
+    arg: { channel: 'orders', instType: 'SWAP' },
+    data: [{ ordId: '1', clOrdId: 'c1', instId: BTC, side: 'buy', posSide: 'long', tdMode: 'cross', ordType: 'limit', px: '49000', sz: '1', accFillSz: state === 'filled' ? '1' : '0', avgPx: '', state, lever: '5', fee: '0', feeCcy: '', pnl: '0', cTime: String(NOW), uTime: String(NOW) }],
+  });
+  const positionPush = (pos: string) => ({
+    arg: { channel: 'positions', instType: 'SWAP' },
+    data: [{ instId: BTC, posSide: 'long', mgnMode: 'cross', pos, avgPx: '50000', markPx: '50000', upl: '0', uplRatio: '0', lever: '5', liqPx: '', margin: '', notionalUsd: '500', cTime: String(NOW), uTime: String(Date.now()) }],
+  });
+
+  function stops() {
+    const exchange = { algo: [] as OkxAlgoOrder[], fail: null as Error | null, calls: [] as Array<Record<string, unknown>> };
+    const rest = {
+      getAccountConfig: async () => ({ uid: '1', acctLv: '2', posMode: 'long_short_mode', autoLoan: false, level: 'Lv1', perm: 'read_only,trade' }),
+      getBalance: async () => ({ totalEq: '1000', uTime: String(Date.now()), details: [] }),
+      getPositions: async () => [],
+      getOrdersPending: async () => [],
+      getAlgoOrdersPending: async (params: Record<string, unknown>) => {
+        exchange.calls.push(params);
+        if (exchange.fail) throw exchange.fail;
+        const after = params['after'] as string | undefined;
+        const rows = [...exchange.algo].sort((a, b) => Number(b.algoId) - Number(a.algoId)).filter((a) => after === undefined || Number(a.algoId) < Number(after));
+        return rows.slice(0, params['limit'] as number);
+      },
+    };
+    const ws = new FakePrivateSocket();
+    const clients = { rest, wsPrivate: ws, clock: { offsetMs: 0 }, demo: false } as unknown as OkxClients;
+    const account = new AccountService(clients, new MemoryStore(), log);
+    const heard: AlgoOrderList[] = [];
+    account.on('algoOrders', (l) => heard.push(l));
+    return { account, exchange, ws, heard };
+  }
+
+  it('reads the TP/SL algo orders of the swaps with every reconcile and tells the terminals each time, changed or not', async () => {
+    const { account, exchange, heard } = stops();
+    expect(account.algoOrders).toBeNull();
+    exchange.algo = [rawStop('1'), rawStop('2', '58000')];
+    await account.start();
+    expect(exchange.calls).toEqual([{ ordType: 'conditional,oco', instType: 'SWAP', limit: 100 }]);
+    expect(account.algoOrders).toMatchObject({ ts: NOW, orders: [{ algoId: '2', slTriggerPx: '58000' }, { algoId: '1', slTriggerPx: '59000' }] });
+    expect(heard).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(heard).toHaveLength(2);
+    expect(heard[1]?.ts).toBe(NOW + 60_000);
+    await account.stop();
+  });
+
+  it('a failed read of the stops fails neither the start nor the reconcile, and keeps the last list with its time', async () => {
+    const { account, exchange, heard } = stops();
+    exchange.fail = new OkxApiError('50011', 'Too Many Requests', '/api/v5/trade/orders-algo-pending');
+    await account.start();
+    expect(account.status()).toMatchObject({ state: 'ok', error: null });
+    expect(account.algoOrders).toBeNull();
+    await expect(account.refreshAlgoOrders()).rejects.toMatchObject({ code: '50011' });
+
+    exchange.fail = null;
+    exchange.algo = [rawStop('1')];
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(account.algoOrders).toMatchObject({ ts: NOW + 60_000, orders: [{ algoId: '1' }] });
+    exchange.fail = new OkxTransportError('/api/v5/trade/orders-algo-pending', 'could not reach OKX (ECONNRESET)', false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(account.status()).toMatchObject({ state: 'ok', error: null, lastSyncAt: NOW + 120_000 });
+    expect(account.algoOrders).toMatchObject({ ts: NOW + 60_000, orders: [{ algoId: '1' }] });
+    expect(heard).toHaveLength(1);
+    await account.stop();
+  });
+
+  it('pages through more stops than one call returns', async () => {
+    const { account, exchange } = stops();
+    exchange.algo = Array.from({ length: 150 }, (_, i) => rawStop(String(i + 1)));
+    await account.start();
+    expect(account.algoOrders?.orders).toHaveLength(150);
+    expect(exchange.calls).toEqual([
+      { ordType: 'conditional,oco', instType: 'SWAP', limit: 100 },
+      { ordType: 'conditional,oco', instType: 'SWAP', limit: 100, after: '51' },
+    ]);
+    await account.stop();
+  });
+
+  it('reads the stops again one and five seconds after an order ended: its attached stop exists only then', async () => {
+    const { account, exchange, ws, heard } = stops();
+    await account.start();
+    ws.emit('data', orderPush('live'));
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(heard).toHaveLength(1); // a resting order changes nothing
+
+    exchange.algo = [rawStop('1')];
+    ws.emit('data', orderPush('filled'));
+    ws.emit('data', orderPush('filled')); // a repeated push does not stack more reads
+    await vi.advanceTimersByTimeAsync(999);
+    expect(heard).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(heard).toHaveLength(2);
+    expect(account.algoOrders?.orders.map((a) => a.algoId)).toEqual(['1']);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(heard).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(heard).toHaveLength(3);
+    await account.stop();
+  });
+
+  it('reads the stops again when a position changes size, not on a push that only reprices it', async () => {
+    const { account, ws, heard } = stops();
+    await account.start();
+    ws.emit('data', positionPush('1')); // opened
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(heard).toHaveLength(3);
+    ws.emit('data', positionPush('1')); // the periodic push of an unchanged position
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(heard).toHaveLength(3);
+    ws.emit('data', positionPush('0')); // closed: its stop may be left behind
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(heard).toHaveLength(5);
+    await account.stop();
+  });
+
+  it('a read asked for while one is in flight waits for it and then reads again: it must not return a list from before a write', async () => {
+    const { account, exchange } = stops();
+    await account.start();
+    const before = exchange.calls.length;
+    const [a, b] = await Promise.all([account.refreshAlgoOrders(), account.refreshAlgoOrders()]);
+    expect(exchange.calls.length).toBe(before + 2);
+    expect(a.orders).toEqual([]);
+    expect(b.orders).toEqual([]);
+    await account.stop();
+  });
+
+  it('pending reads are dropped when the service stops', async () => {
+    const { account, ws, heard } = stops();
+    await account.start();
+    ws.emit('data', orderPush('canceled'));
+    await account.stop();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(heard).toHaveLength(1);
   });
 });

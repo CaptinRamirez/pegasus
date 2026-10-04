@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { D, ZERO, type BookLevel, type Decimal, type Instrument } from '@pegasus/shared';
 import { Panel } from './Panel';
+import { useT } from '../i18n';
 import { fmtCoin, fmtPct, fmtPx } from '../lib/format';
 import { isStreamStale } from '../store/alerts';
 import { getSelectedInstrument, getSelectedMarket, useStore } from '../store/store';
@@ -28,8 +29,9 @@ function widthPct(cum: Decimal, max: Decimal): number {
 }
 
 function BookRow({ row, side, max, inst, onPick }: { row: Row; side: 'bid' | 'ask'; max: Decimal; inst: Instrument | null; onPick: (px: string) => void }) {
+  const t = useT();
   return (
-    <div className={`book-row num ${side}`} onClick={() => onPick(row.px)} title="Use this price in the ticket">
+    <div className={`book-row num ${side}`} onClick={() => onPick(row.px)} title={t.book.pickTitle}>
       <span className="depth" style={{ width: `${widthPct(row.cum, max)}%` }} />
       <span className="px">{fmtPx(row.px, inst)}</span>
       <span>{fmtCoin(row.sz, inst, row.px)}</span>
@@ -39,6 +41,7 @@ function BookRow({ row, side, max, inst, onPick }: { row: Row; side: 'bid' | 'as
 }
 
 export function OrderBook() {
+  const t = useT();
   const inst = useStore(getSelectedInstrument);
   const book = useStore((s) => getSelectedMarket(s).book);
   const stale = useStore((s) => isStreamStale(s, s.selectedInstId, 'book')) && book !== null;
@@ -63,15 +66,15 @@ export function OrderBook() {
   }, [book]);
 
   return (
-    <Panel title="Order book" className={`panel-book${stale ? ' panel-stale' : ''}`} extra={stale ? <span className="stale-tag" title="The order book stopped updating; these levels are not current">STALE</span> : null}>
+    <Panel title={t.book.title} className={`panel-book${stale ? ' panel-stale' : ''}`} extra={stale ? <span className="stale-tag" title={t.book.staleTitle}>{t.common.stale}</span> : null}>
       {book === null ? (
-        <div className="empty">No book data</div>
+        <div className="empty">{t.book.empty}</div>
       ) : (
       <div className="book">
         <div className="book-head">
-          <span>Price</span>
-          <span>Size ({inst?.baseCcy ?? 'coin'})</span>
-          <span>Total</span>
+          <span>{t.common.price}</span>
+          <span>{t.book.sizeIn(inst?.baseCcy ?? t.common.coin)}</span>
+          <span>{t.book.total}</span>
         </div>
         <div className="book-side asks">
           {[...asks].reverse().map((r) => (
@@ -79,7 +82,7 @@ export function OrderBook() {
           ))}
         </div>
         <div className="spread num">
-          <span>Spread</span>
+          <span>{t.book.spread}</span>
           <span>{fmtPx(spread, inst)}</span>
           <span>{fmtPct(spreadPct, 3)}</span>
         </div>

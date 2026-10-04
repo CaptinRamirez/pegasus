@@ -84,3 +84,38 @@ describe('loadConfig WEB_ORIGINS', () => {
     expect(loadConfig({ WEB_ORIGINS: '' }).server.webOrigins).toEqual([]);
   });
 });
+
+describe('loadConfig paper trading', () => {
+  it('is off without PAPER_EXCHANGE_URL', () => {
+    const config = loadConfig({});
+    expect(config.okx.paper).toBe(false);
+    expect(config.okx.endpoints.restPrivate).toBeUndefined();
+  });
+
+  it('needs no OKX key, takes the live market data whatever OKX_DEMO says, and sends the private side to the paper exchange', () => {
+    const config = loadConfig({ PAPER_EXCHANGE_URL: 'http://127.0.0.1:9200/', OKX_DEMO: '1' });
+    expect(config.okx).toMatchObject({
+      paper: true,
+      demo: false,
+      credentials: { apiKey: 'paper', apiSecret: 'paper', passphrase: 'paper' },
+      endpoints: { rest: 'https://www.okx.com', wsPublic: 'wss://ws.okx.com/ws/v5/public', wsBusiness: 'wss://ws.okx.com/ws/v5/business', restPrivate: 'http://127.0.0.1:9200', wsPrivate: 'ws://127.0.0.1:9200/ws/v5/private' },
+    });
+  });
+
+  it('never uses a key that is configured, complete or not', () => {
+    expect(loadConfig({ PAPER_EXCHANGE_URL: 'http://127.0.0.1:9200', OKX_API_KEY: 'live-key', OKX_API_SECRET: 'live-secret', OKX_API_PASSPHRASE: 'live-pass' }).okx.credentials).toEqual({ apiKey: 'paper', apiSecret: 'paper', passphrase: 'paper' });
+    expect(loadConfig({ PAPER_EXCHANGE_URL: 'http://127.0.0.1:9200', OKX_API_KEY: 'only-this' }).okx.credentials?.apiKey).toBe('paper');
+  });
+
+  it('keeps market data endpoints that are overridden (a regional OKX host) and refuses a value that is not a URL', () => {
+    const config = loadConfig({
+      PAPER_EXCHANGE_URL: 'http://localhost:9300',
+      OKX_REST_URL: 'https://eea.okx.com',
+      OKX_WS_PUBLIC_URL: 'wss://wseea.okx.com/ws/v5/public',
+      OKX_WS_PRIVATE_URL: 'wss://wseea.okx.com/ws/v5/private',
+      OKX_WS_BUSINESS_URL: 'wss://wseea.okx.com/ws/v5/business',
+    });
+    expect(config.okx.endpoints).toEqual({ rest: 'https://eea.okx.com', wsPublic: 'wss://wseea.okx.com/ws/v5/public', wsBusiness: 'wss://wseea.okx.com/ws/v5/business', restPrivate: 'http://localhost:9300', wsPrivate: 'ws://localhost:9300/ws/v5/private' });
+    expect(() => loadConfig({ PAPER_EXCHANGE_URL: 'paper' })).toThrow(/PAPER_EXCHANGE_URL: must be a URL/);
+  });
+});

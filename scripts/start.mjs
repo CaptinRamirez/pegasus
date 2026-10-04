@@ -1,14 +1,16 @@
 // One-command launcher behind `pnpm start` and start.bat: builds the web terminal, then starts the mock exchange
-// (with --mock, or when .env points the API at it), the API and the built terminal in order and opens the browser.
+// (with --mock, or when .env points the API at it) or the paper exchange (with --paper, or PAPER_TRADING=1 in
+// .env), the API and the built terminal in order and opens the browser.
 // The page is built once and served as it was built, so a `git pull` while the stack runs changes neither half.
-// Flags: --mock (local mock exchange instead of OKX), --dev (Vite dev server with hot reload), --no-open.
+// Flags: --paper (paper trading: OKX's live prices, a simulated account), --mock (local mock exchange instead of
+// OKX), --dev (Vite dev server with hot reload), --no-open.
 import { exec, execFileSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
-import { mockEnv, parseFlags } from './launch-options.mjs';
+import { mockEnv, paperEnv, parseFlags } from './launch-options.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const envFile = join(root, '.env');
@@ -144,22 +146,28 @@ function openBrowser(url) {
 
 async function main() {
   const flags = parseFlags(process.argv.slice(2));
-  for (const dir of ['apps/api', 'apps/web', 'packages/mock-okx']) {
+  for (const dir of ['apps/api', 'apps/web', 'packages/mock-okx', 'packages/paper']) {
     if (!existsSync(join(root, dir, 'node_modules'))) throw new Error('依赖还没有安装，请先在项目目录运行：pnpm install');
   }
   if (!existsSync(envFile)) say('没有找到 .env，后端将使用默认配置（可以把 .env.example 复制为 .env 再修改）');
 
-  // --mock only changes what the children see; .env is read here, never written.
-  const overrides = flags.mock ? mockEnv(Number(process.env.MOCK_OKX_PORT ?? 9100)) : {};
   // Same precedence as node --env-file: a variable already set in the environment wins over the file.
-  const env = { ...(existsSync(envFile) ? parseEnv(readFileSync(envFile, 'utf8')) : {}), ...process.env, ...overrides };
+  const base = { ...(existsSync(envFile) ? parseEnv(readFileSync(envFile, 'utf8')) : {}), ...process.env };
+  // Paper trading is chosen on the command line or, for double-clicking start.bat, by PAPER_TRADING=1 in .env.
+  const paper = flags.paper || (!flags.mock && base.PAPER_TRADING === '1');
+  const paperPort = paper ? Number(base.PAPER_PORT ?? 9200) : null;
+  // --mock and --paper only change what the children see; .env is read here, never written.
+  const overrides = flags.mock ? mockEnv(Number(process.env.MOCK_OKX_PORT ?? 9100)) : paper ? paperEnv(paperPort) : {};
+  const env = { ...base, ...overrides };
   const apiPort = Number(env.API_PORT ?? 8787);
   const mockPort = localPort(env.OKX_REST_URL);
+  if (paper && mockPort !== null) throw new Error('纸面交易需要 OKX 的真实行情，但 .env 里的 OKX_REST_URL 指向了本机的模拟交易所；请删掉 .env 里的四个 OKX_*_URL 再启动');
   const version = gitVersion();
-  say(`版本：${version ?? '未知（不是 git 仓库或没有安装 git）'}${flags.mock ? '，模拟交易所模式（--mock）' : ''}${flags.dev ? '，开发模式（--dev）' : ''}`);
+  say(`版本：${version ?? '未知（不是 git 仓库或没有安装 git）'}${flags.mock ? '，模拟交易所模式（--mock）' : ''}${paper ? '，纸面交易模式（OKX 实盘行情，虚拟账户，不会向 OKX 下单）' : ''}${flags.dev ? '，开发模式（--dev）' : ''}`);
 
   const busy = [];
   if (mockPort !== null && (await portOpen(mockPort))) busy.push(mockPort);
+  if (paperPort !== null && (await portOpen(paperPort))) busy.push(paperPort);
   if (await portOpen(apiPort)) busy.push(apiPort);
   if (busy.length > 0) throw new Error(`端口 ${busy.join('、')} 已被占用，Pegasus 可能已经在运行；请先关掉之前的窗口再启动`);
 
@@ -175,6 +183,14 @@ async function main() {
     say(`正在启动模拟交易所（端口 ${mockPort}）`);
     start('模拟交易所', 'packages/mock-okx', ['--import', 'tsx', 'src/cli.ts'], { env: { MOCK_OKX_PORT: String(mockPort) } });
     await waitFor('模拟交易所', () => portOpen(mockPort), 30_000);
+    if (stopping) return;
+  }
+
+  if (paperPort !== null) {
+    say(`正在启动纸面交易所（端口 ${paperPort}）；它先补算上次关闭以来的行情，隔得久会多等一会儿`);
+    // The same .env as the API: INSTRUMENTS and the PAPER_* settings come from it.
+    start('纸面交易所', 'packages/paper', ['--env-file-if-exists=../../.env', '--import', 'tsx', 'src/cli.ts'], { env: { PAPER_PORT: String(paperPort) } });
+    await waitFor('纸面交易所', () => portOpen(paperPort), 300_000);
     if (stopping) return;
   }
 

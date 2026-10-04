@@ -9,6 +9,7 @@ import {
   type SizeUnit,
   type TdMode,
 } from '@pegasus/shared';
+import type { Messages } from '../../i18n';
 
 export interface TicketForm {
   side: Side;
@@ -48,14 +49,14 @@ export function needsPrice(ordType: OrdType): boolean {
   return ordType !== 'market';
 }
 
-export function unitLabel(unit: SizeUnit, inst: Instrument | null): string {
+export function unitLabel(unit: SizeUnit, inst: Instrument | null, t: Messages): string {
   switch (unit) {
     case 'coin':
-      return inst?.baseCcy ?? 'coin';
+      return inst?.baseCcy ?? t.common.coin;
     case 'contracts':
-      return 'contracts';
+      return t.common.contracts;
     case 'quote':
-      return inst?.quoteCcy ?? 'quote';
+      return inst?.quoteCcy ?? t.common.quote;
   }
 }
 
@@ -67,7 +68,10 @@ export function derivePosSide(side: Side, closing: boolean): 'long' | 'short' {
   return (side === 'buy') !== closing ? 'long' : 'short';
 }
 
-/** What an order does to which position, in words; null in net mode, where the side alone says it. */
+/**
+ * What an order does to which position; null in net mode, where the side alone says it. The English words
+ * are the value the code compares: the page shows them through the dictionary (enums.intent).
+ */
 export function intentOf(side: Side, posSide: PosSide | undefined): Intent | null {
   if (posSide !== 'long' && posSide !== 'short') return null;
   const opening = derivePosSide(side, false) === posSide;
@@ -104,9 +108,6 @@ export function newClOrdId(now = Date.now()): string {
   return `pgw${now.toString(36)}${[...random].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
 }
 
-export function describeRequest(req: PlaceOrderRequest): string {
-  const px = req.px === undefined ? 'market' : `@ ${req.px}`;
-  const intent = intentOf(req.side, req.posSide);
-  const stop = req.slTriggerPx === undefined ? '' : `, stop ${req.slTriggerPx} (mark)`;
-  return `${intent === null ? '' : `${intent}: `}${req.side} ${req.size.value} ${req.size.unit} ${req.instId} ${px}${stop}`;
+export function describeRequest(req: PlaceOrderRequest, t: Messages): string {
+  return t.ticket.describe(req, intentOf(req.side, req.posSide));
 }

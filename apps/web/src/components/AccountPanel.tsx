@@ -1,16 +1,18 @@
 import { Panel } from './Panel';
+import { labelOf, useT, type Messages } from '../i18n';
 import { fmtNum, fmtSigned, fmtTime, signOf } from '../lib/format';
 import { accountAsOf, accountUnknown, type AccountUnknown } from '../store/alerts';
 import { useStore } from '../store/store';
 
-const UNKNOWN_TEXT: Record<Exclude<AccountUnknown, 'disabled'>, string> = {
-  waiting: 'Waiting for server…',
-  loading: 'Loading account…',
-  failed: 'Account not loaded (see the warning above)',
-  unloaded: 'Account not loaded',
-};
+const unknownText = (t: Messages): Record<Exclude<AccountUnknown, 'disabled'>, string> => ({
+  waiting: t.common.waitingServer,
+  loading: t.account.loading,
+  failed: t.account.failed,
+  unloaded: t.common.accountNotLoaded,
+});
 
 export function AccountPanel() {
+  const t = useT();
   const balance = useStore((s) => s.balance);
   const account = useStore((s) => s.account);
   // Re-sent by the server every 5 s, which also keeps the "as of" label current.
@@ -20,35 +22,31 @@ export function AccountPanel() {
 
   if (unknown === 'disabled') {
     return (
-      <Panel title="Account" pad>
-        <div className="empty">
-          No API key configured: only market data is shown
-          <br />
-          未配置 API key，仅显示行情
-        </div>
+      <Panel title={t.account.title} pad>
+        <div className="empty">{t.account.noKey}</div>
       </Panel>
     );
   }
 
   return (
-    <Panel title="Account" extra={asOf === null ? null : <span className="stale-tag">as of {fmtTime(asOf)}</span>} pad>
+    <Panel title={t.account.title} extra={asOf === null ? null : <span className="stale-tag">{t.common.asOf(fmtTime(asOf))}</span>} pad>
       <div className="kv-list">
-        <span className="k">Total equity</span>
+        <span className="k">{t.account.totalEquity}</span>
         <span className="v num">{balance === null ? '–' : `${fmtNum(balance.totalEq)} USD`}</span>
-        <span className="k">Position mode</span>
-        <span className="v">{account?.posMode ?? '–'}</span>
-        <span className="k">Account level</span>
+        <span className="k">{t.account.posMode}</span>
+        <span className="v">{account === null ? '–' : labelOf(t.enums.posMode, account.posMode)}</span>
+        <span className="k">{t.account.level}</span>
         <span className="v">{account?.acctLv ?? '–'}</span>
       </div>
       {balance !== null && balance.details.length > 0 && (
         <table className="table" style={{ marginTop: 8 }}>
           <thead>
             <tr>
-              <th>Ccy</th>
-              <th>Equity</th>
-              <th>Avail</th>
-              <th>Cash</th>
-              <th>UPL</th>
+              <th>{t.account.ccy}</th>
+              <th>{t.account.equity}</th>
+              <th>{t.account.avail}</th>
+              <th>{t.account.cash}</th>
+              <th>{t.account.upl}</th>
             </tr>
           </thead>
           <tbody>
@@ -64,7 +62,7 @@ export function AccountPanel() {
           </tbody>
         </table>
       )}
-      {balance === null && <div className="empty">{unknown === null ? 'No balance yet' : UNKNOWN_TEXT[unknown]}</div>}
+      {balance === null && <div className="empty">{unknown === null ? t.account.noBalance : unknownText(t)[unknown]}</div>}
     </Panel>
   );
 }

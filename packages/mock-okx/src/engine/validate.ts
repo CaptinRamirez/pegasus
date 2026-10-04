@@ -1,7 +1,7 @@
 import { d, isDecimalString, isMultipleOf, ZERO, type Dec } from '../num.js';
 import type { OkxMgnMode, OkxOrdType, OkxPosSide, OkxSide, OkxTriggerPxType } from '../wire.js';
 import { reject, type EngineContext, type Rejection } from './context.js';
-import type { AttachedSl, OrderRec } from './orders.js';
+import type { AttachedSl, OrderRec, StopRec } from './orders.js';
 
 const ORD_TYPES: readonly OkxOrdType[] = ['market', 'limit', 'post_only', 'fok', 'ioc'];
 const CL_ORD_ID_RE = /^[A-Za-z0-9]{1,32}$/;
@@ -179,6 +179,132 @@ function checkMargin(ctx: EngineContext, instId: string, tdMode: OkxMgnMode, sid
   const availEq = ctx.account.availEq(ctx.orders.ordFrozen(ctx.instruments));
   if (required.gt(availEq)) return reject('51008', 'Order failed. Insufficient USDT margin in account.');
   return null;
+}
+
+/**
+ * Validates a stop placed on its own (POST /api/v5/trade/order-algo, `ordType` conditional) and builds its
+ * record. Only what the terminal sends is simulated: a stop-loss for a number of contracts of an open position,
+ * on its closing side. Take-profit, `closeFraction` and the other algo order types are refused with the generic
+ * parameter error. Unverified: the codes OKX answers with when there is no position to close or the size exceeds
+ * it; the simulator uses the ones of an ordinary reduce-only order (51023, 51119).
+ */
+export function validatePlaceAlgo(body: unknown, ctx: EngineContext): StopRec | Rejection {
+  const raw = asRecord(body);
+  if (!raw) return reject('51000', 'Parameter error');
+  const instId = str(raw, 'instId') ?? '';
+  const inst = ctx.instruments.get(instId);
+  const market = ctx.markets.get(instId);
+  if (!inst || !market) return reject('51001', 'Instrument ID does not exist.');
+  const tdMode = str(raw, 'tdMode');
+  if (tdMode !== 'cross' && tdMode !== 'isolated') return reject('51000', 'Parameter tdMode error');
+  const side = str(raw, 'side');
+  if (side !== 'buy' && side !== 'sell') return reject('51000', 'Parameter side error');
+  if (str(raw, 'ordType') !== 'conditional') return reject('51000', 'Parameter ordType error: only conditional is simulated');
+  for (const key of ['tpTriggerPx', 'tpOrdPx', 'tpTriggerPxType', 'closeFraction']) if (raw[key] !== undefined && raw[key] !== '') return reject('51000', `Parameter ${key} error: not simulated`);
+  const posSideRaw = raw['posSide'];
+  let posSide: OkxPosSide;
+  if (ctx.posMode === 'long_short_mode') {
+    if (posSideRaw !== 'long' && posSideRaw !== 'short') return reject('51000', 'Parameter posSide error');
+    posSide = posSideRaw;
+  } else {
+    if (posSideRaw !== undefined && posSideRaw !== '' && posSideRaw !== 'net') return reject('51000', 'Parameter posSide error');
+    posSide = 'net';
+  }
+  const szStr = str(raw, 'sz');
+  if (!szStr || !isDecimalString(szStr) || d(szStr).lte(0)) return reject('51000', 'Parameter sz error');
+  const sz = d(szStr);
+  if (!isMultipleOf(sz, d(inst.lotSz))) return reject('51121', 'Order quantity must be a multiple of the lot size.');
+  const triggerStr = str(raw, 'slTriggerPx');
+  if (!triggerStr || !isDecimalString(triggerStr) || d(triggerStr).lte(0) || !isMultipleOf(d(triggerStr), d(inst.tickSz))) return reject('51000', 'Parameter slTriggerPx error');
+  const slOrdPx = str(raw, 'slOrdPx');
+  if (!slOrdPx || (slOrdPx !== '-1' && (!isDecimalString(slOrdPx) || d(slOrdPx).lte(0)))) return reject('51000', 'Parameter slOrdPx error');
+  const typeRaw = raw['slTriggerPxType'];
+  const slTriggerPxType = typeRaw === undefined || typeRaw === '' ? 'last' : TRIGGER_PX_TYPES.find((t) => t === typeRaw);
+  if (!slTriggerPxType) return reject('51000', 'Parameter slTriggerPxType error');
+  const algoClOrdId = str(raw, 'algoClOrdId') ?? '';
+  if (algoClOrdId !== '' && !CL_ORD_ID_RE.test(algoClOrdId)) return reject('51000', 'Parameter algoClOrdId error');
+  if (algoClOrdId !== '' && ctx.orders.algoClOrdIdInUse(algoClOrdId)) return reject('51016', 'Duplicated clOrdId.');
+  // The position the stop closes: open, and on the other side of the stop's order.
+  const position = ctx.account.find(instId, tdMode, posSide);
+  if (!position || position.qty.isZero() || position.dir !== (side === 'sell' ? 1 : -1)) return reject('51023', 'Position does not exist.');
+  if (sz.gt(position.qty)) return reject('51119', 'Order size exceeds the position size on the closing side.');
+  const trigger = d(triggerStr);
+  const ref = slTriggerPxType === 'last' ? market.lastPx : market.markPx;
+  const entrySide: OkxSide = side === 'sell' ? 'buy' : 'sell';
+  if (entrySide === 'buy' ? !trigger.lt(ref) : !trigger.gt(ref)) {
+    return reject(WRONG_SIDE_CODES[slTriggerPxType][entrySide], `SL trigger price cannot be ${entrySide === 'buy' ? 'higher' : 'lower'} than the ${slTriggerPxType} price`);
+  }
+  const now = ctx.now();
+  return { algoId: ctx.orders.newAlgoId(), algoClOrdId, ordId: '', instId, tdMode, posSide, side, sz, slTriggerPx: trigger, slOrdPx, slTriggerPxType, cTime: now, uTime: now };
+}
+
+export interface AmendAlgoRequest {
+  stop: StopRec;
+  newSlTriggerPx: Dec | null;
+  newSlOrdPx: string | null;
+  newSlTriggerPxType: OkxTriggerPxType | null;
+  newSz: Dec | null;
+  reqId: string;
+}
+
+/**
+ * Validates an amend of an active stop (POST /api/v5/trade/amend-algos). The refusals OKX documents are used where
+ * one exists: 51527 (the stop order does not exist), 51526 (the stop-loss cannot be removed from a stop order,
+ * which a trigger of 0 would do) and 51528 (the trigger price type cannot be modified). Unverified: OKX documents no code for an amended trigger on the wrong side of
+ * the price; the simulator answers with the codes of a placement (51278/51280, 51302/51304, 51306/51308).
+ */
+export function validateAmendAlgo(body: unknown, ctx: EngineContext): AmendAlgoRequest | Rejection {
+  const raw = asRecord(body);
+  if (!raw) return reject('51000', 'Parameter error');
+  const instId = str(raw, 'instId') ?? '';
+  const inst = ctx.instruments.get(instId);
+  const market = ctx.markets.get(instId);
+  if (!inst || !market) return reject('51001', 'Instrument ID does not exist.');
+  const algoId = str(raw, 'algoId');
+  const algoClOrdId = str(raw, 'algoClOrdId');
+  if (!algoId && !algoClOrdId) return reject('51000', 'Either algoId or algoClOrdId is required');
+  const stop = ctx.orders.findStop(instId, algoId, algoClOrdId);
+  if (!stop) return reject('51527', 'Order modification unsuccessful. The stop order does not exist.');
+  for (const tp of ['newTpTriggerPx', 'newTpOrdPx', 'newTpTriggerPxType']) if (raw[tp] !== undefined && raw[tp] !== '') return reject('51000', `Parameter ${tp} error: take-profit is not simulated`);
+  const triggerStr = str(raw, 'newSlTriggerPx');
+  const ordPxStr = str(raw, 'newSlOrdPx');
+  const typeRaw = raw['newSlTriggerPxType'];
+  const szStr = str(raw, 'newSz');
+  if (!triggerStr && !ordPxStr && (typeRaw === undefined || typeRaw === '') && !szStr) return reject('51000', 'Parameter error: nothing to amend');
+  let newSlTriggerPx: Dec | null = null;
+  if (triggerStr) {
+    if (!isDecimalString(triggerStr) || d(triggerStr).lt(0)) return reject('51000', 'Parameter newSlTriggerPx error');
+    if (d(triggerStr).isZero()) return reject('51526', 'Order modification unsuccessful. Take profit/Stop loss conditions cannot be added to or removed from stop orders.');
+    newSlTriggerPx = d(triggerStr);
+    if (!isMultipleOf(newSlTriggerPx, d(inst.tickSz))) return reject('51000', 'Parameter newSlTriggerPx error');
+  }
+  let newSlOrdPx: string | null = null;
+  if (ordPxStr) {
+    if (ordPxStr !== '-1' && (!isDecimalString(ordPxStr) || d(ordPxStr).lte(0))) return reject('51000', 'Parameter newSlOrdPx error');
+    newSlOrdPx = ordPxStr;
+  }
+  let newSlTriggerPxType: OkxTriggerPxType | null = null;
+  if (typeRaw !== undefined && typeRaw !== '') {
+    newSlTriggerPxType = TRIGGER_PX_TYPES.find((t) => t === typeRaw) ?? null;
+    if (!newSlTriggerPxType) return reject('51000', 'Parameter newSlTriggerPxType error');
+    if (newSlTriggerPxType !== stop.slTriggerPxType) return reject('51528', 'Unable to modify trigger price type');
+  }
+  let newSz: Dec | null = null;
+  if (szStr) {
+    if (!isDecimalString(szStr) || d(szStr).lte(0)) return reject('51000', 'Parameter newSz error');
+    newSz = d(szStr);
+    if (!isMultipleOf(newSz, d(inst.lotSz))) return reject('51121', 'Order quantity must be a multiple of the lot size.');
+  }
+  // The resulting stop must not already be reached by the price that triggers it. The codes are keyed by the side
+  // of the order the stop protects: a stop that sells protects a buy.
+  const trigger = newSlTriggerPx ?? stop.slTriggerPx;
+  const type = newSlTriggerPxType ?? stop.slTriggerPxType;
+  const ref = type === 'last' ? market.lastPx : market.markPx;
+  const entrySide: OkxSide = stop.side === 'sell' ? 'buy' : 'sell';
+  if (entrySide === 'buy' ? !trigger.lt(ref) : !trigger.gt(ref)) {
+    return reject(WRONG_SIDE_CODES[type][entrySide], `SL trigger price cannot be ${entrySide === 'buy' ? 'higher' : 'lower'} than the ${type} price`);
+  }
+  return { stop, newSlTriggerPx, newSlOrdPx, newSlTriggerPxType, newSz, reqId: str(raw, 'reqId') ?? '' };
 }
 
 export interface AmendRequest {

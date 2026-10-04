@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
-import type { PlaceOrderRequest } from '@pegasus/shared';
+import type { Localized, PlaceOrderRequest } from '@pegasus/shared';
+import { errorText, inEveryLang, labelOf, rejectionText, useLang, useT, type Messages } from '../i18n';
 import { api } from '../lib/api';
-import { errorMessage, isApiError } from '../lib/http';
-import { blockTitle, getSelectedInstrument, getKillSwitch, getTradingBlock, useStore } from '../store/store';
+import { isApiError } from '../lib/http';
+import { getSelectedInstrument, getKillSwitch, getTradingBlock, useStore } from '../store/store';
 import { Panel } from './Panel';
 import { LeverageControl } from './ticket/LeverageControl';
 import { PreviewPanel } from './ticket/PreviewPanel';
@@ -23,12 +24,6 @@ function outcomeUnknown(e: unknown): boolean {
   return e.status >= 500 && !NOT_SENT_CODES.includes(e.code);
 }
 
-/** What is shown under the submit button after a failed submit: English first, then a short Chinese line. */
-interface SubmitError {
-  en: string;
-  zh: string | null;
-}
-
 interface Attempt {
   /** The request without its client order id */
   key: string;
@@ -39,6 +34,8 @@ interface Attempt {
 }
 
 export function OrderTicket() {
+  const t = useT();
+  const lang = useLang();
   const inst = useStore(getSelectedInstrument);
   const posMode = useStore((s) => s.account?.posMode ?? null);
   const killSwitch = useStore(getKillSwitch);
@@ -72,7 +69,8 @@ export function OrderTicket() {
   const request = useMemo(() => (posMode === null ? null : buildRequest(form, instId, posMode)), [form, instId, posMode]);
   const preview = useOrderPreview(request);
 
-  const [submitError, setSubmitError] = useState<SubmitError | null>(null);
+  // What is shown under the submit button after a failed submit, in both languages: it follows a switch of the language.
+  const [submitError, setSubmitError] = useState<Localized | null>(null);
   // The message is about the order as it was submitted: any edit makes it a different one.
   useEffect(() => setSubmitError(null), [form]);
   const attempt = useRef<Attempt | null>(null);
@@ -82,15 +80,15 @@ export function OrderTicket() {
     onSuccess: ({ order }) => {
       attempt.current = null;
       setSubmitError(null);
-      const intent = intentOf(order.side, order.posSide);
-      const stop = order.slTriggerPx === undefined ? '' : `, stop ${order.slTriggerPx} (mark)`;
-      pushToast('success', `Order ${order.state}: ${intent === null ? '' : `${intent}, `}${order.side} ${order.sz} contracts ${order.instId}${order.px !== '' ? ` @ ${order.px}` : ''}${stop} (${order.ordId})`);
+      pushToast('success', t.ticket.placed(order, intentOf(order.side, order.posSide)));
     },
     onError: (e) => {
-      const failed = submitFailure(e, attempt.current?.retry ?? false);
+      const retry = attempt.current?.retry ?? false;
+      const failed = submitFailure(e, retry);
       if (attempt.current !== null) attempt.current = { ...attempt.current, unknown: failed.unknown };
-      setSubmitError(failed.text);
-      pushToast('error', failed.text.zh === null ? failed.text.en : `${failed.text.en}\n${failed.text.zh}`);
+      const text = inEveryLang(failed.text);
+      setSubmitError(text);
+      pushToast('error', text);
     },
   });
 
@@ -109,8 +107,8 @@ export function OrderTicket() {
 
   if (inst === null) {
     return (
-      <Panel title="Order ticket" pad>
-        <div className="empty">Select an instrument</div>
+      <Panel title={t.ticket.title} pad>
+        <div className="empty">{t.ticket.selectInstrument}</div>
       </Panel>
     );
   }
@@ -122,41 +120,35 @@ export function OrderTicket() {
   // Once the server has answered for this exact form the button says what the server understood.
   const intent = !longShort ? null : preview.isCurrent && preview.preview !== undefined ? intentOf(preview.preview.side, preview.preview.posSide) : intentOf(form.side, posSide);
   return (
-    <Panel title="Order ticket" extra={<span className="num">{inst.instId}</span>} pad>
+    <Panel title={t.ticket.title} extra={<span className="num">{inst.instId}</span>} pad>
       <div className="form">
-        {killSwitch && <div className="notice notice-danger">Kill switch is on: only orders that close or reduce a position are accepted</div>}
-        {tradingBlock !== null && (
-          <div className="notice notice-warn">
-            {tradingBlock.en}
-            <br />
-            {tradingBlock.zh}
-          </div>
-        )}
+        {killSwitch && <div className="notice notice-danger">{t.ticket.killSwitchNotice}</div>}
+        {tradingBlock !== null && <div className="notice notice-warn">{tradingBlock[lang]}</div>}
         <div className="btn-group">
           <button className={`btn grow${form.side === 'buy' ? ' active buy' : ''}`} onClick={() => patch({ side: 'buy' })}>
-            {closing ? 'Buy / Close short' : 'Buy / Long'}
+            {closing ? t.ticket.buyCloseShort : t.ticket.buyLong}
           </button>
           <button className={`btn grow${form.side === 'sell' ? ' active sell' : ''}`} onClick={() => patch({ side: 'sell' })}>
-            {closing ? 'Sell / Close long' : 'Sell / Short'}
+            {closing ? t.ticket.sellCloseLong : t.ticket.sellShort}
           </button>
         </div>
 
         <div className="field-row">
           <div className="field">
-            <label>Type</label>
+            <label>{t.ticket.type}</label>
             <select value={form.ordType} onChange={(e) => patch({ ordType: e.target.value as TicketForm['ordType'] })}>
-              {ORD_TYPES.map((t) => (
-                <option key={t} value={t}>
-                  {t}
+              {ORD_TYPES.map((o) => (
+                <option key={o} value={o}>
+                  {t.enums.ordType[o]}
                 </option>
               ))}
             </select>
           </div>
           <div className="field">
-            <label>Margin</label>
+            <label>{t.ticket.margin}</label>
             <select value={form.tdMode} onChange={(e) => patch({ tdMode: e.target.value as TicketForm['tdMode'] })}>
-              <option value="cross">cross</option>
-              <option value="isolated">isolated</option>
+              <option value="cross">{t.enums.mgnMode.cross}</option>
+              <option value="isolated">{t.enums.mgnMode.isolated}</option>
             </select>
           </div>
         </div>
@@ -164,14 +156,14 @@ export function OrderTicket() {
         {longShort && (
           <label className="check">
             <input type="checkbox" checked={form.reduceOnly} onChange={(e) => patch({ reduceOnly: e.target.checked })} />
-            Close / reduce existing position
+            {t.ticket.closeExisting}
           </label>
         )}
 
         {needsPrice(form.ordType) && (
           <div className="field">
             <label>
-              Price <span className="dim">(tick {inst.tickSz})</span>
+              {t.common.price} <span className="dim">{t.ticket.tick(inst.tickSz)}</span>
             </label>
             <input className="num" inputMode="decimal" value={form.px} placeholder="0.0" onChange={(e) => patch({ px: e.target.value })} />
           </div>
@@ -179,14 +171,14 @@ export function OrderTicket() {
 
         <div className="field">
           <label>
-            Size <span className="dim">(min {inst.minSz} / lot {inst.lotSz} contracts)</span>
+            {t.common.size} <span className="dim">{t.ticket.sizeHint(inst.minSz, inst.lotSz)}</span>
           </label>
           <div className="input-group">
             <input className="num" inputMode="decimal" value={form.sizeValue} placeholder="0" onChange={(e) => patch({ sizeValue: e.target.value })} />
             <select value={form.sizeUnit} onChange={(e) => patch({ sizeUnit: e.target.value as TicketForm['sizeUnit'], restoreUnit: null })}>
               {SIZE_UNITS.map((u) => (
                 <option key={u} value={u}>
-                  {unitLabel(u, inst)}
+                  {unitLabel(u, inst, t)}
                 </option>
               ))}
             </select>
@@ -195,17 +187,17 @@ export function OrderTicket() {
 
         {!form.reduceOnly && (
           <div className="field">
-            <label title="Stop-loss attached to the order: OKX creates it only once the order is completely filled; while the order is partially filled, the filled part has no stop. Triggered by the mark price and executed at market. Leave empty for none.">
-              Stop (mark) <span className="dim">(optional, tick {inst.tickSz})</span>
+            <label title={t.ticket.stopTitle}>
+              {t.ticket.stopMark} <span className="dim">{t.ticket.stopHint(inst.tickSz)}</span>
             </label>
-            <input className="num" inputMode="decimal" value={form.slTriggerPx} placeholder="none" onChange={(e) => patch({ slTriggerPx: e.target.value })} />
+            <input className="num" inputMode="decimal" value={form.slTriggerPx} placeholder={t.ticket.none} onChange={(e) => patch({ slTriggerPx: e.target.value })} />
           </div>
         )}
 
         {posMode === 'net_mode' && (
           <label className="check">
             <input type="checkbox" checked={form.reduceOnly} onChange={(e) => patch({ reduceOnly: e.target.checked })} />
-            Reduce only
+            {t.ticket.reduceOnly}
           </label>
         )}
 
@@ -217,19 +209,13 @@ export function OrderTicket() {
           className={`btn ${form.side === 'buy' ? 'btn-buy' : 'btn-sell'}`}
           disabled={disabled}
           onClick={submit}
-          title={tradingBlock !== null ? blockTitle(tradingBlock) : preview.request === null ? 'Complete the form' : describeRequest(preview.request)}
+          title={tradingBlock !== null ? tradingBlock[lang] : preview.request === null ? t.ticket.completeForm : describeRequest(preview.request, t)}
         >
-          {place.isPending ? 'Submitting…' : `${intent === null ? '' : `${intent}: `}${form.side === 'buy' ? 'Buy' : 'Sell'} ${inst.baseCcy} ${form.ordType}`}
+          {place.isPending ? t.ticket.submitting : t.ticket.submitLabel(intent, form.side, inst.baseCcy, labelOf(t.enums.ordType, form.ordType))}
         </button>
         {submitError !== null && (
           <div className="notice notice-danger" role="alert">
-            {submitError.en}
-            {submitError.zh !== null && (
-              <>
-                <br />
-                {submitError.zh}
-              </>
-            )}
+            {submitError[lang]}
           </div>
         )}
       </div>
@@ -237,19 +223,11 @@ export function OrderTicket() {
   );
 }
 
-function submitFailure(e: unknown, retry: boolean): { text: SubmitError; unknown: boolean } {
+/** Why a submit failed, as a text for either dictionary, and whether the order may nevertheless be on the exchange. */
+function submitFailure(e: unknown, retry: boolean): { text: (t: Messages) => string; unknown: boolean } {
   if (retry && isApiError(e) && e.code === 'EXCHANGE' && e.details?.['okxCode'] === OKX_DUPLICATE_CL_ORD_ID) {
-    return {
-      text: { en: 'The earlier attempt did reach OKX; this retry was refused as a duplicate. Check Open orders.', zh: '上一次下单已到达 OKX，本次重试被拒绝，请查看当前委托' },
-      unknown: false,
-    };
+    return { text: (t) => t.ticket.errDuplicate, unknown: false };
   }
-  if (outcomeUnknown(e)) {
-    return {
-      text: { en: `Order status unknown: check Positions, Fills and Open orders before retrying (${errorMessage(e)})`, zh: '订单状态未知：重试前请先查看持仓、成交和当前委托' },
-      unknown: true,
-    };
-  }
-  const risk = isApiError(e) && e.code === 'RISK_REJECTED' && typeof e.details?.['message'] === 'string' ? ` — ${e.details['message']}` : '';
-  return { text: { en: `Order rejected: ${errorMessage(e)}${risk}`, zh: null }, unknown: false };
+  if (outcomeUnknown(e)) return { text: (t) => t.ticket.errUnknown(errorText(e, t)), unknown: true };
+  return { text: (t) => t.ticket.errRejected(errorText(e, t), rejectionText(e, t)), unknown: false };
 }

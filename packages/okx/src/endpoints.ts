@@ -17,6 +17,8 @@ export const OKX_WS_BUSINESS_URL_DEMO = 'wss://wspap.okx.com/ws/v5/business?brok
 
 export interface OkxEndpoints {
   rest: string;
+  /** Where signed REST requests go when not to `rest` (paper trading: the local paper exchange) */
+  restPrivate?: string;
   wsPublic: string;
   wsPrivate: string;
   wsBusiness: string;

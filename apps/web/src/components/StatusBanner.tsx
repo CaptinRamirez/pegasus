@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
+import { useLang } from '../i18n';
 import { activeAlerts } from '../store/alerts';
 import { useStore } from '../store/store';
 
 /** Full-width warnings under the header whenever what the page shows is not live. */
 export function StatusBanner() {
+  const lang = useLang();
   const wsStatus = useStore((s) => s.wsStatus);
   const wsDownSince = useStore((s) => s.wsDownSince);
   const connection = useStore((s) => s.connection);
@@ -24,8 +26,7 @@ export function StatusBanner() {
     <div className="banners">
       {alerts.map((a) => (
         <div key={a.id} className="banner" role="alert">
-          <span>{a.en}</span>
-          <span className="banner-zh">{a.zh}</span>
+          {a[lang]}
         </div>
       ))}
     </div>

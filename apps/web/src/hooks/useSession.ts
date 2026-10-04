@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { currentT } from '../i18n';
 import { api } from '../lib/api';
 import { isApiError } from '../lib/http';
 import { signOut, startSession } from '../store/session';
@@ -60,7 +61,7 @@ export function useHistorySeed(): void {
   useEffect(() => {
     if (error === null) return;
     if (isApiError(error) && error.code === 'UNAUTHORIZED') {
-      pushToast('error', 'Token rejected by the server');
+      pushToast('error', currentT().gate.tokenRejected);
       signOut();
     }
   }, [error, pushToast]);
