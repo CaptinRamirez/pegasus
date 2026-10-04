@@ -8,6 +8,7 @@ import { InstrumentList } from './components/InstrumentList';
 import { OrderBook } from './components/OrderBook';
 import { OrderTicket } from './components/OrderTicket';
 import { RiskPanel } from './components/RiskPanel';
+import { StatusBanner } from './components/StatusBanner';
 import { Toasts } from './components/Toasts';
 import { TokenGate } from './components/TokenGate';
 import { Trades } from './components/Trades';
@@ -17,6 +18,7 @@ function Terminal() {
   return (
     <div className="app">
       <Header />
+      <StatusBanner />
       <div className="main">
         <div className="col col-left">
           <InstrumentList />

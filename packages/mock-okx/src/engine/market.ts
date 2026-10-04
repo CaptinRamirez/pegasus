@@ -144,10 +144,8 @@ export class MarketSim {
     const ask = this.book.bestAsk();
     const hourly = this.candles.get('1H');
     const stats = hourly?.stats(now - 24 * 60 * 60 * 1000);
-    const daily = this.candles.get('1D');
-    const sod0 = daily?.openAt(barStart('1D', now)) ?? this.last;
-    const sod8Ts = barStart('1D', now + 8 * 60 * 60 * 1000) - 8 * 60 * 60 * 1000;
-    const sod8 = hourly?.openAt(sod8Ts) ?? sod0;
+    const sod0 = this.candles.get('1Dutc')?.openAt(barStart('1Dutc', now)) ?? this.last;
+    const sod8 = this.candles.get('1D')?.openAt(barStart('1D', now)) ?? sod0;
     return {
       instType: 'SWAP',
       instId: this.inst.instId,

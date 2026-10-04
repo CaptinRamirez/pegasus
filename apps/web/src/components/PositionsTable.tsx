@@ -2,8 +2,17 @@ import { useMutation } from '@tanstack/react-query';
 import { D, type ClosePositionRequest, type Position } from '@pegasus/shared';
 import { api } from '../lib/api';
 import { errorMessage } from '../lib/http';
-import { fmtCoin, fmtContracts, fmtNum, fmtPct, fmtPx, fmtSigned, signOf } from '../lib/format';
-import { useStore } from '../store/store';
+import { UNTRACKED_TITLE, fmtCoin, fmtContracts, fmtNum, fmtPct, fmtPx, fmtSigned, fmtTime, signOf } from '../lib/format';
+import { accountAsOf, accountUnknown, type AccountUnknown } from '../store/alerts';
+import { blockTitle, getTradingBlock, useStore } from '../store/store';
+
+const UNKNOWN_TEXT: Record<AccountUnknown, string> = {
+  waiting: 'Waiting for server…',
+  disabled: 'No API key configured: positions are not shown',
+  loading: 'Loading positions…',
+  failed: 'Positions not loaded (see the warning above)',
+  unloaded: 'Account not loaded',
+};
 
 function sideOf(p: Position): 'long' | 'short' | 'flat' {
   if (p.posSide === 'long' || p.posSide === 'short') return p.posSide;
@@ -15,7 +24,12 @@ export function PositionsTable() {
   const positions = useStore((s) => s.positions);
   const instruments = useStore((s) => s.instruments);
   const posMode = useStore((s) => s.account?.posMode ?? null);
+  const tradingBlock = useStore(getTradingBlock);
+  // Re-sent by the server every 5 s, which also keeps the "as of" label current.
+  const connection = useStore((s) => s.connection);
   const pushToast = useStore((s) => s.pushToast);
+  const unknown = useStore(accountUnknown);
+  const asOf = accountAsOf(connection, Date.now());
 
   const close = useMutation({
     mutationFn: (body: ClosePositionRequest) => api.closePosition(body),
@@ -33,10 +47,13 @@ export function PositionsTable() {
   };
 
   const open = positions.filter((p) => !D(p.pos).isZero());
-  if (open.length === 0) return <div className="empty">No open positions</div>;
+  const asOfTag = asOf === null ? null : <span className="stale-tag">as of {fmtTime(asOf)}</span>;
+  // An empty list only means a flat account once the positions were actually loaded.
+  if (open.length === 0) return <div className="empty">{unknown === null ? <>No open positions {asOfTag}</> : UNKNOWN_TEXT[unknown]}</div>;
 
   return (
     <table className="table">
+      {asOfTag !== null && <caption className="as-of">Positions {asOfTag}</caption>}
       <thead>
         <tr>
           <th>Instrument</th>
@@ -61,7 +78,14 @@ export function PositionsTable() {
           const absPos = D(p.pos).abs();
           return (
             <tr key={`${p.instId}:${p.posSide}:${p.mgnMode}`} className="num">
-              <td className="left">{p.instId}</td>
+              <td className="left">
+                {p.instId}
+                {inst === undefined && (
+                  <span className="untracked-tag" title={UNTRACKED_TITLE}>
+                    untracked
+                  </span>
+                )}
+              </td>
               <td className={`left ${side === 'long' ? 'pos' : 'neg'}`}>
                 {side} <span className="dim">{p.mgnMode}</span>
               </td>
@@ -78,7 +102,12 @@ export function PositionsTable() {
               <td>{fmtNum(p.margin, 2)}</td>
               <td>{fmtNum(p.notionalUsd, 0)}</td>
               <td>
-                <button className="btn btn-sm btn-danger" onClick={() => onClose(p)} disabled={close.isPending}>
+                <button
+                  className="btn btn-sm btn-danger"
+                  onClick={() => onClose(p)}
+                  disabled={close.isPending || tradingBlock !== null}
+                  {...(tradingBlock === null ? {} : { title: blockTitle(tradingBlock) })}
+                >
                   Close
                 </button>
               </td>

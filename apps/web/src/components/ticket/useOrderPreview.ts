@@ -9,6 +9,8 @@ export interface PreviewResult {
   preview: OrderPreview | undefined;
   error: unknown;
   isFetching: boolean;
+  /** true when the preview is the server's answer to the request as the form holds it now */
+  isCurrent: boolean;
   /** true when the request is stable and the preview matches it with risk.ok */
   canSubmit: boolean;
 }
@@ -31,13 +33,15 @@ export function useOrderPreview(request: PlaceOrderRequest | null): PreviewResul
 
   const stable = debounced === serialized && debounced !== null;
   const preview = debouncedRequest === null ? undefined : q.data;
-  const canSubmit = stable && !q.isError && !q.isPlaceholderData && preview !== undefined && preview.risk.ok;
+  const isCurrent = stable && !q.isError && !q.isPlaceholderData && preview !== undefined;
+  const canSubmit = isCurrent && preview.risk.ok;
 
   return {
     request: debouncedRequest,
     preview,
     error: debouncedRequest === null ? null : q.error,
     isFetching: q.isFetching,
+    isCurrent,
     canSubmit,
   };
 }

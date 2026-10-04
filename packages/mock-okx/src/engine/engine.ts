@@ -11,6 +11,7 @@ import { OrderStore, orderToWire } from './orders.js';
 
 export interface EngineConfig {
   posMode: OkxPosMode;
+  perm: string;
   instruments: OkxInstrument[];
   initialPrices: Record<string, string>;
   seed: number;
@@ -27,6 +28,7 @@ export const MOCK_UID = '1234567890';
 /** The whole exchange simulation: markets, account, matching and an event bus. */
 export class Engine implements EngineContext {
   readonly posMode: OkxPosMode;
+  readonly perm: string;
   readonly instruments = new Map<string, OkxInstrument>();
   readonly markets = new Map<string, MarketSim>();
   readonly account: Account;
@@ -40,6 +42,7 @@ export class Engine implements EngineContext {
 
   constructor(cfg: EngineConfig) {
     this.posMode = cfg.posMode;
+    this.perm = cfg.perm;
     this.log = cfg.log;
     this.takerFee = d(cfg.takerFeeRate);
     this.makerFee = d(cfg.makerFeeRate);
@@ -147,6 +150,11 @@ export class Engine implements EngineContext {
     return this.markets.get(instId)?.fundingRate(this.now());
   }
 
+  /** Whether the API key may place, amend or cancel orders, close positions and set leverage. */
+  get canTrade(): boolean {
+    return this.perm.split(',').includes('trade');
+  }
+
   // ---- account queries ----
 
   config(): OkxAccountConfig {
@@ -170,7 +178,7 @@ export class Engine implements EngineContext {
       kycLv: '2',
       label: 'mock-okx',
       ip: '',
-      perm: 'read_only,trade',
+      perm: this.perm,
       liquidationGear: '-1',
       enableSpotBorrow: false,
       spotBorrowAutoRepay: false,

@@ -1,4 +1,3 @@
-import { bookChecksum } from './checksum.js';
 import type { OkxBookData, OkxBookLevel } from './types.js';
 
 export interface BookSnapshot {
@@ -10,9 +9,8 @@ export interface BookSnapshot {
 
 /**
  * Maintains a local copy of an OKX `books` (400-level) order book from
- * snapshot + incremental updates, verifying sequence numbers and checksums.
- * Prices are kept as the exact strings OKX sent so the checksum can be
- * recomputed byte-for-byte.
+ * snapshot + incremental updates, verifying sequence numbers. Prices are
+ * kept as the exact strings OKX sent.
  */
 export class LocalOrderBook {
   private bids = new Map<string, string>();
@@ -49,8 +47,8 @@ export class LocalOrderBook {
 
   /**
    * Apply a `books` message. Returns an error string when the book must be
-   * resynchronised (sequence gap or checksum mismatch); the caller should
-   * reset() and resubscribe.
+   * resynchronised (sequence gap or update before snapshot); the caller
+   * should reset() and resubscribe.
    */
   apply(action: 'snapshot' | 'update' | undefined, data: OkxBookData): string | null {
     if (action === 'snapshot' || !this._ready) {
@@ -71,12 +69,7 @@ export class LocalOrderBook {
     this.sortedAsks = null;
     this._ts = Number(data.ts);
     if (data.seqId !== undefined) this._seqId = data.seqId;
-    // OKX retired the checksum (2026-06-23): the field is still sent but fixed to 0, and seqId/prevSeqId is the integrity check.
-    if (data.checksum !== undefined && data.checksum !== 0) {
-      const expected = data.checksum;
-      const actual = bookChecksum(this.topBids(25), this.topAsks(25));
-      if (expected !== actual) return `checksum mismatch: expected ${expected}, got ${actual}`;
-    }
+    // OKX retired the checksum (2026-06-23): the field is still sent but fixed to 0 and must not be used for verification; seqId/prevSeqId is the integrity check.
     return null;
   }
 

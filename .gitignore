@@ -10,3 +10,6 @@ coverage/
 .vite/
 .turbo/
 pgdata/
+# written by the API: the saved kill switch / day baseline (STATE_FILE) and the daily log files (LOG_DIR)
+/data/
+/logs/

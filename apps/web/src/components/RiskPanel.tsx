@@ -1,6 +1,6 @@
-import { D, type DecimalInput } from '@pegasus/shared';
+import { D, type CancelSweepState, type DecimalInput } from '@pegasus/shared';
 import { Panel } from './Panel';
-import { fmtNum, fmtPct, fmtSigned, safeDecimal, signOf } from '../lib/format';
+import { fmtNum, fmtPct, fmtSigned, fmtUtcMinute, safeDecimal, signOf } from '../lib/format';
 import { useStore } from '../store/store';
 
 /** Ratio used/limit as a 0..100 number (chart coordinate only). */
@@ -19,6 +19,17 @@ function Meter({ pct, tone }: { pct: number; tone: 'pos' | 'neg' | 'warn' | '' }
   );
 }
 
+/** The first balance of a UTC day arrives up to a reconcile (60 s) after 00:00; a baseline within this of the day start is the day start. */
+const DAY_START_TOLERANCE_MS = 5 * 60_000;
+
+const SWEEP_TONE: Record<CancelSweepState, string> = {
+  idle: '',
+  pending: 'notice-warn',
+  done: 'notice-ok',
+  failed: 'notice-danger',
+  skipped: 'notice-warn',
+};
+
 export function RiskPanel() {
   const config = useStore((s) => s.riskConfig);
   const state = useStore((s) => s.risk);
@@ -33,6 +44,9 @@ export function RiskPanel() {
   }
 
   const dailyPnl = state?.dailyPnl ?? null;
+  // "Daily" is only the whole UTC day when the baseline was taken at its start: after a later start of the
+  // terminal, or a rebase, the PnL counts from that moment and the label says so ("09:12 UTC").
+  const since = state !== null && state.baselineTs - state.dayStartTs > DAY_START_TOLERANCE_MS ? fmtUtcMinute(state.baselineTs).slice(-9) : null;
   const lossUsed = dailyPnl !== null && D(dailyPnl).lt(0) ? D(dailyPnl).abs() : D(0);
   const lossPct = usagePct(lossUsed, config.dailyLossLimit);
   const notionalPct = usagePct(state?.totalPositionNotional, config.maxTotalPositionNotional);
@@ -44,10 +58,17 @@ export function RiskPanel() {
       {state?.killSwitch === true && (
         <div className="notice notice-danger" style={{ marginBottom: 8 }}>
           KILL SWITCH ON{state.killSwitchReason !== '' ? ` — ${state.killSwitchReason}` : ''}
+          {state.killSwitchReason.startsWith('STATE_FILE_UNREADABLE') && <div>状态文件无法读取，为安全起见已暂停开仓；确认账户无误后可手动解除。</div>}
+        </div>
+      )}
+      {state?.killSwitch === true && state.cancelSweep.state !== 'idle' && (
+        <div className={`notice ${SWEEP_TONE[state.cancelSweep.state]}`} style={{ marginBottom: 8 }}>
+          Cancel all open orders: {state.cancelSweep.message}
+          {state.cancelSweep.state === 'failed' || state.cancelSweep.state === 'skipped' ? '. Open orders are NOT cancelled; cancel them on OKX.' : ''}
         </div>
       )}
       <div className="kv-list">
-        <span className="k">Daily PnL</span>
+        <span className="k">Daily PnL{since !== null ? ` since ${since}` : ''}</span>
         <span className={`v num ${signOf(dailyPnl)}`}>
           {fmtSigned(dailyPnl)} / -{fmtNum(config.dailyLossLimit, 0)} USD
         </span>
@@ -81,7 +102,7 @@ export function RiskPanel() {
         <span className="v num">{fmtPct(config.priceBandPct, 2)}</span>
         <span className="k">Max slippage</span>
         <span className="v num">{fmtPct(config.maxSlippagePct, 2)}</span>
-        <span className="k">Day start equity</span>
+        <span className="k">{since !== null ? 'Baseline equity' : 'Day start equity'}</span>
         <span className="v num">{fmtNum(state?.dayStartEquity ?? null)}</span>
         <span className="k">Current equity</span>
         <span className="v num">{fmtNum(state?.currentEquity ?? null)}</span>

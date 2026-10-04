@@ -1,4 +1,4 @@
-import { OkxRestClient, OkxWsClient } from '@pegasus/okx';
+import { OkxRestClient, OkxTransportError, OkxWsClient } from '@pegasus/okx';
 import type { AppConfig } from '../config.js';
 import { okxLogger, type Logger } from '../logger.js';
 
@@ -37,4 +37,43 @@ export async function syncClock(clients: OkxClients, log: Logger): Promise<void>
   } catch (err) {
     log.warn({ err }, 'could not sync clock with OKX; using local time');
   }
+}
+
+/** OKX could not be reached while starting. The message is written for the owner, not for a developer. */
+export class OkxUnreachableAtStartError extends Error {
+  constructor(cause: OkxTransportError) {
+    super(
+      `Pegasus could not reach OKX (${cause.message}). Check the network connection or the proxy / VPN, then start it again.\n` +
+        '无法连接 OKX，请检查网络或代理（VPN）后重新启动。',
+    );
+    this.name = 'OkxUnreachableAtStartError';
+  }
+}
+
+/**
+ * Runs a start-up call that needs OKX. Only a transport failure (no answer at all) is retried, after 2 s and
+ * after 5 s; an answer from OKX, whatever it says, is final.
+ */
+export async function reachOkxAtStart<T>(what: string, fn: () => Promise<T>, log: Logger, backoffMs: readonly number[] = [2_000, 5_000]): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!(err instanceof OkxTransportError)) throw err;
+      const delay = backoffMs[attempt];
+      if (delay === undefined) throw new OkxUnreachableAtStartError(err);
+      log.warn({ err: err.message, retryInMs: delay }, `could not load ${what} from OKX; retrying`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
+/**
+ * Re-measure the offset periodically: when the OS corrects a clock that was off at boot,
+ * a stale offset would push signatures outside OKX's window until the next restart.
+ */
+export function scheduleClockSync(clients: OkxClients, log: Logger, intervalMs = 30 * 60_000): NodeJS.Timeout {
+  const timer = setInterval(() => void syncClock(clients, log), intervalMs);
+  timer.unref();
+  return timer;
 }

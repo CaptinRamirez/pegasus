@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { useStore } from '../store/store';
 
+/** Info and success toasts leave by themselves; an error stays until it is clicked away. */
 const TOAST_TTL_MS = 6_000;
 
 export function Toasts() {
@@ -8,10 +9,12 @@ export function Toasts() {
   const dismiss = useStore((s) => s.dismissToast);
 
   useEffect(() => {
-    const timers = toasts.map((t) => {
-      const remaining = Math.max(0, TOAST_TTL_MS - (Date.now() - t.ts));
-      return setTimeout(() => dismiss(t.id), remaining);
-    });
+    const timers = toasts
+      .filter((t) => t.kind !== 'error')
+      .map((t) => {
+        const remaining = Math.max(0, TOAST_TTL_MS - (Date.now() - t.ts));
+        return setTimeout(() => dismiss(t.id), remaining);
+      });
     return () => {
       for (const timer of timers) clearTimeout(timer);
     };
@@ -21,7 +24,7 @@ export function Toasts() {
   return (
     <div className="toasts">
       {toasts.map((t) => (
-        <div key={t.id} className={`toast ${t.kind}`} onClick={() => dismiss(t.id)} role="status">
+        <div key={t.id} className={`toast ${t.kind}`} onClick={() => dismiss(t.id)} role="status" title="Click to dismiss">
           {t.message}
         </div>
       ))}

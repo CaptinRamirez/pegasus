@@ -13,6 +13,8 @@ export interface MockOkxOptions {
   /** When set, private REST and WS calls must carry a valid OKX signature. */
   credentials?: MockCredentials;
   posMode?: OkxPosMode;
+  /** Permissions of the API key as OKX lists them; default 'read_only,trade'. Without `trade` every write is refused. */
+  perm?: string;
   /** Per-instId overrides; unknown instIds are added using BTC-USDT-SWAP as a template. */
   instruments?: Record<string, Partial<OkxInstrument>>;
   initialPrices?: Record<string, string>;

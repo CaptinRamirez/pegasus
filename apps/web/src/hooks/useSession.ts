@@ -14,6 +14,18 @@ export function useSession(token: string | null): void {
   }, [token]);
 }
 
+/** Shared by the seeding hook and the History / Fills tables, which show a failed load and offer a retry. */
+export const ORDER_HISTORY_QUERY = {
+  queryKey: ['orders', 'history'],
+  queryFn: () => api.orderHistory({ limit: LIMITS.orderHistory }),
+  staleTime: Infinity,
+} as const;
+export const FILLS_QUERY = {
+  queryKey: ['fills'],
+  queryFn: () => api.fills({ limit: LIMITS.fills }),
+  staleTime: Infinity,
+} as const;
+
 /**
  * Seeds order history and fills from REST; live pushes keep them fresh afterwards and
  * every new hello (a reconnect) re-fetches so orders completed during an outage appear.
@@ -26,21 +38,16 @@ export function useHistorySeed(): void {
   const qc = useQueryClient();
 
   useEffect(() => {
-    if (helloSeq < 2) return; // the first hello is covered by the initial fetch
-    void qc.invalidateQueries({ queryKey: ['orders', 'history'] });
-    void qc.invalidateQueries({ queryKey: ['fills'] });
+    if (helloSeq === 0) return;
+    // The first hello is covered by the initial fetch, unless that failed (the page was opened before the API was up).
+    const failed = [ORDER_HISTORY_QUERY, FILLS_QUERY].some((q) => qc.getQueryState(q.queryKey)?.status === 'error');
+    if (helloSeq < 2 && !failed) return;
+    void qc.invalidateQueries({ queryKey: ORDER_HISTORY_QUERY.queryKey });
+    void qc.invalidateQueries({ queryKey: FILLS_QUERY.queryKey });
   }, [helloSeq, qc]);
 
-  const history = useQuery({
-    queryKey: ['orders', 'history'],
-    queryFn: () => api.orderHistory({ limit: LIMITS.orderHistory }),
-    staleTime: Infinity,
-  });
-  const fills = useQuery({
-    queryKey: ['fills'],
-    queryFn: () => api.fills({ limit: LIMITS.fills }),
-    staleTime: Infinity,
-  });
+  const history = useQuery(ORDER_HISTORY_QUERY);
+  const fills = useQuery(FILLS_QUERY);
 
   useEffect(() => {
     if (history.data !== undefined) seedOrderHistory(history.data);

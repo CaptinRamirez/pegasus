@@ -7,14 +7,19 @@ import { AppError } from '../errors.js';
 const instQuery = z.object({ instId: instIdSchema });
 
 export async function registerMarketRoutes(app: FastifyInstance, deps: Deps): Promise<void> {
-  app.get('/api/health', async () => ({
-    ok: true,
-    demo: deps.config.okx.demo,
-    connection: deps.hub.connectionStatus(),
-    clients: deps.hub.size,
-    store: deps.store.kind,
-    serverTime: Date.now(),
-  }));
+  // No token is needed here, so it says only that the server is up: the account status
+  // (OKX's error text, the read-only flag) and the stale streams stay behind the token.
+  app.get('/api/health', async () => {
+    const { okxPublic, okxPrivate, okxBusiness } = deps.hub.connectionStatus();
+    return {
+      ok: true,
+      // The commit this process was started from: a page built from another commit is talking to an older or newer API.
+      version: deps.config.version,
+      demo: deps.config.okx.demo,
+      connection: { okxPublic, okxPrivate, okxBusiness },
+      serverTime: Date.now(),
+    };
+  });
 
   app.get('/api/instruments', async () => ok([...deps.market.instruments.values()]));
 

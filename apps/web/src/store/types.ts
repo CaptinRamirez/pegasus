@@ -82,9 +82,20 @@ export interface TerminalState {
   fills: Fill[];
   positions: Position[];
   balance: Balance | null;
+  /** Whether the server had the account loaded when it last sent its whole state; an empty list means a flat account only then */
+  accountLoaded: boolean;
   risk: RiskState | null;
+  /** What the server last said about its exchange connections; null while the socket to the server is not open */
   connection: ConnectionStatus | null;
+  /** Local time `connection` was received */
+  connectionAt: number | null;
+  /** Local time the server first reported its OKX account stream as not connected; null while it is connected or unknown */
+  privateDownSince: number | null;
   wsStatus: WsStatus;
+  /** Local time the socket to the server stopped being open (or first tried to connect); null while it is open */
+  wsDownSince: number | null;
+  /** Local time of the last message from the server over the socket (HTTP replies do not count); null until the first one */
+  lastMessageAt: number | null;
   toasts: Toast[];
   nextToastId: number;
   ticketPrice: TicketPrice | null;
@@ -122,9 +133,14 @@ export function initialState(token: string | null): TerminalState {
     fills: [],
     positions: [],
     balance: null,
+    accountLoaded: false,
     risk: null,
     connection: null,
+    connectionAt: null,
+    privateDownSince: null,
     wsStatus: 'closed',
+    wsDownSince: null,
+    lastMessageAt: null,
     toasts: [],
     nextToastId: 1,
     ticketPrice: null,

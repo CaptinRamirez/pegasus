@@ -40,7 +40,8 @@ export type ClientMessage = z.infer<typeof clientMessageSchema>;
 export interface HelloPayload {
   demo: boolean;
   instruments: Instrument[];
-  account: AccountConfig;
+  /** null until the account bootstrap has loaded it (and for good without an API key); corrected by the `account` message */
+  account: AccountConfig | null;
   riskConfig: RiskConfig;
   risk: RiskState;
   connection: ConnectionStatus;
@@ -62,6 +63,7 @@ export type ServerMessage =
   | { type: 'fill'; data: Fill }
   | { type: 'positions'; data: Position[] }
   | { type: 'balance'; data: Balance }
+  | { type: 'account'; data: AccountConfig }
   | { type: 'risk'; data: RiskState }
   | { type: 'connection'; data: ConnectionStatus }
   | { type: 'subscribed'; data: { instId: string; bar: CandleBar } }

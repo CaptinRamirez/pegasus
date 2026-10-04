@@ -2,7 +2,8 @@ import { d, fmt, roundToStep, ZERO, type Dec } from '../num.js';
 import type { Prng } from '../prng.js';
 import type { OkxCandleRow } from '../wire.js';
 
-export const BARS = ['1m', '3m', '5m', '15m', '30m', '1H', '2H', '4H', '6H', '12H', '1D', '1W'] as const;
+// Like OKX: plain 6H, 12H, 1D and 1W open on UTC+8 boundaries, the "utc" variants on UTC ones.
+export const BARS = ['1m', '3m', '5m', '15m', '30m', '1H', '2H', '4H', '6H', '12H', '1D', '1W', '6Hutc', '12Hutc', '1Dutc', '1Wutc'] as const;
 export type Bar = (typeof BARS)[number];
 
 const MINUTE = 60_000;
@@ -22,20 +23,28 @@ export const BAR_MS: Readonly<Record<Bar, number>> = {
   '12H': 12 * HOUR,
   '1D': DAY,
   '1W': 7 * DAY,
+  '6Hutc': 6 * HOUR,
+  '12Hutc': 12 * HOUR,
+  '1Dutc': DAY,
+  '1Wutc': 7 * DAY,
 };
+
+const UTC8_BARS: ReadonlySet<Bar> = new Set<Bar>(['6H', '12H', '1D', '1W']);
 
 export function isBar(s: string): s is Bar {
   return (BARS as readonly string[]).includes(s);
 }
 
-/** Open time of the bar containing `ts` (UTC; weeks start on Monday like OKX). */
+/**
+ * Open time of the bar containing `ts`. Weeks start on Monday like OKX; 6H, 12H, 1D and 1W
+ * follow the UTC+8 day (1D opens at 16:00 UTC), their utc variants the UTC day.
+ */
 export function barStart(bar: Bar, ts: number): number {
   const ms = BAR_MS[bar];
-  if (bar === '1W') {
-    const shift = 3 * DAY; // 1970-01-01 was a Thursday; shift so weeks begin on Monday
-    return Math.floor((ts + shift) / ms) * ms - shift;
-  }
-  return Math.floor(ts / ms) * ms;
+  // 1970-01-01 was a Thursday; shift so weeks begin on Monday
+  let shift = bar === '1W' || bar === '1Wutc' ? 3 * DAY : 0;
+  if (UTC8_BARS.has(bar)) shift += 8 * HOUR;
+  return Math.floor((ts + shift) / ms) * ms - shift;
 }
 
 export interface Candle {

@@ -1,8 +1,9 @@
 import { useMutation } from '@tanstack/react-query';
-import type { ConnState } from '@pegasus/shared';
+import type { ConnState, KillSwitchRequest } from '@pegasus/shared';
 import { api } from '../lib/api';
-import { errorMessage } from '../lib/http';
+import { errorMessage, isApiError } from '../lib/http';
 import { fmtNum, fmtSigned, signOf } from '../lib/format';
+import { killSwitchSweepNotice } from '../store/alerts';
 import { signOut } from '../store/session';
 import { useStore } from '../store/store';
 
@@ -14,13 +15,28 @@ function Dot({ label, state }: { label: string; state: ConnState | 'open' | 'con
   );
 }
 
+/** The second question of a release that the server refused with DAILY_LOSS_ACTIVE; `details` are that refusal's. */
+function rebaseQuestion(details: Record<string, unknown> | undefined): string {
+  const value = (key: string): string | null => {
+    const v = details?.[key];
+    return typeof v === 'string' ? v : null;
+  };
+  return [
+    `The daily loss limit is still in force: today's PnL is ${fmtSigned(value('dailyPnl'))} USD and the limit is -${fmtNum(value('limit'), 0)} USD.`,
+    `Release anyway? Today's loss so far is then no longer counted: daily PnL restarts at 0 from the current equity (${fmtNum(value('equity'))} USD) and the limit applies again from there.`,
+    'Do this only when the drop is not a trading loss, for example after moving money out of the account.',
+    '当日亏损仍超过限额。确认解除后，日内盈亏将从当前权益重新计算；仅在资金划出等非交易亏损时使用。',
+  ].join('\n\n');
+}
+
 export function Header() {
   const demo = useStore((s) => s.demo);
   const connection = useStore((s) => s.connection);
   const wsStatus = useStore((s) => s.wsStatus);
   const balance = useStore((s) => s.balance);
   const risk = useStore((s) => s.risk);
-  const applyMessage = useStore((s) => s.applyMessage);
+  const account = useStore((s) => s.account);
+  const applyRiskReply = useStore((s) => s.applyRiskReply);
   const pushToast = useStore((s) => s.pushToast);
 
   const killSwitch = risk?.killSwitch ?? false;
@@ -28,21 +44,29 @@ export function Header() {
   const dailyPnl = risk?.dailyPnl ?? null;
 
   const toggle = useMutation({
-    mutationFn: (enabled: boolean) =>
-      api.setKillSwitch(enabled ? { enabled, reason: 'manual (terminal)' } : { enabled }),
-    onSuccess: (state) => {
-      applyMessage({ type: 'risk', data: state });
-      pushToast('success', state.killSwitch ? 'Kill switch engaged: trading halted' : 'Kill switch released');
+    mutationFn: (body: KillSwitchRequest) => api.setKillSwitch(body),
+    onSuccess: (state, body) => {
+      applyRiskReply(state);
+      const released = body.rebase === true ? 'Kill switch released: daily PnL now counts from the current equity' : 'Kill switch released';
+      pushToast('success', state.killSwitch ? 'Kill switch engaged: trading halted' : released);
     },
-    onError: (e) => pushToast('error', errorMessage(e)),
+    onError: (e, body) => {
+      // The server refuses a plain release while the daily loss limit is still breached. Releasing anyway restarts
+      // the day's baseline, which is asked for separately and in plain words.
+      if (isApiError(e) && e.code === 'DAILY_LOSS_ACTIVE' && body.rebase !== true) {
+        if (window.confirm(rebaseQuestion(e.details))) toggle.mutate({ enabled: false, rebase: true });
+        return;
+      }
+      pushToast('error', errorMessage(e));
+    },
   });
 
   const onToggle = () => {
     const next = !killSwitch;
     const text = next
-      ? 'Engage the kill switch? New orders will be rejected until it is released.'
+      ? `Engage the kill switch?\n\n${killSwitchSweepNotice({ connection, account })}\n\nNew opening orders through Pegasus will be rejected until it is released.`
       : 'Release the kill switch and allow trading again?';
-    if (window.confirm(text)) toggle.mutate(next);
+    if (window.confirm(text)) toggle.mutate(next ? { enabled: true, reason: 'manual (terminal)' } : { enabled: false });
   };
 
   return (

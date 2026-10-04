@@ -44,6 +44,7 @@ export async function startMockOkx(opts: MockOkxOptions = {}): Promise<MockOkxHa
   const instruments = resolveInstruments(opts.instruments);
   const engine = new Engine({
     posMode: opts.posMode ?? 'net_mode',
+    perm: opts.perm ?? 'read_only,trade',
     instruments,
     initialPrices: { ...DEFAULT_PRICES, ...(opts.initialPrices ?? {}) },
     seed: opts.seed ?? 42,

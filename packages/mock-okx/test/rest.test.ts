@@ -83,6 +83,51 @@ describe('public REST', () => {
     expect((await rest(h, 'GET', '/api/v5/market/candles?instId=BTC-USDT-SWAP&bar=7m')).code).toBe('51000');
   });
 
+  it('aligns 6H, 12H, 1D and 1W to UTC+8 like OKX and serves the UTC-aligned variants', async () => {
+    const HOUR = 3_600_000;
+    const DAY = 24 * HOUR;
+    const opens = async (bar: string): Promise<number[]> => {
+      const r = await rest<OkxCandleRow>(h, 'GET', `/api/v5/market/candles?instId=BTC-USDT-SWAP&bar=${bar}&limit=3`);
+      expect(r.code).toBe('0');
+      expect(r.data).toHaveLength(3);
+      return r.data.map((row) => Number(row[0]));
+    };
+    // plain 1D is the UTC+8 day: it opens at 16:00 UTC
+    for (const ts of await opens('1D')) expect(ts % DAY).toBe(16 * HOUR);
+    for (const ts of await opens('1Dutc')) expect(ts % DAY).toBe(0);
+    for (const ts of await opens('12H')) expect(ts % (12 * HOUR)).toBe(4 * HOUR);
+    for (const ts of await opens('12Hutc')) expect(ts % (12 * HOUR)).toBe(0);
+    for (const ts of await opens('6H')) expect(ts % (6 * HOUR)).toBe(4 * HOUR);
+    for (const ts of await opens('6Hutc')) expect(ts % (6 * HOUR)).toBe(0);
+    // weeks open on Monday: 00:00 UTC+8 (Sunday 16:00 UTC) for 1W, 00:00 UTC for 1Wutc
+    for (const ts of await opens('1W')) expect([new Date(ts).getUTCDay(), new Date(ts).getUTCHours()]).toEqual([0, 16]);
+    for (const ts of await opens('1Wutc')) expect([new Date(ts).getUTCDay(), new Date(ts).getUTCHours()]).toEqual([1, 0]);
+    const hist = await rest<OkxCandleRow>(h, 'GET', '/api/v5/market/history-candles?instId=BTC-USDT-SWAP&bar=1Dutc&limit=5');
+    expect(hist.data).toHaveLength(5);
+  });
+
+  it('serves a deterministic per-instrument open interest history, newest first', async () => {
+    const path = '/api/v5/rubik/stat/contracts/open-interest-history?instId=BTC-USDT-SWAP&period=1Dutc';
+    const r = await rest<string[]>(h, 'GET', path);
+    expect(r.code).toBe('0');
+    expect(r.data).toHaveLength(100);
+    for (let i = 0; i < r.data.length; i++) {
+      const row = r.data[i];
+      expect(row).toHaveLength(4);
+      if (!row) continue;
+      // [ts, contracts, coin, USD]; BTC ctVal is 0.01
+      expect(Number(row[0]) % 86_400_000).toBe(0);
+      if (i > 0) expect(Number(row[0])).toBe(Number(r.data[i - 1]?.[0]) - 86_400_000);
+      expect(Number(row[2])).toBeCloseTo(Number(row[1]) * 0.01, 6);
+      expect(Number(row[3])).toBeGreaterThan(Number(row[2]));
+    }
+    const again = await rest<string[]>(h, 'GET', path);
+    expect(again.data.map((row) => row.slice(0, 3))).toEqual(r.data.map((row) => row.slice(0, 3)));
+    expect((await rest<string[]>(h, 'GET', `${path}&limit=12`)).data).toHaveLength(12);
+    expect((await rest(h, 'GET', '/api/v5/rubik/stat/contracts/open-interest-history?instId=NOPE-USDT-SWAP&period=1Dutc')).code).toBe('51001');
+    expect((await rest(h, 'GET', '/api/v5/rubik/stat/contracts/open-interest-history?instId=BTC-USDT-SWAP&period=7m')).code).toBe('51000');
+  });
+
   it('advances the market on tick() and setPrice()', async () => {
     h.setPrice('ETH-USDT-SWAP', '3100');
     const t = await rest<OkxTicker>(h, 'GET', '/api/v5/market/ticker?instId=ETH-USDT-SWAP');

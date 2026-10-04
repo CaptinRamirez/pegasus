@@ -62,6 +62,12 @@ describe('public websocket', () => {
     const c = await biz.next<{ data: string[][] }>(isData('candle1m'));
     expect(c.data[0]).toHaveLength(9);
     expect(c.data[0]?.[8]).toBe('0');
+    // the UTC-aligned daily channel exists next to the UTC+8 one, each with its own open time
+    biz.send({ op: 'subscribe', args: [{ channel: 'candle1Dutc', instId: BTC }, { channel: 'candle1D', instId: BTC }] });
+    const utc = await biz.next<{ data: string[][] }>(isData('candle1Dutc'));
+    expect(Number(utc.data[0]?.[0]) % 86_400_000).toBe(0);
+    const plus8 = await biz.next<{ data: string[][] }>(isData('candle1D'));
+    expect(Number(plus8.data[0]?.[0]) % 86_400_000).toBe(16 * 3_600_000);
     await biz.close();
   });
 

@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { pino } from 'pino';
 import type { Instrument, Order, Position, RiskConfig } from '@pegasus/shared';
 import { MemoryStore } from '../src/db/store.js';
@@ -40,7 +43,7 @@ function resting(instId: string, side: Order['side'], px: string, sz: string, ov
 function input(overrides: Partial<RiskCheckInput> = {}): RiskCheckInput {
   return {
     inst: BTC, side: 'buy', posSide: 'net', ordType: 'limit', contracts: '2', notional: '1000', px: '50000', refPrice: '50000', lever: '5',
-    estSlippagePct: '', reduceOnly: false, positions: [], openOrders: [], instrumentOf: (id) => INSTRUMENTS.get(id), ...overrides,
+    estSlippagePct: '', reduceOnly: false, positions: [], openOrders: [], reservations: [], instrumentOf: (id) => INSTRUMENTS.get(id), ...overrides,
   };
 }
 
@@ -84,9 +87,10 @@ describe('RiskEngine.check', () => {
     // half filled: 19 contracts remain -> 9,500 + 1,000 + 1,000 = 11,500 -> ok
     const half = [resting('BTC-USDT-SWAP', 'buy', '50000', '38', { accFillSz: '19' })];
     expect(engine().check(input({ notional: '1000', openOrders: half, positions })).ok).toBe(true);
-    // resting sells net against a long in net mode
+    // resting sells do not offset a long in net mode: they may never fill, so the buy is judged without them
     const sells = [resting('BTC-USDT-SWAP', 'sell', '50000', '38')];
-    expect(engine().check(input({ notional: '1000', openOrders: sells, positions: [position('BTC-USDT-SWAP', '19500')] })).ok).toBe(true);
+    expect(engine().check(input({ notional: '1000', openOrders: sells, positions: [position('BTC-USDT-SWAP', '19500')] })).code).toBe('MAX_POSITION_NOTIONAL');
+    expect(engine().check(input({ notional: '500', openOrders: sells, positions: [position('BTC-USDT-SWAP', '19500')] })).ok).toBe(true);
     // other instruments count towards the total with their own contract value
     const ethOrders = [resting('ETH-USDT-SWAP', 'buy', '3000', '95')]; // 95 * 0.1 ETH * 3000 = 28,500
     expect(engine().check(input({ notional: '1000', openOrders: ethOrders, positions: [position('BTC-USDT-SWAP', '1000')] })).code).toBe('MAX_TOTAL_NOTIONAL');
@@ -107,6 +111,53 @@ describe('RiskEngine.check', () => {
     expect(engine().check(input({ notional: '500', side: 'buy', posSide: 'long', positions: hedged, openOrders: restingOpen })).code).toBe('MAX_POSITION_NOTIONAL');
     const restingClose = [resting('BTC-USDT-SWAP', 'sell', '50000', '2', { posSide: 'long' })];
     expect(engine().check(input({ notional: '400', side: 'buy', posSide: 'long', positions: hedged, openOrders: restingClose })).ok).toBe(true);
+  });
+  it('net mode: projects the worst case of each side, so a resting sell never makes room for more buys', () => {
+    const positions = [position('BTC-USDT-SWAP', '15000')];
+    const sell = [resting('BTC-USDT-SWAP', 'sell', '50000', '40')]; // 20,000 resting on the other side
+    // long 15,000 + this buy 5,000 = 20,000 -> at the limit
+    expect(engine().check(input({ notional: '5000', openOrders: sell, positions })).ok).toBe(true);
+    const moreBuys = [...sell, resting('BTC-USDT-SWAP', 'buy', '49000', '10')]; // + 4,900 resting buys
+    const res = engine().check(input({ notional: '1000', openOrders: moreBuys, positions }));
+    expect(res.code).toBe('MAX_POSITION_NOTIONAL');
+    expect(res.details).toMatchObject({ current: '19900.00', projected: '20900.00' });
+    // the short side is judged the same way: -15,000 + resting sells 20,000 + this sell 4,000 = 9,000
+    expect(engine().check(input({ notional: '4000', side: 'sell', openOrders: sell, positions })).ok).toBe(true);
+    // ... and with 12,240 more resting sells it is 21,240
+    expect(engine().check(input({ notional: '4000', side: 'sell', openOrders: [...sell, resting('BTC-USDT-SWAP', 'sell', '51000', '24')], positions })).code).toBe('MAX_POSITION_NOTIONAL');
+  });
+  it('fails closed when the contract value of a resting opening order is unknown', () => {
+    const foreign = [resting('PEPE-USDT-SWAP', 'buy', '0.00001', '1000')];
+    const res = engine().check(input({ openOrders: foreign }));
+    expect(res).toMatchObject({ ok: false, code: 'EXPOSURE_UNKNOWN', details: { instId: 'PEPE-USDT-SWAP' } });
+    // an exit on that instrument adds no exposure, so it does not need the spec
+    expect(engine().check(input({ openOrders: [resting('PEPE-USDT-SWAP', 'sell', '0.00001', '1000', { reduceOnly: true })] })).ok).toBe(true);
+    expect(engine().check(input({ posSide: 'long', openOrders: [resting('PEPE-USDT-SWAP', 'sell', '0.00001', '1000', { posSide: 'long' })] })).ok).toBe(true);
+    // with the spec it is counted like any other instrument: 1000 * 10^7 * 0.00001 = 100,000
+    const PEPE: Instrument = { ...BTC, instId: 'PEPE-USDT-SWAP', ctVal: '10000000', ctValCcy: 'PEPE', tickSz: '0.000000001' };
+    const known = input({ openOrders: foreign, instrumentOf: (id) => (id === PEPE.instId ? PEPE : INSTRUMENTS.get(id)) });
+    expect(engine().check(known).code).toBe('MAX_TOTAL_NOTIONAL');
+  });
+  it('long/short mode: a resting exit on another instrument adds no exposure', () => {
+    const positions = [position('ETH-USDT-SWAP', '20000', 'long', '66')];
+    const takeProfit = [resting('ETH-USDT-SWAP', 'sell', '3100', '66', { posSide: 'long' })]; // 20,460 if it were counted
+    expect(engine().check(input({ notional: '5000', posSide: 'long', positions, openOrders: takeProfit })).ok).toBe(true);
+    // a resting opening order on the other instrument still counts: 20,000 + 9,000 + 5,000 > 30,000
+    const opening = [resting('ETH-USDT-SWAP', 'buy', '3000', '30', { posSide: 'long' })];
+    expect(engine().check(input({ notional: '5000', posSide: 'long', positions, openOrders: opening })).code).toBe('MAX_TOTAL_NOTIONAL');
+  });
+  it('counts accepted orders the mirror does not show yet (reservations)', () => {
+    const reserved = (overrides: Partial<RiskCheckInput['reservations'][number]> = {}) => ({ clOrdId: 'c1', instId: 'BTC-USDT-SWAP', side: 'buy' as const, posSide: 'net' as const, notional: '19500', ...overrides });
+    expect(engine().check(input({ notional: '1000', reservations: [reserved()] })).code).toBe('MAX_POSITION_NOTIONAL');
+    expect(engine().check(input({ notional: '500', reservations: [reserved()] })).ok).toBe(true);
+    // long/short mode: the reservation sits on its own leg and the legs are gross
+    expect(engine().check(input({ notional: '1000', posSide: 'short', side: 'sell', reservations: [reserved({ posSide: 'long' })] })).code).toBe('MAX_POSITION_NOTIONAL');
+    // another instrument: it counts towards the total only
+    expect(engine().check(input({ notional: '5000', reservations: [reserved({ instId: 'ETH-USDT-SWAP', notional: '26000' })] })).code).toBe('MAX_TOTAL_NOTIONAL');
+    // once the order rests in the mirror only the part that is no longer resting stays reserved
+    const mirrored = [resting('BTC-USDT-SWAP', 'buy', '50000', '39', { clOrdId: 'c1', accFillSz: '19' })]; // 10,000 still resting of 19,500
+    const res = engine().check(input({ notional: '1000', openOrders: mirrored, reservations: [reserved()] }));
+    expect(res.details).toMatchObject({ current: '19500.00', projected: '20500.00' });
   });
   it('enforces the price band against the reference price', () => {
     expect(engine().check(input({ px: '52600', refPrice: '50000' })).code).toBe('PRICE_BAND');
@@ -169,6 +220,15 @@ describe('RiskEngine daily loss', () => {
     expect(saved?.dayStartEquity).toBe('9500');
   });
 
+  it('ignores an empty equity instead of reading it as zero', () => {
+    const e = new RiskEngine(config, new MemoryStore(), log, () => Date.UTC(2026, 0, 1, 12));
+    e.updateEquity('');
+    expect(e.state.dayStartEquity).toBe('');
+    e.updateEquity('10000');
+    e.updateEquity('');
+    expect(e.state).toMatchObject({ currentEquity: '10000', dailyPnl: '0', killSwitch: false, dayStartEquity: '10000' });
+  });
+
   it('keeps a manual kill switch across days and restores it from the store', async () => {
     let now = Date.UTC(2026, 0, 1, 12);
     const store = new MemoryStore();
@@ -183,5 +243,232 @@ describe('RiskEngine daily loss', () => {
     await e2.init();
     expect(e2.state.killSwitch).toBe(true);
     expect(e2.state.killSwitchReason).toBe('MANUAL: lunch');
+  });
+
+  it('reports when the baseline was taken', () => {
+    let now = Date.UTC(2026, 0, 1, 9, 12);
+    const e = new RiskEngine(config, new MemoryStore(), log, () => now);
+    expect(e.state.baselineTs).toBe(0);
+    e.updateEquity('10000');
+    expect(e.state.baselineTs).toBe(Date.UTC(2026, 0, 1, 9, 12));
+    now = Date.UTC(2026, 0, 1, 15);
+    e.updateEquity('10100');
+    expect(e.state.baselineTs).toBe(Date.UTC(2026, 0, 1, 9, 12));
+    now = Date.UTC(2026, 0, 2, 0, 0, 20);
+    e.updateEquity('10100');
+    expect(e.state).toMatchObject({ dayStartTs: Date.UTC(2026, 0, 2), baselineTs: Date.UTC(2026, 0, 2, 0, 0, 20) });
+  });
+});
+
+describe('RiskEngine across a restart with a state file', () => {
+  const DAY1 = Date.UTC(2026, 0, 1, 12);
+  let dir: string;
+  let file: string;
+  let now: number;
+  /** A fresh process: a new store reading the same file, and a new engine. */
+  const boot = async (): Promise<RiskEngine> => {
+    const e = new RiskEngine(config, new MemoryStore(file), log, () => now);
+    await e.init();
+    return e;
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'pegasus-risk-'));
+    file = join(dir, 'state.json');
+    now = DAY1;
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('restores the daily-loss halt and the day baseline on the same UTC day', async () => {
+    const e = await boot();
+    e.updateEquity('100000');
+    now = DAY1 + 3_600_000;
+    e.updateEquity('98900');
+    expect(e.state.killSwitch).toBe(true);
+
+    now = DAY1 + 2 * 3_600_000;
+    const e2 = await boot();
+    expect(e2.state).toMatchObject({ killSwitch: true, dayStartEquity: '100000', baselineTs: DAY1 });
+    expect(e2.state.killSwitchReason).toMatch(/^DAILY_LOSS_LIMIT/);
+    e2.updateEquity('98900');
+    expect(e2.state).toMatchObject({ killSwitch: true, dayStartEquity: '100000', dailyPnl: '-1100' });
+    expect(e2.check(input()).code).toBe('KILL_SWITCH');
+  });
+
+  it('restores the baseline without a halt, so the loss before the restart still counts', async () => {
+    const e = await boot();
+    e.updateEquity('100000');
+    e.updateEquity('99500');
+    const e2 = await boot();
+    expect(e2.state.killSwitch).toBe(false);
+    e2.updateEquity('99000');
+    expect(e2.state).toMatchObject({ killSwitch: true, dailyPnl: '-1000' });
+  });
+
+  it('a new UTC day clears an automatic halt at start-up but never a manual one', async () => {
+    const e = await boot();
+    e.updateEquity('100000');
+    e.updateEquity('98900');
+    now = Date.UTC(2026, 0, 2, 9);
+    const next = await boot();
+    // already at start-up, before the first equity: the cancel sweep must not run for yesterday's halt
+    expect(next.state).toMatchObject({ killSwitch: false, killSwitchReason: '', dayStartEquity: '' });
+    next.updateEquity('98900');
+    expect(next.state).toMatchObject({ killSwitch: false, dayStartEquity: '98900', dailyPnl: '0', baselineTs: now });
+    // and it stays cleared for the next start
+    expect((await boot()).state.killSwitch).toBe(false);
+
+    next.setKillSwitch(true, 'manual (terminal)');
+    now = Date.UTC(2026, 0, 3, 9);
+    const later = await boot();
+    expect(later.state).toMatchObject({ killSwitch: true, killSwitchReason: 'manual (terminal)' });
+    later.updateEquity('98900');
+    expect(later.state.killSwitch).toBe(true);
+  });
+
+  it('fails closed on a state file that cannot be read: the kill switch is on and the reason names the file', async () => {
+    for (const text of ['{"settings": {"risk.state": {"killSw', '{"settings": {"risk.state": {"killSwitch": "no"}}}']) {
+      writeFileSync(file, text);
+      const errors: string[] = [];
+      const e = new RiskEngine(config, new MemoryStore(file), pino({ level: 'error' }, { write: (line: string) => errors.push(line) }), () => now);
+      await e.init();
+      expect(e.state.killSwitch).toBe(true);
+      expect(e.state.killSwitchReason).toMatch(/^STATE_FILE_UNREADABLE/);
+      expect(e.state.killSwitchReason).toContain('state.json');
+      expect(errors).toHaveLength(1);
+      expect(e.check(input()).code).toBe('KILL_SWITCH');
+      // it is a halt like a manual one: kept across restarts and days until it is released by hand
+      now += 86_400_000;
+      const e2 = await boot();
+      e2.updateEquity('100000');
+      expect(e2.state.killSwitchReason).toMatch(/^STATE_FILE_UNREADABLE/);
+      e2.setKillSwitch(false, '');
+      expect((await boot()).state.killSwitch).toBe(false);
+    }
+  });
+
+  it('still fails closed when the first start after the damage ended before the engine started', async () => {
+    const text = '{"settings": {"risk.state": {"killSw';
+    writeFileSync(file, text);
+    new MemoryStore(file); // a start that died early: OKX unreachable, the window closed
+    const e = await boot();
+    expect(e.state.killSwitch).toBe(true);
+    expect(e.state.killSwitchReason).toMatch(/^STATE_FILE_UNREADABLE/);
+    expect(readFileSync(`${file}.corrupt`, 'utf8')).toBe(text);
+    // the halt is now saved in a readable file and restored like any other
+    const e2 = await boot();
+    expect(e2.state.killSwitch).toBe(true);
+    expect(e2.state.killSwitchReason).toBe(e.state.killSwitchReason);
+  });
+
+  it('remembers a completed cancel sweep with the halt, and forgets it when the halt ends', async () => {
+    const saved = (): unknown => (JSON.parse(readFileSync(file, 'utf8')) as { settings: Record<string, unknown> }).settings['risk.state'];
+    const e = await boot();
+    e.setKillSwitch(true, 'manual (terminal)');
+    e.setCancelSweep('pending', 'cancelling open orders');
+    expect(saved()).toMatchObject({ killSwitch: true, sweepDone: false });
+    expect((await boot()).state.cancelSweep.state).toBe('idle');
+
+    e.setCancelSweep('done', 'open orders cancelled');
+    expect(saved()).toMatchObject({ killSwitch: true, sweepDone: true });
+    const e2 = await boot();
+    expect(e2.state.killSwitch).toBe(true);
+    expect(e2.state.cancelSweep).toMatchObject({ state: 'done', message: 'open orders cancelled before the restart' });
+
+    e2.setKillSwitch(false, '');
+    expect(saved()).toMatchObject({ killSwitch: false, sweepDone: false });
+    e2.setKillSwitch(true, 'again');
+    expect(saved()).toMatchObject({ killSwitch: true, sweepDone: false });
+    expect((await boot()).state.cancelSweep.state).toBe('idle');
+  });
+
+  it('a daily-loss halt keeps its completed sweep on the same day only, and a new trip starts without one', async () => {
+    const e = await boot();
+    e.updateEquity('100000');
+    e.updateEquity('98900');
+    e.setCancelSweep('done', 'open orders cancelled');
+    expect((await boot()).state.cancelSweep.state).toBe('done');
+
+    now = Date.UTC(2026, 0, 2, 9);
+    const next = await boot();
+    expect(next.state).toMatchObject({ killSwitch: false, cancelSweep: { state: 'idle' } });
+    next.updateEquity('98900');
+    next.updateEquity('97800');
+    expect(next.state.killSwitch).toBe(true);
+    expect((await boot()).state.cancelSweep.state).toBe('idle');
+  });
+
+  it('accepts a state saved before the sweep was recorded, and rejects one where it is not a boolean', async () => {
+    writeFileSync(file, JSON.stringify({ settings: { 'risk.state': { killSwitch: true, killSwitchReason: 'manual (terminal)', dayStartTs: Date.UTC(2026, 0, 1), dayStartEquity: '100000' } } }));
+    const e = await boot();
+    expect(e.state).toMatchObject({ killSwitch: true, killSwitchReason: 'manual (terminal)', cancelSweep: { state: 'idle' } });
+
+    writeFileSync(file, JSON.stringify({ settings: { 'risk.state': { killSwitch: false, killSwitchReason: '', dayStartTs: Date.UTC(2026, 0, 1), dayStartEquity: '', sweepDone: 'yes' } } }));
+    expect((await boot()).state.killSwitchReason).toMatch(/^STATE_FILE_UNREADABLE/);
+  });
+});
+
+describe('RiskEngine releasing the kill switch while the daily loss limit is breached', () => {
+  const T0 = Date.UTC(2026, 0, 1, 12);
+  function breached() {
+    const clock = { now: T0 };
+    const store = new MemoryStore();
+    const e = new RiskEngine(config, store, log, () => clock.now);
+    e.updateEquity('100000');
+    e.updateEquity('98900');
+    expect(e.state.killSwitch).toBe(true);
+    return { e, store, clock };
+  }
+
+  it('refuses a plain release and leaves the halt on', () => {
+    const { e } = breached();
+    let thrown: unknown;
+    try {
+      e.setKillSwitch(false, '');
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toMatchObject({ code: 'DAILY_LOSS_ACTIVE', status: 409, details: { dailyPnl: '-1100', limit: '1000', equity: '98900' } });
+    expect(e.state.killSwitch).toBe(true);
+    expect(e.state.killSwitchReason).toMatch(/^DAILY_LOSS_LIMIT/);
+  });
+
+  it('with rebase: releases, restarts the baseline at the current equity, records it, and the limit trips again from there', async () => {
+    const { e, store, clock } = breached();
+    clock.now = T0 + 60_000;
+    const state = e.setKillSwitch(false, '', true);
+    expect(state).toMatchObject({ killSwitch: false, killSwitchReason: '', dayStartEquity: '98900', dailyPnl: '0', baselineTs: T0 + 60_000, dayStartTs: Date.UTC(2026, 0, 1) });
+    expect(store.riskEvents.map((ev) => ev.type)).toContain('DAILY_BASELINE_REBASED');
+    expect(store.riskEvents.find((ev) => ev.type === 'DAILY_BASELINE_REBASED')?.detail).toMatchObject({ from: '100000', to: '98900', dailyPnl: '-1100' });
+    expect(await store.getSetting('risk.state')).toMatchObject({ killSwitch: false, dayStartEquity: '98900', baselineTs: T0 + 60_000 });
+    // the next balance event no longer re-engages it ...
+    e.updateEquity('98900');
+    expect(e.state.killSwitch).toBe(false);
+    e.updateEquity('98000');
+    expect(e.state).toMatchObject({ killSwitch: false, dailyPnl: '-900' });
+    // ... until the limit is lost again from the new baseline
+    e.updateEquity('97900');
+    expect(e.state.killSwitch).toBe(true);
+    expect(e.state.killSwitchReason).toMatch(/^DAILY_LOSS_LIMIT/);
+  });
+
+  it('a release is not refused once the loss no longer applies, and rebase then changes nothing', () => {
+    const { e } = breached();
+    e.updateEquity('99500');
+    expect(e.state.killSwitch).toBe(true);
+    e.setKillSwitch(false, '', true);
+    expect(e.state).toMatchObject({ killSwitch: false, dayStartEquity: '100000', dailyPnl: '-500', baselineTs: T0 });
+  });
+
+  it('engaging is never refused, and a manual halt releases as before', () => {
+    const { e } = breached();
+    e.setKillSwitch(true, 'manual (terminal)', true);
+    expect(e.state).toMatchObject({ killSwitch: true, killSwitchReason: 'manual (terminal)', dayStartEquity: '100000' });
+    const calm = new RiskEngine(config, new MemoryStore(), log, () => T0);
+    calm.updateEquity('100000');
+    calm.setKillSwitch(true, 'manual (terminal)');
+    expect(calm.setKillSwitch(false, '').killSwitch).toBe(false);
   });
 });

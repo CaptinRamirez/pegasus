@@ -1,3 +1,5 @@
+import { copyFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { Fill, Order } from '@pegasus/shared';
 
 export interface ListOrdersOptions {
@@ -19,6 +21,8 @@ export interface ListFillsOptions {
  */
 export interface Store {
   readonly kind: 'memory' | 'postgres';
+  /** Where the settings are kept, for messages to the owner: a file path, or a description */
+  readonly settingsLocation: string;
   upsertOrder(order: Order): Promise<void>;
   upsertFill(fill: Fill): Promise<void>;
   listOrders(opts: ListOrdersOptions): Promise<Order[]>;
@@ -29,12 +33,47 @@ export interface Store {
   close(): Promise<void>;
 }
 
+/**
+ * Orders, fills and risk events live in memory only. The settings (the kill switch and the day baseline) are also
+ * written to `stateFile` when one is given, so that a halt survives closing and reopening the terminal.
+ */
 export class MemoryStore implements Store {
   readonly kind = 'memory' as const;
   private readonly orders = new Map<string, Order>();
   private readonly fills = new Map<string, Fill>();
   private readonly settings = new Map<string, unknown>();
   readonly riskEvents: Array<{ ts: number; type: string; detail: Record<string, unknown> }> = [];
+  /** Set when the state file exists but could not be read: what it held is unknown, so reads fail until the settings are written again. */
+  private unreadable: Error | null = null;
+
+  readonly settingsLocation: string;
+
+  constructor(private readonly stateFile?: string) {
+    this.settingsLocation = stateFile ?? 'memory';
+    if (stateFile === undefined) return;
+    let text: string;
+    try {
+      text = readFileSync(stateFile, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return; // first start
+      this.unreadable = new Error(`the state file ${stateFile} could not be read (${(err as Error).message})`);
+      return;
+    }
+    try {
+      const saved = (JSON.parse(text) as { settings?: unknown } | null)?.settings;
+      if (typeof saved !== 'object' || saved === null || Array.isArray(saved)) throw new Error('no settings object in it');
+      for (const [key, value] of Object.entries(saved)) this.settings.set(key, value);
+    } catch (err) {
+      this.unreadable = new Error(`the state file ${stateFile} could not be parsed (${(err as Error).message})`);
+      // A copy is kept aside for inspection. The bad file itself stays until the next write replaces it: a start
+      // that ends before that write must leave the damage for the following start to find, not a missing file.
+      try {
+        copyFileSync(stateFile, `${stateFile}.corrupt`);
+      } catch {
+        // best effort
+      }
+    }
+  }
 
   async upsertOrder(order: Order): Promise<void> {
     const prev = this.orders.get(order.ordId);
@@ -66,11 +105,19 @@ export class MemoryStore implements Store {
   }
 
   async getSetting<T>(key: string): Promise<T | null> {
+    if (this.unreadable) throw this.unreadable;
     return this.settings.has(key) ? (this.settings.get(key) as T) : null;
   }
 
   async setSetting<T>(key: string, value: T): Promise<void> {
     this.settings.set(key, value);
+    this.unreadable = null;
+    if (this.stateFile === undefined) return;
+    // Synchronous, so two writes can never interleave; through a temporary file, so a crash mid-write never leaves half a file.
+    const tmp = `${this.stateFile}.tmp`;
+    mkdirSync(dirname(this.stateFile), { recursive: true });
+    writeFileSync(tmp, `${JSON.stringify({ settings: Object.fromEntries(this.settings) }, null, 2)}\n`);
+    renameSync(tmp, this.stateFile);
   }
 
   async addRiskEvent(type: string, detail: Record<string, unknown>): Promise<void> {

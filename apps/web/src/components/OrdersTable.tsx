@@ -1,10 +1,21 @@
 import { useMemo } from 'react';
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import type { Order } from '@pegasus/shared';
 import { api } from '../lib/api';
 import { errorMessage } from '../lib/http';
-import { fmtContracts, fmtDateTime, fmtPx, fmtSigned, signOf } from '../lib/format';
-import { useStore } from '../store/store';
+import { ORDER_HISTORY_QUERY } from '../hooks/useSession';
+import { UNTRACKED_TITLE, fmtContracts, fmtDateTime, fmtPx, fmtSigned, signOf } from '../lib/format';
+import { accountUnknown, type AccountUnknown } from '../store/alerts';
+import { blockTitle, getTradingBlock, useStore } from '../store/store';
+import { LoadFailed } from './LoadFailed';
+
+const UNKNOWN_TEXT: Record<AccountUnknown, string> = {
+  waiting: 'Waiting for server…',
+  disabled: 'No API key configured: orders are not shown',
+  loading: 'Loading orders…',
+  failed: 'Orders not loaded (see the warning above)',
+  unloaded: 'Account not loaded',
+};
 
 interface Props {
   mode: 'open' | 'history';
@@ -14,7 +25,14 @@ export function OrdersTable({ mode }: Props) {
   const orders = useStore((s) => s.orders);
   const history = useStore((s) => s.orderHistory);
   const instruments = useStore((s) => s.instruments);
+  const tradingBlock = useStore(getTradingBlock);
+  const unknown = useStore(accountUnknown);
   const pushToast = useStore((s) => s.pushToast);
+  const blockedTitle = tradingBlock === null ? {} : { title: blockTitle(tradingBlock) };
+  // The seed of the history; live pushes alone would leave it empty or partial without saying so.
+  const seed = useQuery({ ...ORDER_HISTORY_QUERY, enabled: mode === 'history' });
+  const seedFailed = mode === 'history' && seed.isError;
+  const retry = () => void seed.refetch();
 
   const rows = useMemo<Order[]>(
     () => (mode === 'open' ? Object.values(orders).sort((a, b) => b.cTime - a.cTime) : history),
@@ -36,10 +54,18 @@ export function OrdersTable({ mode }: Props) {
     if (window.confirm(`Cancel all ${rows.length} open orders?`)) cancelAll.mutate();
   };
 
-  if (rows.length === 0) return <div className="empty">{mode === 'open' ? 'No open orders' : 'No order history'}</div>;
+  if (rows.length === 0) {
+    if (mode === 'open') return <div className="empty">{unknown === null ? 'No open orders' : UNKNOWN_TEXT[unknown]}</div>;
+    return <div className="empty">{seedFailed ? <LoadFailed what="order history" busy={seed.isFetching} onRetry={retry} /> : 'No order history'}</div>;
+  }
 
   return (
     <table className="table">
+      {seedFailed && (
+        <caption className="as-of">
+          <LoadFailed what="earlier orders" busy={seed.isFetching} onRetry={retry} />
+        </caption>
+      )}
       <thead>
         <tr>
           <th>Time</th>
@@ -55,7 +81,7 @@ export function OrdersTable({ mode }: Props) {
           {mode === 'history' && <th>PnL</th>}
           {mode === 'open' && (
             <th>
-              <button className="btn btn-sm btn-danger" onClick={onCancelAll} disabled={cancelAll.isPending}>
+              <button className="btn btn-sm btn-danger" onClick={onCancelAll} disabled={cancelAll.isPending || tradingBlock !== null} {...blockedTitle}>
                 Cancel all
               </button>
             </th>
@@ -68,7 +94,14 @@ export function OrdersTable({ mode }: Props) {
           return (
             <tr key={o.ordId} className="num">
               <td className="left muted">{fmtDateTime(mode === 'open' ? o.cTime : o.uTime)}</td>
-              <td className="left">{o.instId}</td>
+              <td className="left">
+                {o.instId}
+                {inst === undefined && (
+                  <span className="untracked-tag" title={UNTRACKED_TITLE}>
+                    untracked
+                  </span>
+                )}
+              </td>
               <td className={`left ${o.side === 'buy' ? 'pos' : 'neg'}`}>
                 {o.side}
                 {o.posSide !== 'net' ? ` ${o.posSide}` : ''}
@@ -88,7 +121,7 @@ export function OrdersTable({ mode }: Props) {
               {mode === 'history' && <td className={signOf(o.pnl)}>{fmtSigned(o.pnl, 4)}</td>}
               {mode === 'open' && (
                 <td>
-                  <button className="btn btn-sm" onClick={() => cancel.mutate(o)} disabled={cancel.isPending}>
+                  <button className="btn btn-sm" onClick={() => cancel.mutate(o)} disabled={cancel.isPending || tradingBlock !== null} {...blockedTitle}>
                     Cancel
                   </button>
                 </td>

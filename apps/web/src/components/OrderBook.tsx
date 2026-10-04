@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import { D, ZERO, type BookLevel, type Decimal, type Instrument } from '@pegasus/shared';
 import { Panel } from './Panel';
 import { fmtCoin, fmtPct, fmtPx } from '../lib/format';
+import { isStreamStale } from '../store/alerts';
 import { getSelectedInstrument, getSelectedMarket, useStore } from '../store/store';
 
 const DEPTH = 20;
@@ -40,6 +41,7 @@ function BookRow({ row, side, max, inst, onPick }: { row: Row; side: 'bid' | 'as
 export function OrderBook() {
   const inst = useStore(getSelectedInstrument);
   const book = useStore((s) => getSelectedMarket(s).book);
+  const stale = useStore((s) => isStreamStale(s, s.selectedInstId, 'book')) && book !== null;
   const setTicketPrice = useStore((s) => s.setTicketPrice);
 
   const { bids, asks, max, spread, spreadPct } = useMemo(() => {
@@ -61,7 +63,7 @@ export function OrderBook() {
   }, [book]);
 
   return (
-    <Panel title="Order book" className="panel-book">
+    <Panel title="Order book" className={`panel-book${stale ? ' panel-stale' : ''}`} extra={stale ? <span className="stale-tag" title="The order book stopped updating; these levels are not current">STALE</span> : null}>
       {book === null ? (
         <div className="empty">No book data</div>
       ) : (

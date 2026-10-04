@@ -36,13 +36,16 @@ describe('LocalOrderBook', () => {
     expect(b.apply('update', data([['1', '1']], [], { seqId: 1, prevSeqId: 0 }))).toMatch(/before snapshot/);
   });
 
-  it('verifies the checksum', () => {
+  it('does not verify the retired checksum: a frame with a wrong non-zero value is accepted', () => {
     const b = new LocalOrderBook('BTC-USDT-SWAP');
     const bids: Array<[string, string]> = [['101', '2'], ['100', '1']];
     const asks: Array<[string, string]> = [['102', '5'], ['103', '1']];
     const good = bookChecksum(bids, asks);
     expect(b.apply('snapshot', data(bids, asks, { seqId: 1, prevSeqId: -1, checksum: good }))).toBeNull();
-    expect(b.apply('update', data([['100', '0']], [], { seqId: 2, prevSeqId: 1, checksum: good }))).toMatch(/checksum mismatch/);
+    // `good` no longer matches the book once the 100 bid is removed
+    expect(b.apply('update', data([['100', '0']], [], { seqId: 2, prevSeqId: 1, checksum: good }))).toBeNull();
+    expect(b.topBids(5)).toEqual([['101', '2']]);
+    expect(b.apply('update', data([], [['102', '1']], { seqId: 4, prevSeqId: 3, checksum: good }))).toMatch(/sequence gap/);
     b.reset();
     expect(b.ready).toBe(false);
   });

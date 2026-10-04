@@ -1,4 +1,5 @@
-import type { Candle, Fill, HelloPayload, Order, ServerMessage, Trade } from '@pegasus/shared';
+import type { Candle, Fill, HelloPayload, Order, RiskState, ServerMessage, Trade } from '@pegasus/shared';
+import type { WsStatus } from '../lib/ws';
 import { LIMITS, emptyMarket, type MarketData, type TerminalState, type ToastKind } from './types';
 
 /**
@@ -30,10 +31,12 @@ export function applyServerMessage(state: TerminalState, msg: ServerMessage): Pa
       return { positions: msg.data };
     case 'balance':
       return { balance: msg.data };
+    case 'account':
+      return { account: msg.data };
     case 'risk':
       return { risk: msg.data };
     case 'connection':
-      return { connection: msg.data };
+      return { connection: msg.data, accountLoaded: state.accountLoaded || msg.data.account.lastSyncAt !== null };
     case 'subscribed':
       return {};
     case 'error':
@@ -41,6 +44,31 @@ export function applyServerMessage(state: TerminalState, msg: ServerMessage): Pa
     case 'pong':
       return {};
   }
+}
+
+/** Receive times kept next to the message's own changes: every message proves the server is alive. */
+export function stampMessage(state: TerminalState, msg: ServerMessage, now: number): Partial<TerminalState> {
+  if (msg.type !== 'hello' && msg.type !== 'connection') return { lastMessageAt: now };
+  const connection = msg.type === 'hello' ? msg.data.connection : msg.data;
+  const privateDownSince = connection.okxPrivate === 'connected' ? null : (state.privateDownSince ?? now);
+  return { lastMessageAt: now, connectionAt: now, privateDownSince };
+}
+
+/**
+ * A risk state that came back from an HTTP call. Not routed through applyServerMessage: only messages
+ * from the socket may move lastMessageAt, the time the disconnect banner quotes.
+ */
+export function applyRiskReply(risk: RiskState): Partial<TerminalState> {
+  return { risk };
+}
+
+/**
+ * The socket to the server changed state. While it is not open nothing the server said about its exchange
+ * connections is known to hold, so that status is dropped instead of being shown as current.
+ */
+export function applyWsStatus(state: TerminalState, status: WsStatus, now: number): Partial<TerminalState> {
+  if (status === 'open') return { wsStatus: status, wsDownSince: null };
+  return { wsStatus: status, connection: null, connectionAt: null, privateDownSince: null, wsDownSince: state.wsDownSince ?? now };
 }
 
 export function applyHello(state: TerminalState, data: HelloPayload): Partial<TerminalState> {
@@ -65,6 +93,8 @@ export function applyHello(state: TerminalState, data: HelloPayload): Partial<Te
     risk: data.risk,
     connection: data.connection,
     balance: data.balance,
+    // hello replaces positions, orders and balance wholesale, so it also decides whether they are loaded
+    accountLoaded: data.connection.account.lastSyncAt !== null,
     positions: data.positions,
     orders,
     serverTime: data.serverTime,

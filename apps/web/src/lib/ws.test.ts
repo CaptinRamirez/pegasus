@@ -136,6 +136,37 @@ describe('WsClient', () => {
     expect(FakeSocket.instances).toHaveLength(5);
   });
 
+  it('replaces a socket that is open but silent for 20 s', () => {
+    const { client, statuses } = make();
+    client.connect();
+    client.send({ type: 'subscribe', instId: 'BTC-USDT-SWAP', bar: '1m' });
+    const first = last();
+    first.open();
+    // the server speaks at least every 5 s: no timeout while it does
+    for (let i = 0; i < 12; i += 1) {
+      vi.advanceTimersByTime(5_000);
+      first.receive({ type: 'pong', data: { ts: i } });
+    }
+    expect(FakeSocket.instances).toHaveLength(1);
+    expect(statuses).toEqual(['connecting', 'open']);
+
+    // it goes quiet without ever closing
+    vi.advanceTimersByTime(19_000);
+    expect(statuses).toEqual(['connecting', 'open']);
+    vi.advanceTimersByTime(6_000);
+    expect(statuses).toEqual(['connecting', 'open', 'closed']);
+    expect(first.readyState).toBe(FakeSocket.CLOSED);
+    vi.advanceTimersByTime(1_300);
+    expect(FakeSocket.instances).toHaveLength(2);
+    last().open();
+    expect(last().sent).toEqual([JSON.stringify({ type: 'subscribe', instId: 'BTC-USDT-SWAP', bar: '1m' })]);
+    // the abandoned socket can no longer disturb the new one
+    first.onclose?.();
+    first.receive({ type: 'pong', data: { ts: 99 } });
+    expect(statuses[statuses.length - 1]).toBe('open');
+    client.close();
+  });
+
   it('forgets the subscription after unsubscribe', () => {
     const { client } = make();
     client.connect();

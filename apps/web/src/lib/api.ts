@@ -10,7 +10,6 @@ import type {
   Fill,
   FillsQuery,
   Instrument,
-  InstrumentSignalReport,
   KillSwitchRequest,
   OrdType,
   Order,
@@ -25,6 +24,7 @@ import type {
   RiskState,
   SetLeverageRequest,
   Side,
+  SignalsResponse,
   TdMode,
   Ticker,
 } from '@pegasus/shared';
@@ -40,7 +40,7 @@ export interface HealthResponse {
 }
 
 export interface AccountResponse {
-  config: AccountConfig;
+  config: AccountConfig | null;
   balance: Balance | null;
 }
 
@@ -69,23 +69,6 @@ export type SignalsQuery = {
   riskPct?: string;
   maxNotionalPct?: string;
 };
-
-export interface SignalReportError {
-  instId: string;
-  error: { code: string; message: string };
-}
-
-export type SignalReportRow = InstrumentSignalReport | SignalReportError;
-
-export interface SignalsResponse {
-  generatedAt: number;
-  equity: string | null;
-  reports: SignalReportRow[];
-}
-
-export function isSignalReportError(row: SignalReportRow): row is SignalReportError {
-  return 'error' in row;
-}
 
 export const api = {
   health: () => http<HealthResponse>('/api/health'),

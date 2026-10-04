@@ -21,6 +21,8 @@ async function main(): Promise<void> {
   };
   if (apiKey && apiSecret && passphrase) opts.credentials = { apiKey, apiSecret, passphrase };
   if (posModeEnv === 'net_mode' || posModeEnv === 'long_short_mode') opts.posMode = posModeEnv;
+  const perm = process.env['MOCK_OKX_PERM'];
+  if (perm) opts.perm = perm;
   const balance = process.env['MOCK_OKX_INITIAL_BALANCE'];
   if (balance) opts.initialBalanceUsdt = balance;
 
@@ -29,7 +31,7 @@ async function main(): Promise<void> {
   console.log(`mock-okx WS public ${handle.wsPublicUrl}`);
   console.log(`mock-okx WS private ${handle.wsPrivateUrl}`);
   console.log(`mock-okx WS business ${handle.wsBusinessUrl}`);
-  console.log(`mock-okx auth: ${opts.credentials ? 'signature required' : 'open (no credentials configured)'}; posMode: ${opts.posMode ?? 'net_mode'}`);
+  console.log(`mock-okx auth: ${opts.credentials ? 'signature required' : 'open (no credentials configured)'}; posMode: ${opts.posMode ?? 'net_mode'}; perm: ${opts.perm ?? 'read_only,trade'}`);
 
   const shutdown = (): void => {
     void handle.close().then(() => process.exit(0));

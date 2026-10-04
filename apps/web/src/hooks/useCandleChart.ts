@@ -133,9 +133,11 @@ export function useCandleChart(
     r.candles.setData(sorted.map(toCandle));
     r.volume.setData(sorted.map(toVolume));
     lastTs.current = sorted[sorted.length - 1]?.ts ?? null;
+    // A refetch of the same instrument and bar must not move the view away from where the user is looking.
+    const switched = loadedKey.current !== key;
     loadedKey.current = key;
     applyLive(r, live, lastTs);
-    r.chart.timeScale().scrollToRealTime();
+    if (switched) r.chart.timeScale().scrollToRealTime();
   }, [history, key]); // live candles are applied by the effect below
 
   useEffect(() => {

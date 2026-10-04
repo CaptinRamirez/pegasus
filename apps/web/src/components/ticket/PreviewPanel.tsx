@@ -2,6 +2,7 @@ import type { Instrument } from '@pegasus/shared';
 import type { OrderPreview } from '../../lib/api';
 import { errorMessage, isApiError } from '../../lib/http';
 import { fmtNum, fmtPct, fmtPx } from '../../lib/format';
+import { intentOf } from './form';
 
 interface Props {
   preview: OrderPreview | undefined;
@@ -35,8 +36,19 @@ export function PreviewPanel({ preview, error, isFetching, inst }: Props) {
   }
   const quote = inst?.quoteCcy ?? 'USD';
   const isMarket = preview.ordType === 'market';
+  // Taken from the server's own reading of the order, not from the form.
+  const intent = intentOf(preview.side, preview.posSide);
+  const closing = intent === 'Close long' || intent === 'Close short';
   return (
     <div className={`preview${preview.risk.ok ? '' : ' rejected'}`} style={{ opacity: isFetching ? 0.7 : 1 }}>
+      {intent !== null && (
+        <div className="kv">
+          <span>Action</span>
+          <b className={preview.side === 'buy' ? 'pos' : 'neg'}>
+            {intent} ({preview.side})
+          </b>
+        </div>
+      )}
       <div className="kv num">
         <span>Contracts</span>
         <span>{preview.sz}</span>
@@ -63,8 +75,12 @@ export function PreviewPanel({ preview, error, isFetching, inst }: Props) {
           <span>{preview.estSlippagePct === '' ? '–' : fmtPct(preview.estSlippagePct, 3)}</span>
         </div>
       )}
+      <div className="kv num">
+        <span>Leverage</span>
+        <span>{preview.lever}x</span>
+      </div>
       <div className={`risk-msg ${preview.risk.ok ? 'good' : 'bad'}`}>
-        {preview.risk.ok ? 'Risk check passed' : `${preview.risk.code}: ${preview.risk.message}`}
+        {preview.risk.ok ? (closing ? 'Closing order: limits not applied' : 'Risk check passed') : `${preview.risk.code}: ${preview.risk.message}`}
       </div>
     </div>
   );

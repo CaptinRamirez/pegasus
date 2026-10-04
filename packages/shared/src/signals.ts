@@ -32,8 +32,13 @@ export interface TrendParams {
   volLongPeriod: number;
   /** vol20 / vol100 above which the market counts as a crisis */
   crisisVolRatio: string;
-  /** |daily return| above this many daily sigmas is a crisis day */
+  /** |daily return| above this many daily sigmas (of the bars before it) is a crisis day */
   crisisReturnSigmas: string;
+  /**
+   * Closes for which a crisis day keeps the regime at crisis, the crisis bar included.
+   * The framework says 5 to 10 trading days and leaves the number to a backtest; 5 is the low end.
+   */
+  crisisHoldBars: number;
   /**
    * Do not open longs when the 3-day 8h-normalised funding average is above this
    * (fraction, 0.001 = 0.1%/8h ≈ 110% p.a.). Positive funding is the normal state
@@ -45,6 +50,16 @@ export interface TrendParams {
   minFundingForShort: string;
   /** Window for the funding average, hours */
   fundingWindowHours: number;
+  /** |3-day 8h-normalised funding average| above which a side may count as crowded (fraction) */
+  crowdedFunding: string;
+  /** 10-day open interest increase above which, together with crowdedFunding, the paying side is crowded (fraction) */
+  crowdedOiChange: string;
+  /** Size multiplier for every short entry (the cost of the positive drift) */
+  shortSizeMultiplier: string;
+  /** Size multiplier for new entries on either side in the crisis regime */
+  crisisSizeMultiplier: string;
+  /** Size multiplier for new entries on the crowded side */
+  crowdedSizeMultiplier: string;
   /**
    * Block new entries in the 'range' regime (low efficiency ratio near the MA).
    * Off by default: the evidence for choppiness filters on top of a slow trend
@@ -67,15 +82,21 @@ export const DEFAULT_TREND_PARAMS: TrendParams = {
   volLongPeriod: 100,
   crisisVolRatio: '2',
   crisisReturnSigmas: '3',
+  crisisHoldBars: 5,
   maxFundingForLong: '0.001',
   minFundingForShort: '-0.0005',
   fundingWindowHours: 72,
+  crowdedFunding: '0.0008',
+  crowdedOiChange: '0.2',
+  shortSizeMultiplier: '0.5',
+  crisisSizeMultiplier: '0.5',
+  crowdedSizeMultiplier: '0.75',
   useRangeFilter: false,
 };
 
 /** Minimum number of confirmed bars the indicators need. */
 export function minBarsRequired(p: TrendParams = DEFAULT_TREND_PARAMS): number {
-  return Math.max(p.trendMaPeriod, p.volLongPeriod + 1, p.entryChannel + 1, p.atrPeriod + 1, p.efficiencyPeriod + 1);
+  return Math.max(p.trendMaPeriod, p.volLongPeriod + 1, p.entryChannel + 1, p.atrPeriod + 1, p.efficiencyPeriod + 1, p.volShortPeriod + p.crisisHoldBars + 1);
 }
 
 export class SignalError extends Error {
@@ -118,15 +139,12 @@ export function atr(candles: readonly Candle[], n: number): Decimal {
   return acc.div(n);
 }
 
-/**
- * Highest high and lowest low of the `n` bars BEFORE the last bar
- * (the Donchian channel today's close is compared against).
- */
-export function previousChannel(candles: readonly Candle[], n: number): { high: Decimal; low: Decimal } {
-  if (candles.length < n + 1) throw new SignalError('NOT_ENOUGH_DATA', `channel(${n}) needs ${n + 1} bars, got ${candles.length}`);
+/** Highest high and lowest low of the `n` bars ending just before index `end`. */
+function channelBefore(candles: readonly Candle[], n: number, end: number): { high: Decimal; low: Decimal } {
+  if (n <= 0 || end - n < 0) throw new SignalError('NOT_ENOUGH_DATA', `channel(${n}) needs ${n + candles.length - end} bars, got ${candles.length}`);
   let high: Decimal | null = null;
   let low: Decimal | null = null;
-  for (let i = candles.length - 1 - n; i < candles.length - 1; i++) {
+  for (let i = end - n; i < end; i++) {
     const c = candles[i] as Candle;
     const h = D(c.high);
     const l = D(c.low);
@@ -134,6 +152,22 @@ export function previousChannel(candles: readonly Candle[], n: number): { high: 
     if (low === null || l.lt(low)) low = l;
   }
   return { high: high as Decimal, low: low as Decimal };
+}
+
+/**
+ * Highest high and lowest low of the `n` bars BEFORE the last bar
+ * (the Donchian channel today's close is compared against).
+ */
+export function previousChannel(candles: readonly Candle[], n: number): { high: Decimal; low: Decimal } {
+  return channelBefore(candles, n, candles.length - 1);
+}
+
+/**
+ * Highest high and lowest low of the last `n` bars, the last bar included:
+ * the channel the NEXT close will be compared against.
+ */
+export function trailingChannel(candles: readonly Candle[], n: number): { high: Decimal; low: Decimal } {
+  return channelBefore(candles, n, candles.length);
 }
 
 /**
@@ -210,7 +244,9 @@ const EIGHT_HOURS = 8 * 3_600_000;
  * Normalise settlement records to an 8-hour basis and average them over the
  * window ending at `now`. OKX shortens the settlement interval (8h → 4h → 2h → 1h)
  * when funding is capped, so raw averages understate crowding; each record is
- * scaled by 8h / its own interval, inferred from the gap to the next record.
+ * scaled by 8h / its own interval. A record covers the period ENDING at its
+ * fundingTime, so the interval is the gap to the previous record (the oldest
+ * record, which has none, borrows the gap to the next one).
  */
 export function summarizeFunding(records: readonly FundingRecord[], now: number, windowHours = DEFAULT_TREND_PARAMS.fundingWindowHours): FundingSummary | null {
   const sorted = [...records].filter((r) => r.fundingRate !== '' && Number.isFinite(r.fundingTime)).sort((a, b) => a.fundingTime - b.fundingTime);
@@ -222,7 +258,7 @@ export function summarizeFunding(records: readonly FundingRecord[], now: number,
     const r = sorted[i] as FundingRecord;
     const next = sorted[i + 1];
     const prev = sorted[i - 1];
-    let interval = next ? next.fundingTime - r.fundingTime : prev ? r.fundingTime - prev.fundingTime : EIGHT_HOURS;
+    let interval = prev ? r.fundingTime - prev.fundingTime : next ? next.fundingTime - r.fundingTime : EIGHT_HOURS;
     if (!(interval > 0) || interval > EIGHT_HOURS * 1.5) interval = EIGHT_HOURS;
     const scaled = D(r.fundingRate).mul(EIGHT_HOURS / interval);
     latest = scaled;
@@ -249,12 +285,18 @@ export interface IndicatorSnapshot {
   entryLow: string;
   exitHigh: string;
   exitLow: string;
+  /** Exit channel including the last bar: what the NEXT close is tested against (the trailing stop level for the next session) */
+  nextExitHigh: string;
+  nextExitLow: string;
   efficiencyRatio: string;
   volShort: string;
   volLong: string;
   volRatio: string;
   dailyReturn: string;
+  /** Standard deviation of the volShortPeriod daily log returns BEFORE the last bar (the last return is not in its own yardstick) */
   dailySigma: string;
+  /** Closes since the most recent crisis day inside the hold window (0 = the last bar); null when there is none */
+  crisisDaysAgo: number | null;
   /** Distance of close from the MA in ATRs, signed */
   maDistanceAtr: string;
 }
@@ -273,11 +315,19 @@ export function computeIndicators(candles: readonly Candle[], p: TrendParams = D
   const a = atr(candles, p.atrPeriod);
   const entry = previousChannel(candles, p.entryChannel);
   const exit = previousChannel(candles, p.exitChannel);
+  const nextExit = trailingChannel(candles, p.exitChannel);
   const er = efficiencyRatio(closes, p.efficiencyPeriod);
   const volShort = realizedVol(closes, p.volShortPeriod);
   const volLong = realizedVol(closes, p.volLongPeriod);
-  const sigma = dailyVol(closes, p.volShortPeriod);
+  const sigma = dailyVol(closes.slice(0, -1), p.volShortPeriod);
   const dailyReturn = close.div(prev.close).ln();
+  let crisisDaysAgo: number | null = null;
+  for (let ago = 0; ago < p.crisisHoldBars && crisisDaysAgo === null; ago++) {
+    const i = closes.length - 1 - ago;
+    const ret = D(closes[i] as string).div(closes[i - 1] as string).ln();
+    const priorSigma = ago === 0 ? sigma : dailyVol(closes.slice(0, i), p.volShortPeriod);
+    if (priorSigma.gt(0) && ret.abs().gt(priorSigma.mul(p.crisisReturnSigmas))) crisisDaysAgo = ago;
+  }
   return {
     asOf: last.ts,
     bars: candles.length,
@@ -289,20 +339,22 @@ export function computeIndicators(candles: readonly Candle[], p: TrendParams = D
     entryLow: entry.low.toFixed(),
     exitHigh: exit.high.toFixed(),
     exitLow: exit.low.toFixed(),
+    nextExitHigh: nextExit.high.toFixed(),
+    nextExitLow: nextExit.low.toFixed(),
     efficiencyRatio: er.toFixed(),
     volShort: volShort.toFixed(),
     volLong: volLong.toFixed(),
     volRatio: volLong.isZero() ? '0' : volShort.div(volLong).toFixed(),
     dailyReturn: dailyReturn.toFixed(),
     dailySigma: sigma.toFixed(),
+    crisisDaysAgo,
     maDistanceAtr: a.isZero() ? '0' : close.minus(ma).div(a).toFixed(),
   };
 }
 
 export function classifyRegime(ind: IndicatorSnapshot, p: TrendParams = DEFAULT_TREND_PARAMS): Regime {
-  const volRatio = D(ind.volRatio);
-  const sigma = D(ind.dailySigma);
-  if (volRatio.gt(p.crisisVolRatio) || (sigma.gt(0) && D(ind.dailyReturn).abs().gt(sigma.mul(p.crisisReturnSigmas)))) return 'crisis';
+  // With overlapping 20 and 100 day windows this ratio tops out near sqrt(5); kept as the framework states it.
+  if (D(ind.volRatio).gt(p.crisisVolRatio) || ind.crisisDaysAgo !== null) return 'crisis';
   const er = D(ind.efficiencyRatio);
   const dist = D(ind.maDistanceAtr).abs();
   if (er.lt(p.rangeEfficiency) && dist.lte(1)) return 'range';
@@ -326,13 +378,24 @@ export function evaluateTrendSignals(ind: IndicatorSnapshot, regime: Regime, fun
   const belowMa = close.lt(ind.ma);
   const breakUp = close.gt(ind.entryHigh);
   const breakDown = close.lt(ind.entryLow);
-  const fundingOkLong = funding === null || D(funding.avg8h).lte(p.maxFundingForLong);
-  const fundingOkShort = funding === null || D(funding.avg8h).gte(p.minFundingForShort);
+  const fundingOkLong = funding === null || D(funding.avg8h).lt(p.maxFundingForLong);
+  const fundingOkShort = funding === null || D(funding.avg8h).gt(p.minFundingForShort);
   const regimeOk = !p.useRangeFilter || regime !== 'range';
   reasons.push(`close ${ind.close} vs ${p.entryChannel}d high ${ind.entryHigh}: ${breakUp ? 'breakout up' : 'no'}`);
   reasons.push(`close vs ${p.entryChannel}d low ${ind.entryLow}: ${breakDown ? 'breakout down' : 'no'}`);
   reasons.push(`close vs MA${p.trendMaPeriod} ${ind.ma}: ${aboveMa ? 'above' : belowMa ? 'below' : 'equal'}`);
-  reasons.push(`regime ${regime}: ${regimeOk ? 'new entries allowed' : 'no new entries'}${p.useRangeFilter ? '' : ' (range filter off)'}`);
+  if (regime === 'crisis') {
+    const halfSize = `new entries at half size (x${p.crisisSizeMultiplier})`;
+    if (ind.crisisDaysAgo === null) {
+      reasons.push(`regime crisis: ${p.volShortPeriod}d/${p.volLongPeriod}d vol ratio ${D(ind.volRatio).toFixed(2)} above ${p.crisisVolRatio}; ${halfSize} while it lasts`);
+    } else {
+      const left = p.crisisHoldBars - 1 - ind.crisisDaysAgo;
+      const which = ind.crisisDaysAgo === 0 ? 'the last bar' : `the bar ${ind.crisisDaysAgo} ${ind.crisisDaysAgo === 1 ? 'close' : 'closes'} ago`;
+      reasons.push(`regime crisis: ${which} moved more than ${p.crisisReturnSigmas} sigma; ${halfSize} for this close and ${left} more ${left === 1 ? 'close' : 'closes'}`);
+    }
+  } else {
+    reasons.push(`regime ${regime}: ${regimeOk ? 'new entries allowed' : 'no new entries'}${p.useRangeFilter ? '' : ' (range filter off)'}`);
+  }
   reasons.push(funding === null ? 'funding: no data (filter skipped)' : `funding 3d avg ${D(funding.avg8h).mul(100).toFixed(4)}%/8h: long ${fundingOkLong ? 'ok' : 'blocked'}, short ${fundingOkShort ? 'ok' : 'blocked'}`);
   const longExit = close.lt(ind.exitLow);
   const shortExit = close.gt(ind.exitHigh);
@@ -358,6 +421,49 @@ export interface SizingParams {
 
 export const DEFAULT_SIZING: SizingParams = { riskPct: '0.0075', maxNotionalPct: '0.10', atrStopMultiple: '2.5' };
 
+export type EntrySide = 'long' | 'short';
+
+export interface SizeAdjustment {
+  /** Product of the applied cuts, "1" when none applies */
+  multiplier: string;
+  /** One human-readable entry per applied cut, e.g. "short x0.5" */
+  adjustments: string[];
+}
+
+const NO_ADJUSTMENT: SizeAdjustment = { multiplier: '1', adjustments: [] };
+
+/**
+ * Size cuts the framework requires for a new entry on `side`: shorts at half size,
+ * half size on both sides in the crisis regime, three quarters on the crowded side
+ * (extreme funding together with a 10-day open interest build-up; the longs are the
+ * crowded side when funding is positive). The cuts stack multiplicatively. When
+ * funding is extreme but the open interest change is unknown the cut is applied
+ * anyway: where the framework is silent the smaller size wins.
+ */
+export function sizeAdjustment(side: EntrySide, regime: Regime, funding: FundingSummary | null, oiChange10d: DecimalInput | null, p: TrendParams = DEFAULT_TREND_PARAMS): SizeAdjustment {
+  let multiplier = D(1);
+  const adjustments: string[] = [];
+  if (side === 'short') {
+    multiplier = multiplier.mul(p.shortSizeMultiplier);
+    adjustments.push(`short x${p.shortSizeMultiplier}`);
+  }
+  if (regime === 'crisis') {
+    multiplier = multiplier.mul(p.crisisSizeMultiplier);
+    adjustments.push(`crisis x${p.crisisSizeMultiplier}`);
+  }
+  if (funding !== null) {
+    const avg = D(funding.avg8h);
+    const crowdedSide: EntrySide = avg.gt(0) ? 'long' : 'short';
+    const oiKnown = oiChange10d !== null && oiChange10d !== '';
+    if (avg.abs().gt(p.crowdedFunding) && crowdedSide === side && (!oiKnown || D(oiChange10d).gt(p.crowdedOiChange))) {
+      multiplier = multiplier.mul(p.crowdedSizeMultiplier);
+      const oi = oiKnown ? `OI +${D(oiChange10d).mul(100).toFixed(0)}% in 10d` : '10d OI change unavailable';
+      adjustments.push(`crowded x${p.crowdedSizeMultiplier} (funding ${avg.mul(100).toFixed(2)}%/8h, ${oi})`);
+    }
+  }
+  return { multiplier: multiplier.toFixed(), adjustments };
+}
+
 export interface SizingPlan {
   entryPx: string;
   stopLong: string;
@@ -366,9 +472,14 @@ export interface SizingPlan {
   stopDistancePct: string;
   /** Notional before the cap */
   rawNotional: string;
-  /** Notional actually used (after the cap) */
+  /** Notional aimed at (after the cap and the size multiplier), before rounding down to whole lots */
+  targetNotional: string;
+  /** Notional of `contracts`, the order actually proposed; "0.00" when contracts is "0" */
   notional: string;
   capped: boolean;
+  /** Size multiplier applied after the cap (see sizeAdjustment), "1" when none */
+  multiplier: string;
+  adjustments: string[];
   /** Contracts, rounded down to lotSz; "0" when the minimum order size already exceeds the risk budget */
   contracts: string;
   coin: string;
@@ -381,9 +492,11 @@ export interface SizingPlan {
 
 /**
  * Position size from the stop distance: notional = equity × risk% ÷ stop%,
- * capped at maxNotionalPct of equity, converted to contracts and rounded down.
+ * capped at maxNotionalPct of equity, reduced by the size multiplier, converted
+ * to contracts and rounded down. The minimum order size is checked last. The
+ * notional, coin and risk reported are those of the rounded order.
  */
-export function planSize(equity: DecimalInput, entryPx: DecimalInput, atrValue: DecimalInput, inst: Instrument, s: SizingParams = DEFAULT_SIZING): SizingPlan {
+export function planSize(equity: DecimalInput, entryPx: DecimalInput, atrValue: DecimalInput, inst: Instrument, s: SizingParams = DEFAULT_SIZING, adj: SizeAdjustment = NO_ADJUSTMENT): SizingPlan {
   const eq = D(equity);
   const px = D(entryPx);
   const stopDist = D(atrValue).mul(s.atrStopMultiple);
@@ -392,25 +505,32 @@ export function planSize(equity: DecimalInput, entryPx: DecimalInput, atrValue: 
   const rawNotional = eq.mul(s.riskPct).div(distPct);
   const cap = eq.mul(s.maxNotionalPct);
   const capped = rawNotional.gt(cap);
-  const notional = capped ? cap : rawNotional;
+  const reduced = !D(adj.multiplier).eq(1);
+  const targetNotional = (capped ? cap : rawNotional).mul(adj.multiplier);
   const unit = D(inst.ctVal).mul(inst.ctMult || '1');
   const perContractNotional = inst.ctType === 'linear' ? unit.mul(px) : unit;
   const minUnitRisk = perContractNotional.mul(inst.minSz).mul(distPct);
-  let contracts = floorToStep(notional.div(perContractNotional), inst.lotSz);
+  let contracts = floorToStep(targetNotional.div(perContractNotional), inst.lotSz);
   let note = capped ? `notional capped at ${D(s.maxNotionalPct).mul(100).toFixed(0)}% of equity; actual risk below ${D(s.riskPct).mul(100).toFixed(2)}%` : 'sized from the stop distance';
+  if (reduced) note += `; size x${adj.multiplier} (${adj.adjustments.join(', ')})`;
   if (contracts.lt(inst.minSz)) {
     contracts = ZERO;
-    note = `the minimum order size (${inst.minSz} contracts) would risk ${minUnitRisk.toFixed(2)} which exceeds the budget ${eq.mul(s.riskPct).toFixed(2)}; do not trade this instrument at this equity`;
+    const budget = eq.mul(s.riskPct).mul(adj.multiplier).toFixed(2);
+    note = `the minimum order size (${inst.minSz} contracts) would risk ${minUnitRisk.toFixed(2)} which exceeds the budget ${budget}${reduced ? ` (after size x${adj.multiplier}: ${adj.adjustments.join(', ')})` : ''}; do not trade this instrument at this equity`;
   }
-  const riskQuote = contracts.isZero() ? ZERO : notionalQuote(contracts, px, inst).mul(distPct);
+  const notional = contracts.isZero() ? ZERO : notionalQuote(contracts, px, inst);
+  const riskQuote = notional.mul(distPct);
   return {
     entryPx: px.toFixed(),
     stopLong: px.minus(stopDist).toFixed(),
     stopShort: px.plus(stopDist).toFixed(),
     stopDistancePct: distPct.toFixed(),
     rawNotional: rawNotional.toFixed(2),
+    targetNotional: targetNotional.toFixed(2),
     notional: notional.toFixed(2),
     capped,
+    multiplier: D(adj.multiplier).toFixed(),
+    adjustments: [...adj.adjustments],
     contracts: contracts.toFixed(),
     coin: contracts.isZero() ? '0' : contractsToCoin(contracts, inst, px).toFixed(),
     riskQuote: riskQuote.toFixed(2),
@@ -427,9 +547,12 @@ export interface InstrumentSignalReport {
   regime: Regime;
   funding: FundingSummary | null;
   signals: TrendSignals;
-  sizing: SizingPlan | null;
+  /** One plan per side, each with its own size multiplier; null when there is no equity to size from */
+  sizing: { long: SizingPlan; short: SizingPlan } | null;
   /** Execution context (book depth/imbalance, open interest); filled in by the API, null when unavailable */
   structure: MarketStructure | null;
+  /** When the candles and funding behind this report were fetched from the exchange; filled in by the API */
+  dataFetchedAt: number | null;
   params: TrendParams;
 }
 
@@ -442,14 +565,45 @@ export function buildSignalReport(
   equity: DecimalInput | null,
   p: TrendParams = DEFAULT_TREND_PARAMS,
   s: SizingParams = DEFAULT_SIZING,
+  /** Fractional 10-day change of the instrument's open interest (crowding rule), null when unknown */
+  oiChange10d: DecimalInput | null = null,
 ): InstrumentSignalReport {
   const confirmed = candles.filter((c) => c.confirm);
   const indicators = computeIndicators(confirmed, p);
   const regime = classifyRegime(indicators, p);
   const fundingSummary = funding ? summarizeFunding(funding, now, p.fundingWindowHours) : null;
   const signals = evaluateTrendSignals(indicators, regime, fundingSummary, p);
-  const sizing = inst && equity !== null && D(equity).gt(0) ? planSize(equity, indicators.close, indicators.atr, inst, { ...s, atrStopMultiple: p.atrStopMultiple }) : null;
-  return { instId, indicators, regime, funding: fundingSummary, signals, sizing, structure: null, params: p };
+  const adjLong = sizeAdjustment('long', regime, fundingSummary, oiChange10d, p);
+  const adjShort = sizeAdjustment('short', regime, fundingSummary, oiChange10d, p);
+  for (const a of adjLong.adjustments) signals.reasons.push(`long size: ${a}`);
+  for (const a of adjShort.adjustments) signals.reasons.push(`short size: ${a}`);
+  const sizingParams = { ...s, atrStopMultiple: p.atrStopMultiple };
+  const sizing =
+    inst && equity !== null && D(equity).gt(0)
+      ? { long: planSize(equity, indicators.close, indicators.atr, inst, sizingParams, adjLong), short: planSize(equity, indicators.close, indicators.atr, inst, sizingParams, adjShort) }
+      : null;
+  return { instId, indicators, regime, funding: fundingSummary, signals, sizing, structure: null, dataFetchedAt: null, params: p };
+}
+
+/** A row of GET /api/signals that could not be computed. */
+export interface SignalReportError {
+  instId: string;
+  error: { code: string; message: string };
+}
+
+export type SignalReportRow = InstrumentSignalReport | SignalReportError;
+
+export function isSignalReportError(row: SignalReportRow): row is SignalReportError {
+  return 'error' in row;
+}
+
+/** Response of GET /api/signals. */
+export interface SignalsResponse {
+  generatedAt: number;
+  equity: string | null;
+  /** The sizing parameters the plans were computed with (request overrides applied) */
+  sizingParams: SizingParams;
+  reports: SignalReportRow[];
 }
 
 // ---- market structure (execution context, not direction) ----
@@ -503,20 +657,28 @@ export function computeBookMetrics(
 
 export interface OpenInterestPoint {
   ts: number;
-  /** Open interest in USD (or in contracts when `unit` says so) */
+  /** Open interest the changes are measured on: base coin for the instrument history (USD would move with price) */
   value: string;
+  /** The same point in USD, shown as the level when present */
+  usd?: string;
 }
 
 export interface OpenInterestMetrics {
-  /** Latest open interest */
+  /** Latest open interest of the instrument, in `unit`: the forming day's value when the history has it */
   current: string;
   unit: 'usd' | 'contracts';
-  /** Fractional change vs. 1 point back, '' when unavailable */
+  /**
+   * 'history': the instrument's daily history (UTC days); the changes are measured in base coin.
+   * 'live': only the current level is known; the changes are unavailable ('').
+   */
+  source: 'history' | 'live';
+  /** Fractional change of the last completed day vs. the day before it, '' when unavailable */
   change1d: string;
-  /** Fractional change vs. 10 points back, '' when unavailable */
+  /** Fractional change of the last completed day vs. 10 days before it, '' when unavailable */
   change10d: string;
-  /** Percentile of the current value within the supplied history (0..1), '' when < 10 points */
+  /** Percentile of the last completed day within the last 30 completed days (0..1), '' when < 10 points */
   percentile30d: string;
+  /** Completed points the changes and the percentile are computed on */
   points: number;
 }
 
@@ -524,22 +686,35 @@ export interface OpenInterestMetrics {
  * Open interest level and changes from a daily history (oldest first).
  * Rising OI with rising price = new positions (fuel and fragility);
  * falling OI on a sharp move = deleveraging (the move is being forced).
+ *
+ * A row holds the value at the END of its period, so the newest row of a live history is still
+ * changing. With `formingFrom` (the start of the forming period, e.g. the UTC day start) rows at or
+ * after it only supply the displayed level; the changes and the percentile compare completed periods.
+ * Without it every row counts as completed.
  */
-export function computeOpenInterestMetrics(history: readonly OpenInterestPoint[], unit: 'usd' | 'contracts' = 'usd'): OpenInterestMetrics | null {
-  const pts = [...history].filter((p) => p.value !== '' && D(p.value).gt(0)).sort((a, b) => a.ts - b.ts);
+export function computeOpenInterestMetrics(
+  history: readonly OpenInterestPoint[],
+  unit: 'usd' | 'contracts' = 'usd',
+  source: 'history' | 'live' = 'history',
+  formingFrom?: number,
+): OpenInterestMetrics | null {
+  const all = [...history].filter((p) => p.value !== '' && D(p.value).gt(0)).sort((a, b) => a.ts - b.ts);
+  const newest = all[all.length - 1];
+  if (!newest) return null;
+  const pts = formingFrom === undefined ? all : all.filter((p) => p.ts < formingFrom);
   const last = pts[pts.length - 1];
-  if (!last) return null;
   const change = (back: number): string => {
     const ref = pts[pts.length - 1 - back];
-    return ref ? D(last.value).div(ref.value).minus(1).toFixed(6) : '';
+    return last && ref ? D(last.value).div(ref.value).minus(1).toFixed(6) : '';
   };
   const window = pts.slice(-30);
   let percentile = '';
-  if (window.length >= 10) {
+  if (last && window.length >= 10) {
     const below = window.filter((p) => D(p.value).lt(last.value)).length;
     percentile = D(below).div(window.length - 1).toFixed(3);
   }
-  return { current: D(last.value).toFixed(), unit, change1d: change(1), change10d: change(10), percentile30d: percentile, points: pts.length };
+  const level = newest.usd !== undefined && newest.usd !== '' ? newest.usd : newest.value;
+  return { current: D(level).toFixed(), unit, source, change1d: change(1), change10d: change(10), percentile30d: percentile, points: pts.length };
 }
 
 export interface MarketStructure {

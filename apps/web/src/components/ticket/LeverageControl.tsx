@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { Instrument, SetLeverageRequest, TdMode } from '@pegasus/shared';
 import { api } from '../../lib/api';
 import { errorMessage } from '../../lib/http';
-import { useStore } from '../../store/store';
+import { blockTitle, getTradingBlock, useStore } from '../../store/store';
 
 interface Props {
   inst: Instrument;
@@ -15,6 +15,7 @@ interface Props {
 export function LeverageControl({ inst, tdMode, posSide, longShort }: Props) {
   const pushToast = useStore((s) => s.pushToast);
   const riskMax = useStore((s) => s.riskConfig?.maxLeverage ?? null);
+  const tradingBlock = useStore(getTradingBlock);
   const queryClient = useQueryClient();
   const [value, setValue] = useState('');
 
@@ -27,9 +28,11 @@ export function LeverageControl({ inst, tdMode, posSide, longShort }: Props) {
 
   const active = current.data?.find((l) => l.posSide === posSide) ?? current.data?.[0];
   const activeLever = active?.lever;
+  const failed = current.isError;
+  // The box always shows this instrument's own leverage: never a number typed for, or fetched for, another one.
   useEffect(() => {
-    if (activeLever !== undefined) setValue(activeLever);
-  }, [activeLever]);
+    setValue(failed ? '' : (activeLever ?? ''));
+  }, [inst.instId, tdMode, posSide, activeLever, failed]);
 
   const set = useMutation({
     mutationFn: (body: SetLeverageRequest) => api.setLeverage(body),
@@ -57,16 +60,22 @@ export function LeverageControl({ inst, tdMode, posSide, longShort }: Props) {
     <div className="field">
       <label>
         Leverage <span className="dim">({hint})</span>
+        {failed && <span className="neg"> unavailable</span>}
       </label>
       <div className="input-group">
         <input
           className="num"
           inputMode="decimal"
           value={value}
-          placeholder={current.isLoading ? '…' : '1'}
+          placeholder={current.isLoading ? '…' : failed ? 'unavailable' : '1'}
           onChange={(e) => setValue(e.target.value)}
         />
-        <button className="btn" onClick={submit} disabled={set.isPending || value.trim() === ''}>
+        <button
+          className="btn"
+          onClick={submit}
+          disabled={set.isPending || value.trim() === '' || tradingBlock !== null}
+          {...(tradingBlock === null ? {} : { title: blockTitle(tradingBlock) })}
+        >
           Set
         </button>
       </div>

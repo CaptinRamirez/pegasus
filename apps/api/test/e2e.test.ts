@@ -4,10 +4,11 @@
  * risk rejection, the kill switch and the terminal WebSocket.
  */
 import { once } from 'node:events';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { pino } from 'pino';
 import WebSocket from 'ws';
 import { startMockOkx, type MockOkxHandle } from '@pegasus/mock-okx';
+import { OkxTransportError, type OkxRestClient } from '@pegasus/okx';
 import { D, decodeServerMessage, type ApiResponse, type Order, type Position, type ServerMessage } from '@pegasus/shared';
 import type { FastifyInstance, InjectOptions } from 'fastify';
 import { loadConfig, type AppConfig } from '../src/config.js';
@@ -16,6 +17,7 @@ import type { Deps } from '../src/deps.js';
 import { createOkxClients, syncClock } from '../src/okx/clients.js';
 import { buildServer } from '../src/server.js';
 import { AccountService } from '../src/services/account.js';
+import { KillSwitchSweeper } from '../src/services/kill-switch-sweeper.js';
 import { MarketDataService } from '../src/services/market-data.js';
 import { OrderService } from '../src/services/order-service.js';
 import { RiskEngine } from '../src/services/risk-engine.js';
@@ -65,6 +67,7 @@ beforeAll(async () => {
     OKX_WS_PRIVATE_URL: mock.wsPrivateUrl,
     OKX_WS_BUSINESS_URL: mock.wsBusinessUrl,
     API_TOKEN: TOKEN,
+    PEGASUS_VERSION: 'e2e1234',
     INSTRUMENTS: 'BTC-USDT-SWAP,ETH-USDT-SWAP',
     RISK_MAX_ORDER_NOTIONAL: '20000',
     RISK_MAX_POSITION_NOTIONAL_PER_INSTRUMENT: '30000',
@@ -83,13 +86,15 @@ beforeAll(async () => {
   const account = new AccountService(clients, store, log);
   const risk = new RiskEngine(config.risk, store, log);
   await risk.init();
-  const orders = new OrderService(clients, market, account, risk, store, log, { defaultTdMode: config.defaultTdMode, wsTrading: true });
+  // REST, like the real server: OKX_WS_TRADING=1 is refused at start-up.
+  const orders = new OrderService(clients, market, account, risk, store, log, { defaultTdMode: config.defaultTdMode, wsTrading: config.okx.wsTrading });
   const signals = new SignalsService(clients, market, account, log);
   const hub = new Hub(config, market, account, risk, log);
   deps = { config, log, clients, store, market, account, risk, orders, signals, hub };
   account.on('balance', (b) => risk.updateEquity(b.totalEq));
   account.on('positions', () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional()));
   account.on('order', () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional()));
+  new KillSwitchSweeper(risk, account, orders, log).start();
   hub.wire();
   app = await buildServer(deps);
   await market.start();
@@ -114,6 +119,8 @@ describe('api e2e against mock OKX', () => {
     expect(res.statusCode).toBe(401);
     const health = await app.inject({ method: 'GET', url: '/api/health' });
     expect(health.statusCode).toBe(200);
+    // the commit the stack was started from, as the launcher passed it
+    expect(health.json()).toMatchObject({ ok: true, version: 'e2e1234' });
   });
 
   it('serves instruments, ticker, book and candles', async () => {
@@ -130,11 +137,16 @@ describe('api e2e against mock OKX', () => {
   });
 
   it('computes daily signal reports with indicators, regime and sizing', async () => {
-    const res = data(await api<{ equity: string | null; reports: Array<{ instId: string; indicators?: { bars: number; atr: string; entryHigh: string }; regime?: string; funding?: { avg8h: string; samples: number } | null; sizing?: { contracts: string; riskQuote: string } | null; signals?: { reasons: string[] }; error?: { code: string; message: string } }> }>('GET', '/api/signals?equity=100000'));
+    type Plan = { contracts: string; riskQuote: string; multiplier: string };
+    const res = data(await api<{ equity: string | null; sizingParams: { riskPct: string; maxNotionalPct: string }; reports: Array<{ instId: string; indicators?: { asOf: number; bars: number; atr: string; entryHigh: string }; regime?: string; funding?: { avg8h: string; samples: number } | null; sizing?: { long: Plan; short: Plan } | null; signals?: { reasons: string[] }; dataFetchedAt?: number | null; error?: { code: string; message: string } }> }>('GET', '/api/signals?equity=100000'));
     expect(res.reports).toHaveLength(2);
     expect(res.equity).toBe('100000');
+    expect(res.sizingParams).toMatchObject({ riskPct: '0.0075', maxNotionalPct: '0.10' });
     for (const r of res.reports) {
       expect(r.error).toBeUndefined();
+      // the daily bar is the UTC day (OKX 1Dutc), not OKX's default UTC+8 day that opens at 16:00 UTC
+      expect(r.indicators!.asOf % 86_400_000).toBe(0);
+      expect(r.dataFetchedAt).toBeGreaterThan(0);
       expect(r.indicators!.bars).toBeGreaterThanOrEqual(100);
       expect(D(r.indicators!.atr).gt(0)).toBe(true);
       expect(['trend', 'neutral', 'range', 'crisis']).toContain(r.regime);
@@ -142,15 +154,23 @@ describe('api e2e against mock OKX', () => {
       expect(r.funding!.samples).toBeGreaterThanOrEqual(9); // three days of 8h settlements
       expect(D(r.funding!.avg8h).eq('0.0001')).toBe(true);
       expect(r.sizing).not.toBeNull();
-      expect(D(r.sizing!.riskQuote).lte('750')).toBe(true); // 0.75% of 100k at most
+      expect(D(r.sizing!.long.riskQuote).lte('750')).toBe(true); // 0.75% of 100k at most
+      expect(D(r.sizing!.short.multiplier).lte('0.5')).toBe(true); // shorts are sized at half at most
+      expect(D(r.sizing!.short.riskQuote).lte(D(r.sizing!.long.riskQuote))).toBe(true);
       expect(r.signals!.reasons.length).toBeGreaterThan(3);
-      const st = (r as { structure?: { book: { imbalance: string; levels: number } | null; openInterest: { current: string; points: number } | null } }).structure;
+      const st = (r as { structure?: { book: { imbalance: string; levels: number } | null; openInterest: { current: string; points: number; source: string; change10d: string } | null } }).structure;
       expect(st?.book).not.toBeNull();
       expect(st!.book!.levels).toBeGreaterThan(5);
       expect(Math.abs(Number(st!.book!.imbalance))).toBeLessThanOrEqual(1);
       expect(st?.openInterest).not.toBeNull();
       expect(D(st!.openInterest!.current).gt(0)).toBe(true);
+      // the per-instrument daily history, not the live single point
+      expect(st!.openInterest!.source).toBe('history');
+      expect(st!.openInterest!.points).toBeGreaterThanOrEqual(30);
+      expect(st!.openInterest!.change10d).not.toBe('');
     }
+    const half = data(await api<{ sizingParams: { riskPct: string } }>('GET', '/api/signals?equity=100000&riskPct=0.005'));
+    expect(half.sizingParams.riskPct).toBe('0.005');
     const one = data(await api<{ reports: Array<{ instId: string }> }>('GET', '/api/signals?instId=ETH-USDT-SWAP'));
     expect(one.reports.map((r) => r.instId)).toEqual(['ETH-USDT-SWAP']);
   });
@@ -195,6 +215,80 @@ describe('api e2e against mock OKX', () => {
     await waitFor(() => !deps.account.openOrders.has(placed.order.ordId), 5000, 'order removed');
   });
 
+  it('answers EXCHANGE_UNREACHABLE when OKX cannot be reached or does not answer in time', async () => {
+    const spy = vi.spyOn(deps.clients.rest, 'getCandles');
+    try {
+      spy.mockRejectedValueOnce(new OkxTransportError('/api/v5/market/candles', 'OKX did not answer within 10000 ms', true));
+      const slow = await api<unknown>('GET', '/api/candles?instId=BTC-USDT-SWAP&bar=1m&limit=50');
+      expect(slow.status).toBe(504);
+      if (!slow.body.ok) expect(slow.body.error).toMatchObject({ code: 'EXCHANGE_UNREACHABLE', details: { timedOut: true } });
+      spy.mockRejectedValueOnce(new OkxTransportError('/api/v5/market/candles', 'could not reach OKX (ENOTFOUND)', false));
+      const down = await api<unknown>('GET', '/api/candles?instId=BTC-USDT-SWAP&bar=1m&limit=50');
+      expect(down.status).toBe(502);
+      expect(down.body.ok).toBe(false);
+      if (!down.body.ok) {
+        expect(down.body.error.code).toBe('EXCHANGE_UNREACHABLE');
+        expect(down.body.error.message).not.toMatch(/fetch failed|aborted/);
+      }
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('never resends an order whose REST outcome is unknown: it is looked up by clOrdId', async () => {
+    // A REST-only order service whose placeOrder loses the response (or the request) to a transport failure.
+    const real = deps.clients.rest;
+    const lost = new OkxTransportError('/api/v5/trade/order', 'OKX did not answer within 10000 ms', true);
+    let reachExchange = true;
+    let attempts = 0;
+    const rest: OkxRestClient = Object.create(real) as OkxRestClient;
+    rest.placeOrder = async (params) => {
+      attempts++;
+      if (reachExchange) await real.placeOrder(params);
+      throw lost;
+    };
+    const orders = new OrderService({ ...deps.clients, rest }, deps.market, deps.account, deps.risk, deps.store, log, { defaultTdMode: deps.config.defaultTdMode, wsTrading: false });
+    const req = { instId: 'BTC-USDT-SWAP', side: 'buy', ordType: 'limit', px: '48000', size: { unit: 'contracts', value: '1' } } as const;
+
+    // the exchange accepted it but the answer never arrived: found by clOrdId, not placed twice
+    const placed = await orders.place(req);
+    expect(attempts).toBe(1);
+    expect(placed.order.ordId).toBeTruthy();
+    await waitFor(() => deps.account.openOrders.has(placed.order.ordId), 5000, 'order open');
+    expect(deps.account.openOrderList().filter((o) => o.clOrdId === placed.order.clOrdId)).toHaveLength(1);
+    data(await api<unknown>('POST', '/api/orders/cancel', { instId: 'BTC-USDT-SWAP', ordId: placed.order.ordId }));
+    await waitFor(() => !deps.account.openOrders.has(placed.order.ordId), 5000, 'order removed');
+
+    // the request never arrived: still a single attempt, reported as unknown instead of retried
+    reachExchange = false;
+    attempts = 0;
+    const err = await orders.place(req).catch((e: unknown) => e);
+    expect(attempts).toBe(1);
+    expect(err).toMatchObject({ code: 'ORDER_STATUS_UNKNOWN', status: 504 });
+  }, 15_000);
+
+  it('the WebSocket order branch still places and cancels against the mock (not reachable through the configuration)', async () => {
+    const orders = new OrderService(deps.clients, deps.market, deps.account, deps.risk, deps.store, log, { defaultTdMode: deps.config.defaultTdMode, wsTrading: true });
+    const ws = deps.clients.wsPrivate!;
+    const request = vi.spyOn(ws, 'request');
+    const restPlace = vi.spyOn(deps.clients.rest, 'placeOrder');
+    const restCancel = vi.spyOn(deps.clients.rest, 'cancelOrder');
+    try {
+      const placed = await orders.place({ instId: 'BTC-USDT-SWAP', side: 'buy', ordType: 'limit', px: '48200', size: { unit: 'contracts', value: '1' } });
+      expect(placed.order.ordId).toBeTruthy();
+      await waitFor(() => deps.account.openOrders.has(placed.order.ordId), 5000, 'order open');
+      expect(await orders.cancel({ instId: 'BTC-USDT-SWAP', ordId: placed.order.ordId })).toMatchObject({ ordId: placed.order.ordId, sCode: '0' });
+      await waitFor(() => !deps.account.openOrders.has(placed.order.ordId), 5000, 'order removed');
+      expect(request.mock.calls.map(([op]) => op)).toEqual(['order', 'cancel-order']);
+      expect(restPlace).not.toHaveBeenCalled();
+      expect(restCancel).not.toHaveBeenCalled();
+    } finally {
+      request.mockRestore();
+      restPlace.mockRestore();
+      restCancel.mockRestore();
+    }
+  });
+
   it('fills a market order, updates positions and balance, and closes the position', async () => {
     const fills: unknown[] = [];
     deps.account.on('fill', (f) => fills.push(f));
@@ -211,17 +305,44 @@ describe('api e2e against mock OKX', () => {
     await waitFor(() => !deps.account.positionList().some((p) => p.instId === 'ETH-USDT-SWAP'), 5000, 'position closed');
   });
 
+  it('a marked retry of a market order that already filled is answered with that order and executes nothing', async () => {
+    // The first attempt goes out through another order service, as if the API had been restarted since: the
+    // server under test has never seen the id, and the mock (like OKX) frees the id of a filled order.
+    const before = new OrderService(deps.clients, deps.market, deps.account, deps.risk, deps.store, log, { defaultTdMode: deps.config.defaultTdMode, wsTrading: false });
+    const req = { instId: 'ETH-USDT-SWAP', side: 'buy', ordType: 'market', size: { unit: 'contracts', value: '10' }, clOrdId: 'pgwretry1' } as const;
+    const first = await before.place(req);
+    const pos = await waitFor(() => deps.account.positionList().find((p) => p.instId === 'ETH-USDT-SWAP'), 5000, 'position');
+    expect(D(pos.pos).eq(10)).toBe(true);
+
+    const restPlace = vi.spyOn(deps.clients.rest, 'placeOrder');
+    try {
+      const retried = data(await api<{ order: Order }>('POST', '/api/orders', { ...req, retry: true }));
+      expect(retried.order).toMatchObject({ ordId: first.order.ordId, clOrdId: 'pgwretry1', state: 'filled' });
+      expect(restPlace).not.toHaveBeenCalled();
+    } finally {
+      restPlace.mockRestore();
+    }
+    // the exchange itself still holds 10 contracts, not 20
+    const held = await deps.clients.rest.getPositions('SWAP', 'ETH-USDT-SWAP');
+    expect(held.filter((p) => !D(p.pos).isZero()).map((p) => D(p.pos).toFixed())).toEqual(['10']);
+
+    data(await api<unknown>('POST', '/api/positions/close', { instId: 'ETH-USDT-SWAP', mgnMode: 'cross' }));
+    await waitFor(() => !deps.account.positionList().some((p) => p.instId === 'ETH-USDT-SWAP'), 5000, 'position closed');
+  });
+
   it('kill switch blocks new orders and cancels open ones', async () => {
     const placed = data(await api<{ order: Order }>('POST', '/api/orders', { instId: 'BTC-USDT-SWAP', side: 'sell', ordType: 'limit', px: '52000', size: { unit: 'contracts', value: '1' } }));
     await waitFor(() => deps.account.openOrders.has(placed.order.ordId), 5000, 'order open');
-    data(await api<unknown>('POST', '/api/risk/kill-switch', { enabled: true, reason: 'test' }));
-    // the server-side wiring that cancels on kill switch lives in index.ts; emulate it here
-    await deps.orders.cancelAll().catch(() => undefined);
+    const engaged = data(await api<{ cancelSweep: { state: string } }>('POST', '/api/risk/kill-switch', { enabled: true, reason: 'test' }));
+    expect(engaged.cancelSweep.state).toBe('pending');
     const blocked = await api<unknown>('POST', '/api/orders', { instId: 'BTC-USDT-SWAP', side: 'buy', ordType: 'limit', px: '49000', size: { unit: 'contracts', value: '1' } });
     expect(blocked.status).toBe(422);
     if (!blocked.body.ok) expect(blocked.body.error.details?.['code']).toBe('KILL_SWITCH');
     await waitFor(() => !deps.account.openOrders.has(placed.order.ordId), 5000, 'order canceled by kill switch');
-    data(await api<unknown>('POST', '/api/risk/kill-switch', { enabled: false }));
+    await waitFor(() => deps.risk.state.cancelSweep.state === 'done', 5000, 'cancel sweep done');
+    expect(mock.getState().orders.filter((o) => o.state === 'live' || o.state === 'partially_filled')).toEqual([]);
+    const released = data(await api<{ cancelSweep: { state: string } }>('POST', '/api/risk/kill-switch', { enabled: false }));
+    expect(released.cancelSweep.state).toBe('idle');
   });
 
   it('streams hello, market data and private updates over /ws', async () => {

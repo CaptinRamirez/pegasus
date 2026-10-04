@@ -13,7 +13,6 @@
     "db:migrate": "tsx --env-file-if-exists=../../.env src/db/migrate.ts"
   },
   "dependencies": {
-    "@fastify/cors": "^11.3.0",
     "@fastify/websocket": "^11.3.1",
     "@pegasus/okx": "workspace:*",
     "@pegasus/shared": "workspace:*",

@@ -1,8 +1,8 @@
 import { EventEmitter } from 'node:events';
-import type { OkxBalance, OkxLeverageInfo, OkxOrder, OkxPosition, OkxSetLeverageParams, OkxWsData } from '@pegasus/okx';
-import { D, ZERO, type AccountConfig, type Balance, type ConnState, type Fill, type Order, type Position, type TdMode } from '@pegasus/shared';
+import { OkxApiError, OkxWsError, type OkxAccountConfig, type OkxBalance, type OkxLeverageInfo, type OkxOrder, type OkxPosition, type OkxSetLeverageParams, type OkxWsData } from '@pegasus/okx';
+import { D, ZERO, type AccountConfig, type AccountError, type AccountStatus, type Balance, type ConnState, type Fill, type Order, type Position, type TdMode } from '@pegasus/shared';
 import type { Store } from '../db/store.js';
-import { NotConnectedError } from '../errors.js';
+import { NotConnectedError, ReadOnlyKeyError } from '../errors.js';
 import type { Logger } from '../logger.js';
 import type { OkxClients } from '../okx/clients.js';
 import { fillFromOrderPush, mapBalance, mapFill, mapOrder, mapPosition, positionKey } from '../okx/mappers.js';
@@ -12,6 +12,9 @@ export interface AccountEvents {
   fill: [Fill];
   positions: [Position[]];
   balance: [Balance];
+  /** The account config was loaded for the first time or changed on the exchange. */
+  config: [AccountConfig];
+  /** The private socket state or the account status (state, error, read-only) changed. */
   status: [];
 }
 
@@ -19,23 +22,51 @@ const OPEN_STATES = new Set<Order['state']>(['live', 'partially_filled']);
 const RECONCILE_MS = 60_000;
 /** Leverage can be changed outside this process (OKX app, other clients); cached values expire quickly. */
 const LEVERAGE_TTL_MS = 30_000;
+/** An order the exchange no longer knows (51603) is dropped at once when older than this; a younger one may just not be queryable yet. */
+const VANISHED_ORDER_AGE_MS = 120_000;
+
+function mapConfig(c: OkxAccountConfig): AccountConfig {
+  const perms = (c.perm ?? '').split(',').map((p) => p.trim()).filter((p) => p !== '');
+  // Without a perm list the key is assumed to be able to trade and the exchange decides.
+  return { posMode: c.posMode === 'long_short_mode' ? 'long_short_mode' : 'net_mode', acctLv: c.acctLv, canTrade: perms.length === 0 || perms.includes('trade') };
+}
+
+/** The exchange's own code and text when it answered; the transport failure otherwise. */
+function describeFailure(err: unknown, ts: number): AccountError {
+  if (err instanceof OkxApiError) return { code: err.code, message: err.okxMessage, ts };
+  if (err instanceof OkxWsError) return { code: err.code ?? '', message: err.message, ts };
+  return { code: '', message: (err as Error).message, ts };
+}
 
 /**
  * Mirrors the exchange account: balance, positions and open orders, kept in
  * sync by the private WebSocket and periodically reconciled over REST.
  */
 export class AccountService extends EventEmitter<AccountEvents> {
-  config: AccountConfig = { posMode: 'net_mode', acctLv: '' };
+  /** null until the first successful load: the position mode is not guessed. */
+  config: AccountConfig | null = null;
   balance: Balance | null = null;
   readonly positions = new Map<string, Position>();
   readonly openOrders = new Map<string, Order>();
   private readonly seenFills = new Set<string>();
   /** Orders already seen in a terminal state; guards against a late local insert after the fill push raced the order ack. */
   private readonly closedOrders = new Set<string>();
+  /** How many REST snapshots in a row each open order has been missing from. */
+  private readonly missedSnapshots = new Map<string, number>();
+  /** Positions closed by a push, with the exchange time of the close; guards against a REST snapshot taken before it. */
+  private readonly closedPositions = new Map<string, number>();
   private readonly leverageCache = new Map<string, { info: OkxLeverageInfo[]; fetchedAt: number }>();
   private reconcileTimer: NodeJS.Timeout | null = null;
-  private reconciling = false;
+  /** The REST reconcile in flight, if any. */
+  private syncing: Promise<void> | null = null;
   private started = false;
+  private stopped = false;
+  private retryTimer: NodeJS.Timeout | null = null;
+  /** Why the last REST bootstrap or reconcile failed; null once one succeeded. */
+  private restError: AccountError | null = null;
+  /** Why the private socket could not log in; null once it is ready. */
+  private wsError: AccountError | null = null;
+  private lastSyncAt: number | null = null;
 
   constructor(
     private readonly clients: OkxClients,
@@ -56,27 +87,44 @@ export class AccountService extends EventEmitter<AccountEvents> {
   connection(): ConnState {
     const ws = this.clients.wsPrivate;
     if (!ws) return 'disconnected';
-    return ws.isReady ? 'connected' : ws.currentStatus;
+    if (ws.isReady) return 'connected';
+    // An open socket that has not logged in yet delivers nothing: it is still connecting.
+    return ws.currentStatus === 'disconnected' ? 'disconnected' : 'connecting';
   }
 
+  status(): AccountStatus {
+    const error = this.restError ?? this.wsError;
+    const state = !this.enabled ? 'disabled' : error ? 'error' : this.started ? 'ok' : 'starting';
+    return { state, error, lastSyncAt: this.lastSyncAt, readOnly: this.config !== null && !this.config.canTrade };
+  }
+
+  /** One start attempt; a failure is recorded in the status and rethrown. */
   async start(): Promise<void> {
     if (this.started || !this.enabled) return;
     const ws = this.clients.wsPrivate;
     if (!ws) return;
     // Nothing is marked started until the REST bootstrap succeeded, so a transient failure can be retried.
-    this.config = await this.loadConfig();
-    await this.reconcile(true);
+    await this.refresh();
     this.started = true;
+    this.emit('status');
     ws.on('data', (msg) => this.onPrivateData(msg));
     ws.on('status', (status, detail) => {
       this.log.info({ ws: 'private', status, detail }, 'okx socket status');
       this.emit('status');
     });
     ws.on('ready', () => {
+      this.wsError = null;
       this.emit('status');
       void this.reconcile();
     });
-    ws.on('error', (err) => this.log.warn({ err: err.message }, 'okx private socket error'));
+    ws.on('error', (err) => {
+      this.log.warn({ err: err.message }, 'okx private socket error');
+      // The client raises OkxWsError only when the login after a connect failed; plain socket errors show as a disconnected stream.
+      if (err instanceof OkxWsError) {
+        this.wsError = describeFailure(err, Date.now());
+        this.emit('status');
+      }
+    });
     await ws.subscribe([
       { channel: 'orders', instType: 'SWAP' },
       { channel: 'positions', instType: 'SWAP' },
@@ -87,7 +135,28 @@ export class AccountService extends EventEmitter<AccountEvents> {
     this.reconcileTimer.unref();
   }
 
+  /** The private side needs REST calls that may fail (bad key, clock, network); keep retrying without blocking market data. */
+  async startWithRetry(): Promise<void> {
+    if (!this.enabled) return;
+    for (let attempt = 1; !this.stopped; attempt++) {
+      try {
+        await this.start();
+        return;
+      } catch (err) {
+        const delay = Math.min(60_000, 5_000 * attempt);
+        this.log.error({ err: (err as Error).message, attempt, retryInMs: delay }, 'account service failed to start; retrying');
+        await new Promise<void>((resolve) => {
+          this.retryTimer = setTimeout(resolve, delay);
+          this.retryTimer.unref();
+        });
+      }
+    }
+  }
+
   async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     this.reconcileTimer = null;
     await this.clients.wsPrivate?.close();
@@ -96,6 +165,30 @@ export class AccountService extends EventEmitter<AccountEvents> {
   requireReady(): void {
     if (!this.enabled) throw new NotConnectedError('OKX private API (no credentials configured)');
     if (!this.ready) throw new NotConnectedError('OKX private stream');
+  }
+
+  /** Gate for placing orders; returns the config so callers never act on an unknown position mode. */
+  requireTrading(): AccountConfig {
+    if (!this.enabled) throw new NotConnectedError('OKX private API (no credentials configured)');
+    if (this.config !== null && !this.config.canTrade) throw new ReadOnlyKeyError();
+    this.requireReady();
+    return this.requireConfig();
+  }
+
+  /**
+   * Gate for the writes that are plain REST calls and take no risk decision from the mirror (cancel, close, set leverage):
+   * credentials and the trade permission, not the private stream. Exits must work while the stream is down.
+   */
+  requireRestTrading(): AccountConfig {
+    const config = this.requireConfig();
+    if (!config.canTrade) throw new ReadOnlyKeyError();
+    return config;
+  }
+
+  requireConfig(): AccountConfig {
+    if (!this.enabled) throw new NotConnectedError('OKX private API (no credentials configured)');
+    if (this.config === null) throw new NotConnectedError('OKX account (position mode not loaded yet)');
+    return this.config;
   }
 
   // ---- queries ----
@@ -115,12 +208,14 @@ export class AccountService extends EventEmitter<AccountEvents> {
     return acc.toFixed();
   }
 
-  async getLeverage(instId: string, mgnMode: TdMode): Promise<OkxLeverageInfo[]> {
+  /** `fresh` skips the cache: an order must be checked against the leverage OKX has now, not the one of 30 s ago. */
+  async getLeverage(instId: string, mgnMode: TdMode, fresh = false): Promise<OkxLeverageInfo[]> {
     const key = `${instId}:${mgnMode}`;
     const cached = this.leverageCache.get(key);
-    if (cached && Date.now() - cached.fetchedAt < LEVERAGE_TTL_MS) return cached.info;
+    if (!fresh && cached && Date.now() - cached.fetchedAt < LEVERAGE_TTL_MS) return cached.info;
     const info = await this.clients.rest.getLeverageInfo(instId, mgnMode);
-    this.leverageCache.set(key, { info, fetchedAt: Date.now() });
+    if (info.length > 0) this.leverageCache.set(key, { info, fetchedAt: Date.now() });
+    else this.leverageCache.delete(key);
     return info;
   }
 
@@ -130,35 +225,78 @@ export class AccountService extends EventEmitter<AccountEvents> {
     return info;
   }
 
-  /** Leverage currently set for an instrument/margin mode (and side in long/short mode). */
-  async leverageFor(instId: string, mgnMode: TdMode, posSide: 'long' | 'short' | 'net'): Promise<string> {
-    const info = await this.getLeverage(instId, mgnMode);
+  /** Leverage currently set for an instrument/margin mode (and side in long/short mode); throws when OKX reports none. */
+  async leverageFor(instId: string, mgnMode: TdMode, posSide: 'long' | 'short' | 'net', fresh = false): Promise<string> {
+    const info = await this.getLeverage(instId, mgnMode, fresh);
     const match = info.find((i) => i.posSide === posSide) ?? info.find((i) => i.posSide === 'net') ?? info[0];
-    return match?.lever ?? '1';
+    // No row is "unknown", not 1x: the caller's leverage rule must fail closed.
+    if (!match || !match.lever) throw new Error(`OKX returned no leverage for ${instId} ${mgnMode}`);
+    return match.lever;
+  }
+
+  /** The exchange's clock: uTime / cTime of orders and positions are compared against this, never the local clock. */
+  private exchangeNow(): number {
+    return Date.now() + this.clients.clock.offsetMs;
   }
 
   // ---- sync ----
 
-  private async loadConfig(): Promise<AccountConfig> {
-    const c = await this.clients.rest.getAccountConfig();
-    const cfg: AccountConfig = { posMode: c.posMode === 'long_short_mode' ? 'long_short_mode' : 'net_mode', acctLv: c.acctLv };
-    this.log.info({ posMode: cfg.posMode, acctLv: cfg.acctLv, demo: this.clients.demo }, 'okx account config loaded');
-    return cfg;
+  /** Position mode and key permissions can be changed on OKX at any time, so they are re-read with every reconcile. */
+  private async loadConfig(): Promise<void> {
+    const cfg = mapConfig(await this.clients.rest.getAccountConfig());
+    const prev = this.config;
+    if (prev && prev.posMode === cfg.posMode && prev.acctLv === cfg.acctLv && prev.canTrade === cfg.canTrade) return;
+    this.config = cfg;
+    this.log.info({ posMode: cfg.posMode, acctLv: cfg.acctLv, canTrade: cfg.canTrade, demo: this.clients.demo }, prev ? 'okx account config changed' : 'okx account config loaded');
+    if (!cfg.canTrade) this.log.warn('the API key has no trade permission: orders, cancels, closes and leverage changes are refused');
+    this.emit('config', cfg);
+    this.emit('status');
+  }
+
+  private noteFailure(err: unknown): void {
+    const prev = this.restError;
+    this.restError = describeFailure(err, Date.now());
+    if (!prev || prev.code !== this.restError.code || prev.message !== this.restError.message) this.emit('status');
+  }
+
+  async reconcile(force = false): Promise<void> {
+    if (this.syncing || !this.enabled) return;
+    if (!force && !this.started) return;
+    // The failure is logged and recorded in the status by sync(); the next timer tick tries again.
+    await this.sync().catch(() => undefined);
   }
 
   /**
-   * Pull balance, positions and open orders over REST and merge them into the
-   * local state without reverting anything a WebSocket push updated in the
-   * meantime: entries are only replaced by newer data (uTime) and only orders
-   * known before the call went out can be evicted.
+   * A full REST reconcile that has completed when this resolves; rejects with the reason when it failed.
+   * Does not need the private stream.
    */
-  async reconcile(force = false): Promise<void> {
-    if (this.reconciling || !this.enabled) return;
-    if (!force && !this.started) return;
-    this.reconciling = true;
-    const t0 = Date.now();
+  async refresh(): Promise<void> {
+    if (!this.enabled) throw new NotConnectedError('OKX private API (no credentials configured)');
+    // A reconcile already in flight may have read the exchange before the caller's last write: wait, then pull again.
+    while (this.syncing) await this.syncing.catch(() => undefined);
+    await this.sync();
+  }
+
+  private sync(): Promise<void> {
+    const run = this.pull().finally(() => {
+      if (this.syncing === run) this.syncing = null;
+    });
+    this.syncing = run;
+    return run;
+  }
+
+  /**
+   * Pull the account config, balance, positions and open orders over REST and
+   * merge them into the local state without reverting anything a WebSocket push
+   * updated in the meantime: entries are only replaced by newer data (uTime) and
+   * only orders known before the call went out can be evicted.
+   */
+  private async pull(): Promise<void> {
+    const t0 = this.exchangeNow();
     const knownBefore = [...this.openOrders.keys()];
     try {
+      // On its own first: a rejected key then costs one request per attempt instead of four.
+      await this.loadConfig();
       const [balance, positions, pending] = await Promise.all([
         this.clients.rest.getBalance(),
         this.clients.rest.getPositions('SWAP'),
@@ -174,6 +312,11 @@ export class AccountService extends EventEmitter<AccountEvents> {
         restKeys.add(key);
         const local = this.positions.get(key);
         if (local && local.uTime > pos.uTime) continue; // a push during the round trip is newer
+        const closedAt = this.closedPositions.get(key);
+        if (closedAt !== undefined) {
+          if (pos.uTime <= closedAt) continue; // closed by a push while the snapshot was in flight
+          this.closedPositions.delete(key);
+        }
         if (D(pos.pos).isZero()) this.positions.delete(key);
         else this.positions.set(key, pos);
       }
@@ -186,6 +329,7 @@ export class AccountService extends EventEmitter<AccountEvents> {
       for (const o of pending) {
         const order = mapOrder(o);
         seen.add(order.ordId);
+        this.missedSnapshots.delete(order.ordId);
         if (this.closedOrders.has(order.ordId)) continue; // closed by a push while the snapshot was in flight
         const prev = this.openOrders.get(order.ordId);
         if (prev && prev.uTime > order.uTime) continue;
@@ -196,7 +340,12 @@ export class AccountService extends EventEmitter<AccountEvents> {
       for (const ordId of knownBefore) {
         if (seen.has(ordId)) continue;
         const order = this.openOrders.get(ordId);
-        if (!order) continue;
+        if (!order) {
+          this.missedSnapshots.delete(ordId);
+          continue;
+        }
+        const missed = (this.missedSnapshots.get(ordId) ?? 0) + 1;
+        this.missedSnapshots.set(ordId, missed);
         // The exchange no longer lists it as open; confirm its final state before dropping it.
         try {
           const final = mapOrder(await this.clients.rest.getOrder({ instId: order.instId, ordId }));
@@ -204,23 +353,44 @@ export class AccountService extends EventEmitter<AccountEvents> {
             if (order.uTime <= final.uTime) this.openOrders.set(ordId, final);
             continue;
           }
-          this.openOrders.delete(ordId);
-          this.rememberClosed(ordId);
+          this.dropOrder(ordId);
           this.emit('order', final);
           void this.store.upsertOrder(final).catch(() => undefined);
         } catch (err) {
+          // 51603 (order does not exist): OKX has purged it, so its final state will never be confirmed. Kept for
+          // ever it would count in exposure and the open-order limit; a just-placed order is protected by its age.
+          if (err instanceof OkxApiError && err.code === '51603' && (missed >= 2 || t0 - order.cTime > VANISHED_ORDER_AGE_MS)) {
+            const gone: Order = { ...order, state: 'canceled', uTime: this.exchangeNow() };
+            this.dropOrder(ordId);
+            this.log.warn({ ordId, instId: order.instId, missed }, 'open order no longer exists on the exchange; dropped as canceled');
+            this.emit('order', gone);
+            void this.store.upsertOrder(gone).catch(() => undefined);
+            continue;
+          }
           this.log.warn({ ordId, err: (err as Error).message }, 'could not confirm state of vanished order; keeping it until the next reconcile');
         }
       }
+      this.lastSyncAt = Date.now();
+      if (this.restError) {
+        this.restError = null;
+        this.emit('status');
+      }
     } catch (err) {
       this.log.warn({ err: (err as Error).message }, 'account reconcile failed');
-    } finally {
-      this.reconciling = false;
+      this.noteFailure(err);
+      throw err;
     }
   }
 
   private applyBalance(b: OkxBalance): void {
-    this.balance = mapBalance(b);
+    const next = mapBalance(b);
+    // OKX can push an account update without a total equity. That is "not reported", not zero: the last value
+    // is kept, so the risk engine never sees a total loss (or takes a zero baseline) that did not happen.
+    if (!b.totalEq) {
+      if (!this.balance) return;
+      next.totalEq = this.balance.totalEq;
+    }
+    this.balance = next;
     this.emit('balance', this.balance);
   }
 
@@ -228,13 +398,17 @@ export class AccountService extends EventEmitter<AccountEvents> {
     const pos = mapPosition(p);
     const key = positionKey(pos);
     if (D(pos.pos).isZero()) {
+      this.closedPositions.set(key, pos.uTime || this.exchangeNow());
+      if (this.closedPositions.size > 1_000) this.closedPositions.delete(this.closedPositions.keys().next().value as string);
       return this.positions.delete(key);
     }
+    this.closedPositions.delete(key);
     this.positions.set(key, pos);
     return true;
   }
 
   private onPrivateData(msg: OkxWsData): void {
+    this.lastSyncAt = Date.now();
     switch (msg.arg.channel) {
       case 'orders':
         for (const raw of msg.data as OkxOrder[]) this.applyOrderPush(raw);
@@ -266,6 +440,12 @@ export class AccountService extends EventEmitter<AccountEvents> {
     return true;
   }
 
+  private dropOrder(ordId: string): void {
+    this.openOrders.delete(ordId);
+    this.missedSnapshots.delete(ordId);
+    this.rememberClosed(ordId);
+  }
+
   private rememberClosed(ordId: string): void {
     this.closedOrders.add(ordId);
     if (this.closedOrders.size > 10_000) this.closedOrders.delete(this.closedOrders.values().next().value as string);
@@ -276,8 +456,7 @@ export class AccountService extends EventEmitter<AccountEvents> {
     if (OPEN_STATES.has(order.state)) {
       this.openOrders.set(order.ordId, order);
     } else {
-      this.openOrders.delete(order.ordId);
-      this.rememberClosed(order.ordId);
+      this.dropOrder(order.ordId);
     }
     this.emit('order', order);
     void this.store.upsertOrder(order).catch((err: Error) => this.log.warn({ err: err.message }, 'store.upsertOrder failed'));

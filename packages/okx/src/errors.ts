@@ -14,12 +14,36 @@ export class OkxApiError extends Error {
     return this.code === '50011' || this.code === '50061';
   }
 
+  /**
+   * The request timed out inside OKX (50004 endpoint timeout, 51149 order timeout): it may or may
+   * not have been executed, so an order must be looked up instead of being reported as rejected.
+   */
+  get isOutcomeUnknown(): boolean {
+    return this.code === '50004' || this.code === '51149';
+  }
+
   get isAuthError(): boolean {
     return ['50100', '50101', '50102', '50103', '50104', '50105', '50111', '50112', '50113', '50114', '50115'].includes(this.code);
   }
 }
 
-/** Thrown on transport failures or non-JSON / non-2xx responses. */
+/**
+ * Thrown when no complete response arrived: the network failed or the request timed out.
+ * Deliberately not an OkxApiError: the exchange may or may not have processed the request,
+ * so callers must treat the outcome as unknown.
+ */
+export class OkxTransportError extends Error {
+  constructor(
+    public readonly requestPath: string,
+    message: string,
+    public readonly timedOut: boolean,
+  ) {
+    super(message);
+    this.name = 'OkxTransportError';
+  }
+}
+
+/** Thrown on non-JSON / non-2xx responses. */
 export class OkxHttpError extends Error {
   constructor(
     public readonly status: number,

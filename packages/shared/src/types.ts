@@ -180,6 +180,7 @@ export interface Position {
   uplRatio: string;
   lever: string;
   liqPx: string;
+  /** Posted margin (isolated) or initial margin requirement (cross); '' when the exchange reports neither */
   margin: string;
   notionalUsd: string;
   cTime: number;
@@ -204,6 +205,8 @@ export interface Balance {
 export interface AccountConfig {
   posMode: PosMode;
   acctLv: string;
+  /** False when the API key lacks OKX's trade permission (a read-only key): the API refuses every write with READ_ONLY_KEY */
+  canTrade: boolean;
 }
 
 export interface RiskConfig {
@@ -223,14 +226,33 @@ export interface RiskConfig {
   maxSlippagePct: string;
 }
 
+/**
+ * The cancel-all sweep the kill switch starts. idle: the switch is off; pending: running or waiting for a retry;
+ * done: no open order is left; failed: given up (the key was rejected or lacks the permission);
+ * skipped: not attempted (read-only key, no API key).
+ */
+export type CancelSweepState = 'idle' | 'pending' | 'done' | 'failed' | 'skipped';
+
+export interface CancelSweep {
+  state: CancelSweepState;
+  /** Display text, e.g. "open orders cancelled" or "cancel failed: <reason>, retrying in 10 s"; '' when idle */
+  message: string;
+  /** When the state or message last changed, epoch ms */
+  ts: number;
+}
+
 export interface RiskState {
   /** True when trading is halted (manually or by the daily loss limit) */
   killSwitch: boolean;
   killSwitchReason: string;
+  /** Only its completion is persisted: after a restart with the switch on the sweep runs again unless it had reached done */
+  cancelSweep: CancelSweep;
   /** Start of the current UTC day, epoch ms */
   dayStartTs: number;
-  /** Total equity observed at the start of the day (or when the server started) */
+  /** The day's baseline: the first total equity observed this UTC day, or the equity at a later rebase */
   dayStartEquity: string;
+  /** When dayStartEquity was taken, epoch ms; 0 while there is none. Later than dayStartTs when the server was not running at 00:00 UTC or the baseline was rebased */
+  baselineTs: number;
   currentEquity: string;
   /** currentEquity - dayStartEquity */
   dailyPnl: string;
@@ -241,13 +263,39 @@ export interface RiskState {
 
 export type ConnState = 'connected' | 'connecting' | 'disconnected';
 
+/** Per-instrument market-data streams whose freshness the API watches. */
+export type MarketStream = 'ticker' | 'book' | 'mark';
+
+/** disabled: no API key configured; starting: first load in progress; error: the last attempt to reach the account failed */
+export type AccountState = 'disabled' | 'starting' | 'ok' | 'error';
+
+export interface AccountError {
+  /** OKX's own code, e.g. "50105"; '' when the failure did not come from the exchange (network, timeout) */
+  code: string;
+  /** The exchange's message verbatim, or the transport failure */
+  message: string;
+  ts: number;
+}
+
+export interface AccountStatus {
+  state: AccountState;
+  error: AccountError | null;
+  /** Server time of the last successful REST reconcile or private push; null before the first one */
+  lastSyncAt: number | null;
+  /** True when the key is known to lack the trade permission */
+  readOnly: boolean;
+}
+
 export interface ConnectionStatus {
   okxPublic: ConnState;
   okxPrivate: ConnState;
   okxBusiness: ConnState;
+  account: AccountStatus;
   demo: boolean;
-  /** Milliseconds since the last message from the exchange on any socket */
-  lastMessageAgeMs: number;
+  /** Milliseconds since the stalest watched stream last delivered anything; -1 when nothing has arrived yet */
+  dataAgeMs: number;
+  /** Streams that stopped updating, as `<instId>:<MarketStream>`, e.g. "SOL-USDT-SWAP:book" */
+  staleStreams: string[];
 }
 
 export interface RiskCheckResult {

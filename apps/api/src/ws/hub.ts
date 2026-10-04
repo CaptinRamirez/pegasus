@@ -17,11 +17,14 @@ interface ClientCtx {
   socket: WebSocket;
   instId: string | null;
   bar: CandleBar;
-  lastSeen: number;
+  /** Answered the last protocol ping, or connected since. */
+  alive: boolean;
 }
 
-const IDLE_MS = 60_000;
+/** Every sweep pings each client and terminates the ones that did not answer the previous ping. */
 const SWEEP_MS = 15_000;
+/** The connection status is re-sent this often; terminals also read it as proof that the server is alive. */
+const STATUS_MS = 5_000;
 
 /**
  * Fans market and account updates out to connected terminal clients and
@@ -30,6 +33,7 @@ const SWEEP_MS = 15_000;
 export class Hub {
   private readonly clients = new Set<ClientCtx>();
   private sweepTimer: NodeJS.Timeout | null = null;
+  private statusTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly config: AppConfig,
@@ -63,10 +67,13 @@ export class Hub {
     this.account.on('fill', (f) => this.broadcast({ type: 'fill', data: f }));
     this.account.on('positions', (p) => this.broadcast({ type: 'positions', data: p }));
     this.account.on('balance', (b) => this.broadcast({ type: 'balance', data: b }));
+    this.account.on('config', (c) => this.broadcast({ type: 'account', data: c }));
     this.account.on('status', () => this.broadcast({ type: 'connection', data: this.connectionStatus() }));
     this.risk.on('state', (s) => this.broadcast({ type: 'risk', data: { ...s } }));
     this.sweepTimer = setInterval(() => this.sweep(), SWEEP_MS);
     this.sweepTimer.unref();
+    this.statusTimer = setInterval(() => this.broadcast({ type: 'connection', data: this.connectionStatus() }), STATUS_MS);
+    this.statusTimer.unref();
   }
 
   connectionStatus(): ConnectionStatus {
@@ -75,8 +82,10 @@ export class Hub {
       okxPublic: m.public,
       okxBusiness: m.business,
       okxPrivate: this.account.connection(),
+      account: this.account.status(),
       demo: this.config.okx.demo,
-      lastMessageAgeMs: m.lastMessageAgeMs,
+      dataAgeMs: m.dataAgeMs,
+      staleStreams: m.staleStreams,
     };
   }
 
@@ -97,7 +106,7 @@ export class Hub {
 
   /** Attach an authenticated socket. */
   attach(socket: WebSocket): void {
-    const ctx: ClientCtx = { socket, instId: null, bar: '1m', lastSeen: Date.now() };
+    const ctx: ClientCtx = { socket, instId: null, bar: '1m', alive: true };
     this.clients.add(ctx);
     this.log.info({ clients: this.clients.size }, 'terminal client connected');
     this.send(ctx, { type: 'hello', data: this.hello() });
@@ -106,8 +115,11 @@ export class Hub {
       if (t) this.send(ctx, { type: 'ticker', data: t });
     }
     socket.on('message', (raw) => {
-      ctx.lastSeen = Date.now();
+      ctx.alive = true;
       void this.onMessage(ctx, raw.toString());
+    });
+    socket.on('pong', () => {
+      ctx.alive = true;
     });
     socket.on('close', () => {
       this.clients.delete(ctx);
@@ -125,6 +137,7 @@ export class Hub {
 
   async close(): Promise<void> {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
+    if (this.statusTimer) clearInterval(this.statusTimer);
     for (const ctx of this.clients) ctx.socket.close(1001, 'server shutting down');
     this.clients.clear();
   }
@@ -181,8 +194,9 @@ export class Hub {
         return;
       case 'unsubscribe':
         if (ctx.instId === msg.instId) {
-          await this.market.unsubscribeCandles(ctx.instId, ctx.bar);
+          // ctx changes before the await: the subscribe that follows in the same tick must not see the old instrument and release it again.
           ctx.instId = null;
+          await this.market.unsubscribeCandles(msg.instId, ctx.bar);
         }
         return;
     }
@@ -193,12 +207,17 @@ export class Hub {
       this.send(ctx, { type: 'error', data: { code: 'UNKNOWN_INSTRUMENT', message: `instrument ${instId} is not tracked` } });
       return;
     }
-    const changed = ctx.instId !== instId || ctx.bar !== bar;
-    if (changed) {
-      if (ctx.instId) await this.market.unsubscribeCandles(ctx.instId, ctx.bar);
+    if (!this.clients.has(ctx)) return;
+    const prevInstId = ctx.instId;
+    const prevBar = ctx.bar;
+    if (prevInstId !== instId || prevBar !== bar) {
+      // ctx and the candle reference counts move together, before any await: the next message of this
+      // client and its close handler then always see exactly what it holds.
       ctx.instId = instId;
       ctx.bar = bar;
-      await this.market.subscribeCandles(instId, bar);
+      const released = prevInstId ? this.market.unsubscribeCandles(prevInstId, prevBar) : null;
+      const acquired = this.market.subscribeCandles(instId, bar);
+      await Promise.all([released, acquired]);
     }
     this.send(ctx, { type: 'subscribed', data: { instId, bar } });
     const ticker = this.market.ticker(instId);
@@ -213,13 +232,20 @@ export class Hub {
     if (funding) this.send(ctx, { type: 'fundingRate', data: funding });
   }
 
+  /**
+   * Liveness through the WebSocket protocol's own ping/pong: a browser answers those even for a
+   * hidden tab, whose timers (and with them the application-level ping) are throttled to about one a minute.
+   */
   private sweep(): void {
-    const cutoff = Date.now() - IDLE_MS;
     for (const ctx of this.clients) {
-      if (ctx.lastSeen < cutoff) {
-        this.log.info('closing idle terminal client');
-        ctx.socket.close(1000, 'idle');
+      if (!ctx.alive) {
+        this.log.info('terminating unresponsive terminal client');
+        ctx.socket.terminate();
+        continue;
       }
+      if (ctx.socket.readyState !== ctx.socket.OPEN) continue;
+      ctx.alive = false;
+      ctx.socket.ping();
     }
   }
 }

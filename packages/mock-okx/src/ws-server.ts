@@ -5,6 +5,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import { verifyWsLogin } from './auth.js';
 import type { Engine } from './engine/engine.js';
 import { MOCK_UID } from './engine/engine.js';
+import { NO_PERMISSION } from './rest-routes.js';
 import type { MockCredentials } from './types.js';
 import { candleBar, checkArg, endpointOfPath, isPrivateChannel, parseArg, subKey, type Endpoint } from './ws-channels.js';
 import type { OkxOrderAck, OkxWsArg } from './wire.js';
@@ -251,6 +252,7 @@ export class MockWsServer {
     };
     if (conn.endpoint !== 'private') return respond('60012', 'Illegal request', []);
     if (!conn.loggedIn) return respond('60011', 'Please log in', []);
+    if (!this.engine.canTrade) return respond(NO_PERMISSION.code, NO_PERMISSION.msg, []);
     const m = this.engine.matcher;
     const fn: (item: unknown) => OkxOrderAck = op.includes('cancel') ? (i) => m.cancelRequest(i) : op.includes('amend') ? (i) => m.amendRequest(i) : (i) => m.place(i);
     const batch = op.startsWith('batch-');

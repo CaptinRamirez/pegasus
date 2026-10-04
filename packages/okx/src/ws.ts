@@ -24,6 +24,8 @@ export interface OkxWsClientOptions {
   idleTimeoutMs?: number;
   reconnectMinMs?: number;
   reconnectMaxMs?: number;
+  /** The reconnect backoff starts over only after a connection has stayed ready for this long. */
+  stableAfterMs?: number;
   /** Timeout for login / subscribe / trade-op acknowledgements. */
   ackTimeoutMs?: number;
   logger?: OkxWsLogger;
@@ -41,6 +43,8 @@ export interface OkxWsClientEvents {
   error: [err: Error];
   /** Emitted when the server confirms a subscription (after a resubscribe too). */
   subscribed: [arg: OkxWsArg];
+  /** The server refused a subscription. The arg stays registered and is requested again on the next connection. */
+  subscribeRejected: [arg: OkxWsArg, code: string | undefined, msg: string | undefined];
 }
 
 interface PendingOp {
@@ -81,8 +85,14 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
   private reconnectAttempt = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private pingTimer: NodeJS.Timeout | null = null;
+  private stableTimer: NodeJS.Timeout | null = null;
   private lastMessageAt = 0;
   private readonly desired = new Map<string, OkxWsArg>();
+  /** Keys the server has confirmed / refused on the current connection. */
+  private readonly confirmed = new Set<string>();
+  private readonly rejected = new Set<string>();
+  /** An error event arrived on this connection that could not be tied to a login or a pending subscription. */
+  private unattributedError = false;
   private readonly pendingSubs = new Map<string, PendingSub>();
   private readonly pendingOps = new Map<string, PendingOp>();
   private loginWaiter: { resolve: () => void; reject: (e: Error) => void; timer: NodeJS.Timeout } | null = null;
@@ -98,6 +108,7 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
       idleTimeoutMs: options.idleTimeoutMs ?? 30_000,
       reconnectMinMs: options.reconnectMinMs ?? 1_000,
       reconnectMaxMs: options.reconnectMaxMs ?? 30_000,
+      stableAfterMs: options.stableAfterMs ?? 30_000,
       ackTimeoutMs: options.ackTimeoutMs ?? 10_000,
       logger: options.logger ?? noopLogger,
       clockOffsetMs: options.clockOffsetMs ?? (() => 0),
@@ -151,6 +162,14 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
     this.setStatus('disconnected', 'closed by client');
   }
 
+  /** Drop the current connection; the normal reconnect path (backoff, login, resubscribe) opens a new one. */
+  reconnect(reason: string): void {
+    const ws = this.ws;
+    if (!ws || this.closing) return;
+    this.opts.logger.warn(`${this.opts.name} ws reconnect requested`, { reason });
+    ws.terminate();
+  }
+
   /** Register channels; they are (re)subscribed whenever the socket is ready. */
   async subscribe(args: OkxWsArg[]): Promise<void> {
     const fresh: OkxWsArg[] = [];
@@ -159,10 +178,16 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
       if (!this.desired.has(key)) {
         this.desired.set(key, arg);
         fresh.push(arg);
+      } else if (!this.confirmed.has(key) && !this.pendingSubs.has(key)) {
+        // Registered but never confirmed on this connection (ack lost or refused): ask again instead of silently doing nothing.
+        fresh.push(arg);
       }
     }
     if (fresh.length === 0) return;
-    if (this.readyFlag && this.socketOpen()) await this.sendSubscribe(fresh);
+    if (this.readyFlag && this.socketOpen()) {
+      for (const arg of fresh) this.rejected.delete(argKey(arg));
+      await this.sendSubscribe(fresh);
+    }
   }
 
   private socketOpen(): boolean {
@@ -174,6 +199,8 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
     for (const arg of args) {
       const key = argKey(arg);
       if (this.desired.delete(key)) present.push(arg);
+      this.confirmed.delete(key);
+      this.rejected.delete(key);
     }
     if (present.length === 0 || !this.readyFlag || !this.socketOpen()) return;
     for (let i = 0; i < present.length; i += this.opts.subscribeBatchSize) {
@@ -219,6 +246,7 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
     this.setStatus('connecting');
     this.loggedIn = false;
     this.readyFlag = false;
+    this.resetSession();
     const ws = new WebSocket(this.opts.url, { handshakeTimeout: 10_000 });
     this.ws = ws;
     ws.on('open', () => {
@@ -244,6 +272,7 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
       this.ws = null;
       this.readyFlag = false;
       this.loggedIn = false;
+      this.resetSession();
       this.clearTimers();
       this.failPending(new OkxWsError(`${this.opts.name} socket closed (${code})`, undefined, true));
       this.setStatus('disconnected', `${code} ${reason.toString()}`);
@@ -257,16 +286,76 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
       if (this.opts.credentials) await this.login();
       if (this.ws !== ws) return;
       this.readyFlag = true;
-      this.reconnectAttempt = 0;
+      // A connection that drops again right away must keep backing off, so the attempt counter survives until this one has proven stable.
+      this.stableTimer = setTimeout(() => {
+        this.stableTimer = null;
+        this.reconnectAttempt = 0;
+      }, this.opts.stableAfterMs);
+      this.stableTimer.unref();
       const all = [...this.desired.values()];
-      if (all.length > 0) {
-        this.sendSubscribe(all).catch((err: Error) => this.opts.logger.warn(`${this.opts.name} resubscribe failed`, { error: err.message }));
-      }
+      if (all.length > 0) void this.resubscribe(ws, all);
       this.emit('ready');
     } catch (err) {
       this.opts.logger.error(`${this.opts.name} post-connect setup failed`, { error: (err as Error).message });
       this.emit('error', err as Error);
       ws.terminate();
+    }
+  }
+
+  private resetSession(): void {
+    this.confirmed.clear();
+    this.rejected.clear();
+    this.unattributedError = false;
+  }
+
+  /** Desired args the server has neither confirmed nor refused and that are not awaiting an ack right now. */
+  private unconfirmed(): OkxWsArg[] {
+    const out: OkxWsArg[] = [];
+    for (const [key, arg] of this.desired) {
+      if (!this.confirmed.has(key) && !this.rejected.has(key) && !this.pendingSubs.has(key)) out.push(arg);
+    }
+    return out;
+  }
+
+  /**
+   * Re-request every desired channel on a new connection. Args the server never
+   * acknowledges are sent once more; if some are still missing after that the socket
+   * is terminated so the reconnect path (with its backoff) starts a clean session.
+   * An explicit refusal is reported through `subscribeRejected` and never causes a reconnect.
+   */
+  private async resubscribe(ws: WebSocket, args: OkxWsArg[]): Promise<void> {
+    for (let resent = false; ; resent = true) {
+      if (this.ws !== ws || !this.socketOpen()) return;
+      // Settled means every ack has arrived, been refused or timed out.
+      await Promise.allSettled(this.subscribeWaits(args));
+      if (this.ws !== ws || !this.socketOpen()) return;
+      const missing = this.unconfirmed();
+      if (missing.length === 0) return;
+      const channels = missing.map(argKey);
+      if (resent) {
+        if (this.unattributedError) {
+          // The exchange answered with an error we could not match to an arg: reconnecting would only repeat it.
+          this.opts.logger.warn(`${this.opts.name} subscriptions not acknowledged after an exchange error; not reconnecting`, { channels });
+          return;
+        }
+        this.opts.logger.warn(`${this.opts.name} subscriptions still unacknowledged after a re-send; reconnecting`, { channels });
+        ws.terminate();
+        return;
+      }
+      this.opts.logger.warn(`${this.opts.name} subscriptions not acknowledged; sending them again`, { channels });
+      args = missing;
+    }
+  }
+
+  /** Mark the desired arg a server message refers to as confirmed. Private channels echo extra fields such as `uid`. */
+  private confirm(arg: OkxWsArg): void {
+    const key = argKey(arg);
+    if (this.desired.has(key)) {
+      this.confirmed.add(key);
+      return;
+    }
+    for (const [k, want] of this.desired) {
+      if (Object.keys(want).every((f) => want[f] === undefined || want[f] === arg[f])) this.confirmed.add(k);
     }
   }
 
@@ -279,7 +368,7 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
         reject(new OkxWsError('login timed out'));
       }, this.opts.ackTimeoutMs);
       this.loginWaiter = { resolve, reject, timer };
-      this.sendRaw({ op: 'login', args: [wsLoginArgs(creds, Date.now() + this.opts.clockOffsetMs())] });
+      this.sendRaw({ op: 'login', args: [wsLoginArgs(creds, Date.now() + this.opts.clockOffsetMs())] }, true);
     });
   }
 
@@ -290,6 +379,11 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
    */
   private sendSubscribe(args: OkxWsArg[]): Promise<void> {
     if (!this.socketOpen()) return Promise.reject(new OkxWsError(`${this.opts.name} socket not open`));
+    return Promise.all(this.subscribeWaits(args)).then(() => undefined);
+  }
+
+  /** One promise per arg, settled by its ack, its refusal, the ack timeout or the socket closing. */
+  private subscribeWaits(args: OkxWsArg[]): Promise<void>[] {
     const waits: Promise<void>[] = [];
     for (let i = 0; i < args.length; i += this.opts.subscribeBatchSize) {
       const batch = args.slice(i, i + this.opts.subscribeBatchSize);
@@ -332,17 +426,19 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
           this.pendingSubs.delete(key);
           entry.reject(err as Error);
         }
-        return Promise.all(waits).then(() => undefined);
+        return waits;
       }
     }
-    return Promise.all(waits).then(() => undefined);
+    return waits;
   }
 
-  private sendRaw(payload: unknown): void {
+  private sendRaw(payload: unknown, secret = false): void {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) throw new OkxWsError(`${this.opts.name} socket not open`);
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
-    this.opts.logger.debug(`${this.opts.name} ws send`, { text: text.length > 500 ? `${text.slice(0, 500)}…` : text });
+    // The login frame carries the API key and the plaintext passphrase: only its op reaches the log.
+    const shown = secret ? '{"op":"login"}' : text.length > 500 ? `${text.slice(0, 500)}…` : text;
+    this.opts.logger.debug(`${this.opts.name} ws send`, { text: shown });
     ws.send(text);
   }
 
@@ -370,6 +466,8 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
       return;
     }
     if (isWsData(msg)) {
+      // Data flowing on a channel proves the subscription is live even if its ack was lost.
+      if (this.confirmed.size < this.desired.size) this.confirm(msg.arg);
       this.emit('data', msg);
       return;
     }
@@ -399,6 +497,7 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
             this.pendingSubs.delete(key);
             p.resolve();
           }
+          this.confirm(msg.arg);
           this.emit('subscribed', msg.arg);
         }
         return;
@@ -414,17 +513,29 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
           return;
         }
         // Subscription errors echo the offending request inside msg; fail matching pending subs.
+        // The arg stays desired: it is not asked again on this connection but is on the next one.
+        let matched = false;
         for (const [key, p] of this.pendingSubs) {
           const arg = this.desired.get(key);
           if (arg && msg.msg && (msg.msg.includes(arg.channel) && (arg.instId === undefined || msg.msg.includes(arg.instId)))) {
+            matched = true;
             clearTimeout(p.timer);
             this.pendingSubs.delete(key);
-            this.desired.delete(key);
+            this.rejected.add(key);
             p.reject(new OkxWsError(`subscribe rejected: ${detail}`, msg.code));
+            this.emit('subscribeRejected', arg, msg.code, msg.msg);
           }
         }
+        if (!matched) this.unattributedError = true;
         return;
       }
+      case 'notice':
+        // e.g. 64008: the exchange is about to close this connection for an upgrade.
+        this.opts.logger.warn(`${this.opts.name} ws notice`, { code: msg.code, msg: msg.msg });
+        return;
+      case 'channel-conn-count-error':
+        this.opts.logger.warn(`${this.opts.name} ws channel-conn-count-error`, { code: msg.code, msg: msg.msg, channel: msg.channel, connCount: msg.connCount });
+        return;
       default:
         return;
     }
@@ -456,6 +567,8 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
 
   private clearTimers(): void {
     this.stopPing();
+    if (this.stableTimer) clearTimeout(this.stableTimer);
+    this.stableTimer = null;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
   }

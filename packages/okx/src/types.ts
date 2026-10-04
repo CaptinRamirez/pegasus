@@ -117,6 +117,9 @@ export interface OkxFundingRateHistory {
 /** [ts, open interest (USD), volume (USD)] from /rubik/stat/contracts/open-interest-volume */
 export type OkxOpenInterestVolumeRow = [string, string, string];
 
+/** [ts, open interest in contracts, in base coin, in USD] from /rubik/stat/contracts/open-interest-history */
+export type OkxOpenInterestHistoryRow = [string, string, string, string];
+
 export interface OkxOpenInterest {
   instType: OkxInstType;
   instId: string;
@@ -135,6 +138,8 @@ export interface OkxAccountConfig {
   autoLoan: boolean;
   level: string;
   label?: string;
+  /** Comma-separated permissions of the API key, e.g. "read_only" or "read_only,trade" */
+  perm?: string;
 }
 
 export interface OkxBalanceDetail {
@@ -175,7 +180,10 @@ export interface OkxPosition {
   uplRatio: string;
   lever: string;
   liqPx: string;
+  /** Posted margin of an isolated position; '' for cross */
   margin: string;
+  /** Initial margin requirement; the figure a cross position reports instead of margin */
+  imr: string;
   notionalUsd: string;
   ccy: string;
   cTime: string;

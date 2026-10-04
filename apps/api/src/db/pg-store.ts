@@ -115,6 +115,7 @@ function rowToFill(r: FillRow): Fill {
 
 export class PgStore implements Store {
   readonly kind = 'postgres' as const;
+  readonly settingsLocation = 'the database (settings table)';
   private readonly sql: postgres.Sql;
   private readonly db: PostgresJsDatabase;
 

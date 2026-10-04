@@ -38,18 +38,31 @@ export function isDecimalText(s: string): boolean {
   return DECIMAL_STRING_RE.test(s);
 }
 
-/** Price formatted to the instrument tick size, with thousands separators. */
+/** Tooltip of the "untracked" tag on a table row whose instrument is not in the tracked list. */
+export const UNTRACKED_TITLE = 'Not one of the tracked instruments: prices and sizes are shown as OKX reports them, and the coin amount is unknown.';
+
+/** Significant digits of a price whose instrument (and so its tick size) is unknown. */
+const UNTRACKED_PX_DIGITS = 8;
+const UNTRACKED_PX_INTEGER = D(10).pow(UNTRACKED_PX_DIGITS);
+
+/**
+ * Price formatted to the instrument tick size, with thousands separators. Without the instrument (a position
+ * or order outside the tracked list) no tick is assumed: a default step would print 0.1289 as 0.13.
+ */
 export function fmtPx(px: DecimalInput | null | undefined, inst?: Instrument | null): string {
   const d = safeDecimal(px);
   if (d === null) return DASH;
-  return groupThousands(toPlainString(d, inst?.tickSz ?? '0.01'));
+  if (inst !== null && inst !== undefined) return groupThousands(toPlainString(d, inst.tickSz));
+  // Integer digits are never rounded away, whatever their number.
+  const bounded = d.abs().gte(UNTRACKED_PX_INTEGER) ? d.toDecimalPlaces(0) : d.toSignificantDigits(UNTRACKED_PX_DIGITS);
+  return groupThousands(bounded.toFixed());
 }
 
-/** Contract size formatted to the instrument lot size. */
+/** Contract size formatted to the instrument lot size; the exact value when the instrument is unknown. */
 export function fmtContracts(sz: DecimalInput | null | undefined, inst?: Instrument | null): string {
   const d = safeDecimal(sz);
   if (d === null) return DASH;
-  return groupThousands(toPlainString(d, inst?.lotSz ?? '1'));
+  return groupThousands(inst === null || inst === undefined ? d.toFixed() : toPlainString(d, inst.lotSz));
 }
 
 export function coinDecimals(inst: Instrument): number {
@@ -160,6 +173,19 @@ export function fmtTime(ts: number): string {
 export function fmtDateTime(ts: number): string {
   const d = new Date(ts);
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${fmtTime(ts)}`;
+}
+
+/** UTC wall-clock time to the minute: "2026-10-03 00:00 UTC". */
+export function fmtUtcMinute(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())} UTC`;
+}
+
+/** Coarse age for things that are hours or days old: "12 min", "5 h", "3 d". */
+export function fmtAgeCoarse(ms: number): string {
+  if (ms < 3_600_000) return `${Math.max(0, Math.floor(ms / 60_000))} min`;
+  if (ms < 48 * 3_600_000) return `${Math.floor(ms / 3_600_000)} h`;
+  return `${Math.floor(ms / 86_400_000)} d`;
 }
 
 export function fmtAge(ms: number): string {

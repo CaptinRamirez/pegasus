@@ -10,7 +10,7 @@ import type {
   OkxTicker,
   OkxTrade,
 } from '@pegasus/okx';
-import type { Balance, Candle, Fill, FundingRate, Instrument, MarkPrice, Order, OrdType, PosSide, Position, Ticker, Trade } from '@pegasus/shared';
+import { CANDLE_BARS, type Balance, type Candle, type CandleBar, type Fill, type FundingRate, type Instrument, type MarkPrice, type Order, type OrdType, type PosSide, type Position, type Ticker, type Trade } from '@pegasus/shared';
 
 const num = (s: string | undefined): number => (s === undefined || s === '' ? 0 : Number(s));
 
@@ -70,6 +70,20 @@ export function mapCandle(row: OkxCandleRow): Candle {
     volCcy: row[6],
     confirm: row[8] === '1',
   };
+}
+
+// OKX aligns these bars to UTC+8 (its 1D opens at 16:00 UTC). The terminal is UTC throughout (risk day,
+// daily signals), so they always travel as OKX's UTC-aligned variants: 6Hutc, 12Hutc, 1Dutc, 1Wutc.
+const UTC8_BARS: ReadonlySet<CandleBar> = new Set<CandleBar>(['6H', '12H', '1D', '1W']);
+
+/** The OKX name of a bar: the `bar` argument of the REST candle calls and the suffix of the `candle…` channels. */
+export function toOkxBar(bar: CandleBar): string {
+  return UTC8_BARS.has(bar) ? `${bar}utc` : bar;
+}
+
+/** Inverse of toOkxBar; null for a name the terminal never requests (such as OKX's own UTC+8 `1D`). */
+export function fromOkxBar(okxBar: string): CandleBar | null {
+  return CANDLE_BARS.find((bar) => toOkxBar(bar) === okxBar) ?? null;
 }
 
 export function mapMarkPrice(m: OkxMarkPrice): MarkPrice {
@@ -175,7 +189,8 @@ export function mapPosition(p: OkxPosition): Position {
     uplRatio: p.uplRatio || '0',
     lever: p.lever ?? '',
     liqPx: p.liqPx ?? '',
-    margin: p.margin || '0',
+    // OKX fills margin only for isolated positions; a cross position carries its requirement in imr.
+    margin: p.margin || p.imr || '',
     notionalUsd: p.notionalUsd || '0',
     cTime: num(p.cTime),
     uTime: num(p.uTime),

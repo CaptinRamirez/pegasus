@@ -1,6 +1,6 @@
 import type { IncomingHttpHeaders } from 'node:http';
 import { verifyRestAuth } from './auth.js';
-import { isBar } from './engine/candles.js';
+import { BAR_MS, barStart, isBar } from './engine/candles.js';
 import type { Engine } from './engine/engine.js';
 import { d, isDecimalString } from './num.js';
 import type { MockCredentials } from './types.js';
@@ -20,6 +20,9 @@ export interface RestReply {
 }
 
 type Handler = (q: URLSearchParams, body: unknown) => OkxResponse<unknown>;
+
+/** Deliberately generic: the code OKX uses for a key without the permission is not in docs/okx-api-notes.md, so clients must not rely on one. */
+export const NO_PERMISSION = { code: '1', msg: 'This API key does not have the permission for this operation.' } as const;
 
 interface Route {
   auth: boolean;
@@ -82,6 +85,8 @@ export class RestRouter {
       const authErr = verifyRestAuth(this.creds, req.headers, req.method, req.rawPath, req.body);
       if (authErr) return { status: 401, json: err(authErr.code, authErr.msg) };
     }
+    // Every POST route writes (orders, cancels, amends, close-position, set-leverage).
+    if (req.method === 'POST' && !this.engine.canTrade) return { status: 200, json: err(NO_PERMISSION.code, NO_PERMISSION.msg) };
     let body: unknown = undefined;
     if (req.method === 'POST' && req.body !== '') {
       try {
@@ -176,6 +181,28 @@ export class RestRouter {
         const ctVal = Number(inst.ctVal);
         return { instType: 'SWAP', instId: inst.instId, oi: String(oi), oiCcy: String(oi * ctVal), oiUsd: String(oi * ctVal * px), ts: now };
       }));
+    });
+    // Deterministic synthetic history per instrument, newest first: [ts, contracts, coin, USD]. The level
+    // drifts up towards the present with a small fixed wobble, so the 1d and 10d changes are non-zero.
+    this.get('/api/v5/rubik/stat/contracts/open-interest-history', false, (q) => {
+      const instId = q.get('instId');
+      if (!instId) return err('50014', 'Parameter instId cannot be empty.');
+      const [inst] = e.instrumentList(instId);
+      if (!inst) return err('51001', 'Instrument ID does not exist.');
+      const period = q.get('period') ?? '5m';
+      if (!isBar(period)) return err('51000', 'Parameter period error');
+      const limit = limitOf(q, 100, 100);
+      const base = inst.instId.startsWith('BTC') ? 250000 : 400000;
+      const px = e.ticker(inst.instId)?.last ?? '0';
+      const newest = barStart(period, e.now());
+      const rows: Array<[string, string, string, string]> = [];
+      for (let i = 0; i < limit; i++) {
+        const index = Math.floor(newest / BAR_MS[period]) - i;
+        const oi = d(base).mul(d(1).minus(d('0.004').mul(i))).plus(((index % 11) + 11) % 11 * 100).toDecimalPlaces(0);
+        const oiCcy = oi.mul(d(inst.ctVal));
+        rows.push([String(newest - i * BAR_MS[period]), oi.toFixed(), oiCcy.toFixed(), oiCcy.mul(d(px)).toFixed()]);
+      }
+      return ok(rows);
     });
     // Settled records, newest first, at the regular 8h cadence ending with the last settlement before now.
     this.get('/api/v5/public/funding-rate-history', false, (q) => {

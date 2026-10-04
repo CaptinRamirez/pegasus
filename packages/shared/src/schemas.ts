@@ -51,6 +51,11 @@ export const placeOrderRequestSchema = z
     size: orderSizeSchema,
     reduceOnly: z.boolean().optional(),
     clOrdId: clOrdIdSchema.optional(),
+    /**
+     * True when `clOrdId` was already sent in an earlier attempt whose outcome is unknown: the server looks the
+     * id up at the exchange before sending anything. Never forwarded to OKX.
+     */
+    retry: z.boolean().optional(),
   })
   .refine((o) => o.ordType === 'market' || o.px !== undefined, {
     message: 'px is required for non-market orders',
@@ -93,6 +98,8 @@ export type SetLeverageRequest = z.infer<typeof setLeverageRequestSchema>;
 export const killSwitchRequestSchema = z.object({
   enabled: z.boolean(),
   reason: z.string().max(200).optional(),
+  /** Only with enabled false, while the daily loss limit is still breached: release anyway and restart the day's baseline at the current equity */
+  rebase: z.boolean().optional(),
 });
 export type KillSwitchRequest = z.infer<typeof killSwitchRequestSchema>;
 

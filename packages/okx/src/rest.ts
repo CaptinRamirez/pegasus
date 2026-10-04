@@ -1,4 +1,4 @@
-import { OkxApiError, OkxHttpError } from './errors.js';
+import { OkxApiError, OkxHttpError, OkxTransportError } from './errors.js';
 import { restAuthHeaders, type OkxCredentials } from './sign.js';
 import type {
   OkxAccountConfig,
@@ -16,6 +16,7 @@ import type {
   OkxLeverageInfo,
   OkxMarkPrice,
   OkxOpenInterest,
+  OkxOpenInterestHistoryRow,
   OkxOpenInterestVolumeRow,
   OkxOrder,
   OkxOrderAck,
@@ -99,12 +100,19 @@ export class OkxRestClient {
     const init: RequestInit = { method, headers, signal: controller.signal };
     if (method === 'POST') init.body = bodyText;
     let res: Response;
+    let text: string;
     try {
       res = await this.fetchImpl(`${this.baseUrl}${requestPath}`, init);
+      // The timer stays armed until the body is read: a response that stalls after its headers must time out too.
+      text = await res.text();
+    } catch (err) {
+      if (controller.signal.aborted) throw new OkxTransportError(requestPath, `OKX did not answer within ${this.timeoutMs} ms`, true);
+      const cause = (err as { cause?: { code?: unknown } }).cause;
+      const reason = typeof cause?.code === 'string' ? cause.code : (err as Error).message;
+      throw new OkxTransportError(requestPath, `could not reach OKX (${reason})`, false);
     } finally {
       clearTimeout(timer);
     }
-    const text = await res.text();
     let json: OkxResponse<T>;
     try {
       json = JSON.parse(text) as OkxResponse<T>;
@@ -199,6 +207,15 @@ export class OkxRestClient {
    */
   getOpenInterestVolume(ccy: string, period: '5m' | '1H' | '1D' = '1D', opts: { begin?: number; end?: number } = {}): Promise<OkxOpenInterestVolumeRow[]> {
     return this.getData<OkxOpenInterestVolumeRow>('/api/v5/rubik/stat/contracts/open-interest-volume', { ccy, period, begin: opts.begin, end: opts.end });
+  }
+
+  /**
+   * Open interest history of one instrument (trading statistics), newest first, up to 100 rows.
+   * `period` takes the candle bar names, including the UTC-aligned ones (`1Dutc`); plain `1D` is the UTC+8 day.
+   * Rate limit: 5 requests per 2 seconds per IP.
+   */
+  getOpenInterestHistory(instId: string, period = '1Dutc', opts: { begin?: number; end?: number; limit?: number } = {}): Promise<OkxOpenInterestHistoryRow[]> {
+    return this.getData<OkxOpenInterestHistoryRow>('/api/v5/rubik/stat/contracts/open-interest-history', { instId, period, begin: opts.begin, end: opts.end, limit: opts.limit });
   }
 
   // ---- account ----
