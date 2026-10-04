@@ -1,5 +1,5 @@
 import { d, fmt, ZERO, type Dec } from '../num.js';
-import type { OkxExecType, OkxFill, OkxInstrument, OkxMgnMode, OkxOrdType, OkxOrder, OkxOrderState, OkxPosSide, OkxSide } from '../wire.js';
+import type { MockStop, OkxExecType, OkxFill, OkxInstrument, OkxMgnMode, OkxOrdType, OkxOrder, OkxOrderState, OkxPosSide, OkxSide, OkxTriggerPxType } from '../wire.js';
 
 export interface LastFill {
   px: Dec;
@@ -9,6 +9,31 @@ export interface LastFill {
   execType: OkxExecType;
   fee: Dec;
   pnl: Dec;
+}
+
+/** The stop-loss an order carries in `attachAlgoOrds`; it becomes a StopRec when the order is completely filled. */
+export interface AttachedSl {
+  attachAlgoId: string;
+  attachAlgoClOrdId: string;
+  slTriggerPx: Dec;
+  /** '-1' (market) or a limit price; the simulator always closes at market */
+  slOrdPx: string;
+  slTriggerPxType: OkxTriggerPxType;
+}
+
+/** An active stop-loss: closes `sz` of its position with a market order once its trigger price type reaches the trigger. */
+export interface StopRec {
+  algoId: string;
+  algoClOrdId: string;
+  ordId: string;
+  instId: string;
+  tdMode: OkxMgnMode;
+  posSide: OkxPosSide;
+  /** Side of the closing order: sell protects a long, buy a short */
+  side: OkxSide;
+  sz: Dec;
+  slTriggerPx: Dec;
+  slTriggerPxType: OkxTriggerPxType;
 }
 
 export interface OrderRec {
@@ -37,20 +62,56 @@ export interface OrderRec {
   lastFill: LastFill | null;
   amendResult: string;
   reqId: string;
+  attachSl: AttachedSl | null;
 }
 
 const MAX_HISTORY = 500;
 const MAX_FILLS = 1000;
 const ORD_ID_BASE = 1_700_000_000_000_000;
 const BILL_ID_BASE = 1_800_000_000_000_000;
+const ALGO_ID_BASE = 2_000_000_000_000_000;
 
 /** Live orders (time priority), finished-order history and the fill ledger. */
 export class OrderStore {
   private readonly live = new Map<string, OrderRec>();
   private readonly history: OrderRec[] = [];
   private readonly fills: OkxFill[] = [];
+  /** Active attached stops by the ordId of their parent order. They are algo orders: never part of the live orders. */
+  private readonly stops = new Map<string, StopRec>();
   private ordSeq = 0;
   private billSeq = 0;
+  private algoSeq = 0;
+
+  newAlgoId(): string {
+    this.algoSeq += 1;
+    return String(ALGO_ID_BASE + this.algoSeq);
+  }
+
+  /** Generates the stop of a parent order that has ended, for everything the order filled. */
+  addStop(parent: OrderRec, sl: AttachedSl): void {
+    this.stops.set(parent.ordId, {
+      algoId: sl.attachAlgoId,
+      algoClOrdId: sl.attachAlgoClOrdId,
+      ordId: parent.ordId,
+      instId: parent.instId,
+      tdMode: parent.tdMode,
+      posSide: parent.posSide,
+      side: parent.side === 'buy' ? 'sell' : 'buy',
+      sz: parent.accFillSz,
+      slTriggerPx: sl.slTriggerPx,
+      slTriggerPxType: sl.slTriggerPxType,
+    });
+  }
+
+  removeStop(stop: StopRec): void {
+    this.stops.delete(stop.ordId);
+  }
+
+  activeStops(instId?: string): StopRec[] {
+    const out: StopRec[] = [];
+    for (const s of this.stops.values()) if (!instId || s.instId === instId) out.push(s);
+    return out;
+  }
 
   newOrdId(): string {
     this.ordSeq += 1;
@@ -149,6 +210,10 @@ export class OrderStore {
   }
 }
 
+export function stopToWire(s: StopRec): MockStop {
+  return { algoId: s.algoId, algoClOrdId: s.algoClOrdId, ordId: s.ordId, instId: s.instId, tdMode: s.tdMode, posSide: s.posSide, side: s.side, sz: fmt(s.sz), slTriggerPx: fmt(s.slTriggerPx), slTriggerPxType: s.slTriggerPxType };
+}
+
 /** Converts an order to the OKX wire shape. `fillEvent` controls the per-fill fields. */
 export function orderToWire(o: OrderRec, fillEvent: boolean): OkxOrder {
   const f = fillEvent ? o.lastFill : null;
@@ -192,7 +257,24 @@ export function orderToWire(o: OrderRec, fillEvent: boolean): OkxOrder {
     stpMode: 'cancel_maker',
     algoClOrdId: '',
     algoId: '',
-    attachAlgoOrds: [],
+    attachAlgoOrds: o.attachSl
+      ? [
+          {
+            attachAlgoId: o.attachSl.attachAlgoId,
+            attachAlgoClOrdId: o.attachSl.attachAlgoClOrdId,
+            tpTriggerPx: '',
+            tpOrdPx: '',
+            tpTriggerPxType: '',
+            slTriggerPx: fmt(o.attachSl.slTriggerPx),
+            slOrdPx: o.attachSl.slOrdPx,
+            slTriggerPxType: o.attachSl.slTriggerPxType,
+            sz: '',
+            amendPxOnTriggerType: '0',
+            failCode: '',
+            failReason: '',
+          },
+        ]
+      : [],
     cTime: String(o.cTime),
     uTime: String(o.uTime),
     execType: f ? f.execType : '',

@@ -182,8 +182,18 @@ export class RestRouter {
         return { instType: 'SWAP', instId: inst.instId, oi: String(oi), oiCcy: String(oi * ctVal), oiUsd: String(oi * ctVal * px), ts: now };
       }));
     });
-    // Deterministic synthetic history per instrument, newest first: [ts, contracts, coin, USD]. The level
-    // drifts up towards the present with a small fixed wobble, so the 1d and 10d changes are non-zero.
+    // Deterministic synthetic history per instrument, newest first: [ts, contracts, coin, USD]. One level
+    // function of time serves every period, by OKX's END convention for recent data: the row labelled T
+    // holds the level at the end of its period and the newest row, still forming, the current level, so
+    // 1Dutc(D) equals 12Hutc(D + 12h). The level swings 12% over 30 days with a small fixed wobble, so
+    // the 1d and 10d changes are non-zero.
+    const oiLevel = (base: number, t: number) => {
+      const cycle = 60 * BAR_MS['1D'];
+      const phase = d(((t % cycle) + cycle) % cycle).div(BAR_MS['1D']);
+      const swing = phase.gt(30) ? d(60).minus(phase) : phase;
+      const wobble = ((Math.floor(t / BAR_MS['12Hutc']) % 11) + 11) % 11 * 100;
+      return d(base).mul(d(1).plus(d('0.004').mul(swing))).plus(wobble).toDecimalPlaces(0);
+    };
     this.get('/api/v5/rubik/stat/contracts/open-interest-history', false, (q) => {
       const instId = q.get('instId');
       if (!instId) return err('50014', 'Parameter instId cannot be empty.');
@@ -194,13 +204,14 @@ export class RestRouter {
       const limit = limitOf(q, 100, 100);
       const base = inst.instId.startsWith('BTC') ? 250000 : 400000;
       const px = e.ticker(inst.instId)?.last ?? '0';
-      const newest = barStart(period, e.now());
+      const now = e.now();
+      const newest = barStart(period, now);
       const rows: Array<[string, string, string, string]> = [];
       for (let i = 0; i < limit; i++) {
-        const index = Math.floor(newest / BAR_MS[period]) - i;
-        const oi = d(base).mul(d(1).minus(d('0.004').mul(i))).plus(((index % 11) + 11) % 11 * 100).toDecimalPlaces(0);
+        const label = newest - i * BAR_MS[period];
+        const oi = oiLevel(base, i === 0 ? now : label + BAR_MS[period]);
         const oiCcy = oi.mul(d(inst.ctVal));
-        rows.push([String(newest - i * BAR_MS[period]), oi.toFixed(), oiCcy.toFixed(), oiCcy.mul(d(px)).toFixed()]);
+        rows.push([String(label), oi.toFixed(), oiCcy.toFixed(), oiCcy.mul(d(px)).toFixed()]);
       }
       return ok(rows);
     });

@@ -1,13 +1,16 @@
 import { randomBytes } from 'node:crypto';
 import { OkxApiError, OkxTransportError, OkxWsError, type OkxCancelOrderParams, type OkxOrder, type OkxOrderAck, type OkxPlaceOrderParams } from '@pegasus/okx';
 import {
+  ceilToStep,
   contractsToCoin,
   D,
   Decimal,
+  floorToStep,
   normalizePrice,
   notionalQuote,
   sizeToContracts,
   SizingError,
+  toPlainString,
   type CancelOrderRequest,
   type ClosePositionRequest,
   type Instrument,
@@ -30,6 +33,8 @@ import { isClosingOrder, type ExposureReservation, type RiskEngine } from './ris
 const CL_ORD_PREFIX = 'pg';
 /** Longest an accepted order is held against the limits while the account mirror has not shown its effect. */
 const RESERVATION_TTL_MS = 10_000;
+/** Prefix of the client id of an attached stop-loss; the rest is the tail of the order's clOrdId. */
+const ATTACH_SL_PREFIX = 'sl';
 /** How many submitted client order ids are remembered for the retry lookup. */
 const MAX_SENT_IDS = 200;
 
@@ -50,6 +55,12 @@ interface Reservation extends ExposureReservation {
 export function generateClOrdId(now = Date.now()): string {
   // 2 + 9 + 8 = 19 alphanumeric chars, well under OKX's 32 limit
   return `${CL_ORD_PREFIX}${now.toString(36)}${randomBytes(5).toString('hex').slice(0, 8)}`;
+}
+
+/** Client id of the stop attached to an order, inside OKX's limit of 32 alphanumeric characters. */
+export function attachAlgoClOrdIdFor(clOrdId: string): string {
+  // The tail is kept: that is where a generated id carries its random part.
+  return `${ATTACH_SL_PREFIX}${clOrdId.slice(-(32 - ATTACH_SL_PREFIX.length))}`;
 }
 
 /** Translate OKX order errors into API errors with the exchange code attached. */
@@ -160,6 +171,8 @@ export class OrderService {
     }
     const markRef = this.market.refPrice(req.instId);
     if (markRef === undefined) throw new AppError('NO_PRICE', `no reference price available yet for ${req.instId}`, 503);
+    const stop = req.slTriggerPx === undefined ? null : this.attachedStop(req.slTriggerPx, req, inst, posSide, closing, sized.sz, refPrice);
+    // The stop is not an input of the risk check: it never relaxes a limit.
     const risk = this.risk.check({
       inst,
       side: req.side,
@@ -182,7 +195,34 @@ export class OrderService {
     if (placeAs !== undefined && risk.ok && !closing) {
       this.reservations.set(placeAs, { clOrdId: placeAs, instId: req.instId, side: req.side, posSide, notional, full: notional, expiresAt: Infinity, closedAt: null, partial: null });
     }
-    return { instId: req.instId, side: req.side, ordType: req.ordType, tdMode, posSide, sz: sized.sz, coin: sized.coin.toFixed(), px, refPrice, notionalQuote: notional, estSlippagePct, lever, risk };
+    return { instId: req.instId, side: req.side, ordType: req.ordType, tdMode, posSide, sz: sized.sz, coin: sized.coin.toFixed(), px, refPrice, notionalQuote: notional, estSlippagePct, lever, slTriggerPx: stop?.slTriggerPx ?? '', stopLossQuote: stop?.stopLossQuote ?? '', risk };
+  }
+
+  /**
+   * Validate the stop-loss an opening order asks for and work out what it loses. The trigger is rounded to the
+   * tick towards the entry (the smaller loss) and must lie on the losing side of both the order's reference
+   * price and the mark: the stop is triggered by the mark price, so one on the wrong side of it fires at once.
+   * Only the live mark will do for that; the last price or the book mid the other rules fall back on is not it.
+   */
+  private attachedStop(raw: string, req: PlaceOrderRequest, inst: Instrument, posSide: PosSide, closing: boolean, sz: string, refPrice: string): { slTriggerPx: string; stopLossQuote: string } {
+    if (closing) throw new AppError('VALIDATION', 'a stop-loss can only be attached to an order that opens a position');
+    const buy = req.side === 'buy';
+    // Net mode: without reduce-only an order against the open position reduces or flips it; its stop would protect nothing.
+    const reduces = posSide === 'net' && this.account.positionList().some((p) => p.instId === req.instId && p.posSide === 'net' && (buy ? D(p.pos || '0').lt(0) : D(p.pos || '0').gt(0)));
+    if (reduces) throw new AppError('VALIDATION', `a stop-loss can only be attached to an order that opens a position: this ${req.side} order reduces the open net ${buy ? 'short' : 'long'} position of ${req.instId}`);
+    const markPx = this.market.liveMarkPrice(req.instId);
+    if (markPx === undefined) throw new AppError('NO_PRICE', `no live mark price for ${req.instId}: a mark-triggered stop-loss cannot be checked against it; retry shortly or place the order without the stop`, 503);
+    const trigger = buy ? ceilToStep(raw, inst.tickSz) : floorToStep(raw, inst.tickSz);
+    const slTriggerPx = toPlainString(trigger, inst.tickSz);
+    const details = { slTriggerPx, refPrice, markPx };
+    if (trigger.lte(0)) throw new AppError('VALIDATION', 'the stop-loss trigger rounds to zero at this tick size', 400, details);
+    const losing = (px: string): boolean => (buy ? trigger.lt(px) : trigger.gt(px));
+    if (!losing(refPrice) || !losing(markPx)) {
+      throw new AppError('VALIDATION', `the stop-loss trigger ${slTriggerPx} must be ${buy ? 'below' : 'above'} both the order price ${refPrice} and the mark price ${markPx} for a ${req.side} order`, 400, details);
+    }
+    // Coin held at the entry times the price distance: also right for inverse contracts, whose coin amount depends on the entry.
+    const stopLossQuote = contractsToCoin(sz, inst, refPrice).mul(D(refPrice).minus(trigger).abs()).toFixed();
+    return { slTriggerPx, stopLossQuote };
   }
 
   private startReservationClock(clOrdId: string): void {
@@ -270,6 +310,10 @@ export class OrderService {
     if (preview.ordType !== 'market') params.px = preview.px;
     if (config.posMode === 'long_short_mode') params.posSide = preview.posSide;
     else if (req.reduceOnly) params.reduceOnly = true;
+    // The exchange creates the stop when the order fills, sized to the fill. OKX triggers on the last price unless told otherwise.
+    if (preview.slTriggerPx !== '') {
+      params.attachAlgoOrds = [{ attachAlgoClOrdId: attachAlgoClOrdIdFor(clOrdId), slTriggerPx: preview.slTriggerPx, slOrdPx: '-1', slTriggerPxType: 'mark' }];
+    }
 
     const t0 = Date.now();
     this.rememberSent(clOrdId, req.instId);
@@ -289,7 +333,7 @@ export class OrderService {
     }
     // The clock of the reservation starts at the acknowledgement, not at the submit.
     this.startReservationClock(clOrdId);
-    this.log.info({ ordId: ack.ordId, clOrdId, instId: params.instId, side: params.side, ordType: params.ordType, sz: params.sz, px: params.px, latencyMs: Date.now() - t0 }, 'order accepted');
+    this.log.info({ ordId: ack.ordId, clOrdId, instId: params.instId, side: params.side, ordType: params.ordType, sz: params.sz, px: params.px, slTriggerPx: preview.slTriggerPx, latencyMs: Date.now() - t0 }, 'order accepted');
     const order: Order = {
       ordId: ack.ordId,
       clOrdId,
@@ -311,6 +355,7 @@ export class OrderService {
       cTime: t0,
       uTime: t0,
     };
+    if (preview.slTriggerPx !== '') order.slTriggerPx = preview.slTriggerPx;
     // Journal the synthetic 'live' row only when the fill push has not already recorded a newer state.
     if (this.account.noteLocalOrder(order)) void this.store.upsertOrder(order).catch(() => undefined);
     return { order, preview };
@@ -355,6 +400,8 @@ export class OrderService {
       notionalQuote: refPrice === '' ? '' : notionalQuote(order.sz, refPrice, inst).toFixed(),
       estSlippagePct: '',
       lever: order.lever,
+      slTriggerPx: order.slTriggerPx ?? '',
+      stopLossQuote: '',
       risk: { ok: true, code: 'OK', message: 'already at the exchange; nothing was sent' },
     };
   }

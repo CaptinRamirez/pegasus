@@ -1,11 +1,22 @@
 import { d, isDecimalString, isMultipleOf, ZERO, type Dec } from '../num.js';
-import type { OkxMgnMode, OkxOrdType, OkxPosSide, OkxSide } from '../wire.js';
+import type { OkxMgnMode, OkxOrdType, OkxPosSide, OkxSide, OkxTriggerPxType } from '../wire.js';
 import { reject, type EngineContext, type Rejection } from './context.js';
-import type { OrderRec } from './orders.js';
+import type { AttachedSl, OrderRec } from './orders.js';
 
 const ORD_TYPES: readonly OkxOrdType[] = ['market', 'limit', 'post_only', 'fok', 'ioc'];
 const CL_ORD_ID_RE = /^[A-Za-z0-9]{1,32}$/;
 const TAG_RE = /^[A-Za-z0-9]{1,16}$/;
+const TRIGGER_PX_TYPES: readonly OkxTriggerPxType[] = ['last', 'index', 'mark'];
+
+/**
+ * OKX's codes for a stop-loss on the wrong side, by trigger price type and order side: a buy's stop "cannot be
+ * higher than" the price, a sell's "cannot be lower than" it.
+ */
+const WRONG_SIDE_CODES: Record<OkxTriggerPxType, Record<OkxSide, string>> = {
+  last: { sell: '51278', buy: '51280' },
+  mark: { sell: '51302', buy: '51304' },
+  index: { sell: '51306', buy: '51308' },
+};
 
 export type Raw = Record<string, unknown>;
 
@@ -83,6 +94,8 @@ export function validatePlace(body: unknown, ctx: EngineContext): OrderRec | Rej
   const lever = account.leverFor(instId, tdMode, posSide);
   const marginError = checkMargin(ctx, inst.instId, tdMode, side, posSide, sz, px, lever, reduceOnly);
   if (marginError) return marginError;
+  const attachSl = parseAttachedSl(raw['attachAlgoOrds'], ctx, instId, side, px, opening && !reduceOnly);
+  if (attachSl && 'sCode' in attachSl) return attachSl;
 
   const now = ctx.now();
   return {
@@ -110,7 +123,47 @@ export function validatePlace(body: unknown, ctx: EngineContext): OrderRec | Rej
     lastFill: null,
     amendResult: '',
     reqId: '',
+    attachSl,
   };
+}
+
+/**
+ * The stop-loss of `attachAlgoOrds`, or null when the order carries none. Only one attached order with a
+ * stop-loss is simulated; take-profit fields are refused rather than silently dropped.
+ *
+ * A stop on the wrong side of the price that triggers it is refused with OKX's documented code for that trigger
+ * price type and side (51278/51280 last, 51302/51304 mark, 51306/51308 index). The other refusals are the generic
+ * parameter error 51000: OKX documents no code for them.
+ */
+function parseAttachedSl(value: unknown, ctx: EngineContext, instId: string, side: OkxSide, px: Dec | null, opening: boolean): AttachedSl | Rejection | null {
+  if (value === undefined || (Array.isArray(value) && value.length === 0)) return null;
+  const bad = (what: string): Rejection => reject('51000', `Parameter attachAlgoOrds error: ${what}`);
+  if (!Array.isArray(value) || value.length !== 1) return bad('exactly one attached order is simulated');
+  const a = asRecord(value[0]);
+  if (!a) return bad('object expected');
+  for (const tp of ['tpTriggerPx', 'tpOrdPx', 'tpTriggerPxType']) if (a[tp] !== undefined && a[tp] !== '') return bad('take-profit is not simulated');
+  const inst = ctx.instruments.get(instId);
+  const market = ctx.markets.get(instId);
+  if (!inst || !market) return reject('51001', 'Instrument ID does not exist.');
+  const triggerStr = str(a, 'slTriggerPx');
+  if (!triggerStr || !isDecimalString(triggerStr) || d(triggerStr).lte(0) || !isMultipleOf(d(triggerStr), d(inst.tickSz))) return bad('slTriggerPx');
+  const slOrdPx = str(a, 'slOrdPx');
+  if (!slOrdPx || (slOrdPx !== '-1' && (!isDecimalString(slOrdPx) || d(slOrdPx).lte(0)))) return bad('slOrdPx');
+  const typeRaw = a['slTriggerPxType'];
+  // OKX's default trigger price type is the last price.
+  const slTriggerPxType = typeRaw === undefined || typeRaw === '' ? 'last' : TRIGGER_PX_TYPES.find((t) => t === typeRaw);
+  if (!slTriggerPxType) return bad('slTriggerPxType');
+  const attachAlgoClOrdId = str(a, 'attachAlgoClOrdId') ?? '';
+  if (attachAlgoClOrdId !== '' && !CL_ORD_ID_RE.test(attachAlgoClOrdId)) return bad('attachAlgoClOrdId');
+  if (!opening) return bad('a stop-loss cannot be attached to an order that closes a position');
+  // Wrong side: already reached by the price that triggers it (the index price is not modelled apart from the mark).
+  const trigger = d(triggerStr);
+  const triggerRef = slTriggerPxType === 'last' ? market.lastPx : market.markPx;
+  const losing = (ref: Dec): boolean => (side === 'buy' ? trigger.lt(ref) : trigger.gt(ref));
+  if (!losing(triggerRef)) return reject(WRONG_SIDE_CODES[slTriggerPxType][side], `SL trigger price cannot be ${side === 'buy' ? 'higher' : 'lower'} than the ${slTriggerPxType} price`);
+  // At or beyond the order's own price: no documented code.
+  if (!losing(px ?? market.lastPx)) return bad(`the SL trigger price must be ${side === 'buy' ? 'lower' : 'higher'} than the order price`);
+  return { attachAlgoId: ctx.orders.newAlgoId(), attachAlgoClOrdId, slTriggerPx: trigger, slOrdPx, slTriggerPxType };
 }
 
 function checkMargin(ctx: EngineContext, instId: string, tdMode: OkxMgnMode, side: OkxSide, posSide: OkxPosSide, sz: Dec, px: Dec | null, lever: Dec, reduceOnly: boolean): Rejection | null {

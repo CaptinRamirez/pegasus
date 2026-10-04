@@ -5,7 +5,7 @@ import type { Store } from '../db/store.js';
 import { NotConnectedError, ReadOnlyKeyError } from '../errors.js';
 import type { Logger } from '../logger.js';
 import type { OkxClients } from '../okx/clients.js';
-import { fillFromOrderPush, mapBalance, mapFill, mapOrder, mapPosition, positionKey } from '../okx/mappers.js';
+import { failedAttachedStop, fillFromOrderPush, mapBalance, mapFill, mapOrder, mapPosition, positionKey } from '../okx/mappers.js';
 
 export interface AccountEvents {
   order: [Order];
@@ -453,6 +453,10 @@ export class AccountService extends EventEmitter<AccountEvents> {
 
   private applyOrderPush(raw: OkxOrder): void {
     const order = mapOrder(raw);
+    const lostStop = failedAttachedStop(raw);
+    if (lostStop) {
+      this.log.error({ ordId: order.ordId, clOrdId: order.clOrdId, instId: order.instId, slTriggerPx: lostStop.slTriggerPx, failCode: lostStop.failCode, failReason: lostStop.failReason }, 'the exchange did not create the stop-loss attached to this order; its position has no stop, place one on OKX');
+    }
     if (OPEN_STATES.has(order.state)) {
       this.openOrders.set(order.ordId, order);
     } else {

@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import type { Order } from '@pegasus/shared';
+import { stopAwaitsFullFill, type Order } from '@pegasus/shared';
 import { api } from '../lib/api';
 import { errorMessage } from '../lib/http';
 import { ORDER_HISTORY_QUERY } from '../hooks/useSession';
@@ -16,6 +16,9 @@ const UNKNOWN_TEXT: Record<AccountUnknown, string> = {
   failed: 'Orders not loaded (see the warning above)',
   unloaded: 'Account not loaded',
 };
+
+const STOP_NOT_ACTIVE_TITLE =
+  'OKX creates the attached stop only when the order is completely filled. The part that has filled is a position WITHOUT a stop: let the order fill, or cancel the remainder and check on OKX that the stop of the filled part exists.';
 
 interface Props {
   mode: 'open' | 'history';
@@ -73,6 +76,7 @@ export function OrdersTable({ mode }: Props) {
           <th className="left">Side</th>
           <th className="left">Type</th>
           <th>Price</th>
+          {mode === 'open' && <th title="Stop-loss attached to the order: OKX creates it only when the order is completely filled (mark trigger, market execution)">Stop</th>}
           <th>Size</th>
           <th>Filled</th>
           {mode === 'history' && <th>Avg px</th>}
@@ -109,6 +113,16 @@ export function OrdersTable({ mode }: Props) {
               </td>
               <td className="left">{o.ordType}</td>
               <td>{o.px === '' ? 'market' : fmtPx(o.px, inst)}</td>
+              {mode === 'open' && (
+                <td>
+                  {o.slTriggerPx === undefined ? '–' : fmtPx(o.slTriggerPx, inst)}
+                  {stopAwaitsFullFill(o) && (
+                    <span className="untracked-tag" title={STOP_NOT_ACTIVE_TITLE}>
+                      not active
+                    </span>
+                  )}
+                </td>
+              )}
               <td>{fmtContracts(o.sz, inst)}</td>
               <td>{fmtContracts(o.accFillSz, inst)}</td>
               {mode === 'history' && <td>{o.avgPx === '' ? '–' : fmtPx(o.avgPx, inst)}</td>}

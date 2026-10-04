@@ -79,6 +79,8 @@ const hello: HelloPayload = {
     dailyPnl: '123.45',
     openOrders: 0,
     totalPositionNotional: '0',
+    overLimit: [],
+    totalOverLimit: '',
     updatedAt: 1,
   },
   connection: { okxPublic: 'connected', okxPrivate: 'connected', okxBusiness: 'connected', account: { state: 'ok', error: null, lastSyncAt: Date.now(), readOnly: false }, demo: true, dataAgeMs: 5, staleStreams: [] },

@@ -92,8 +92,8 @@ beforeAll(async () => {
   const hub = new Hub(config, marketData, account, risk, log);
   deps = { config, log, clients, store, market: marketData, account, risk, orders, signals, hub };
   account.on('balance', (b) => risk.updateEquity(b.totalEq));
-  account.on('positions', () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional()));
-  account.on('order', () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional()));
+  account.on('positions', () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional(), account.positionList(), (id) => deps.market.specOf(id)));
+  account.on('order', () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional(), account.positionList(), (id) => deps.market.specOf(id)));
   new KillSwitchSweeper(risk, account, orders, log).start();
   hub.wire();
   app = await buildServer(deps);

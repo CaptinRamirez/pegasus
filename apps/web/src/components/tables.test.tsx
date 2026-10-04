@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import type { Fill, Instrument, Order, Position } from '@pegasus/shared';
+import type { Fill, Instrument, Order, Position, RiskState } from '@pegasus/shared';
 import { api } from '../lib/api';
 import { ApiError } from '../lib/http';
 import { useHistorySeed } from '../hooks/useSession';
@@ -140,6 +140,29 @@ describe('History and Fills tables', () => {
     expect(text()).toContain('61,000');
   });
 
+  it('open orders show the stop attached to a resting order, and a dash when there is none', async () => {
+    const resting: Order = { ...order, state: 'live', accFillSz: '0', avgPx: '' };
+    useStore.setState({ orders: { o1: { ...resting, slTriggerPx: '58000' }, o2: { ...resting, ordId: 'o2', cTime: order.cTime - 1 } } });
+    await render(<OrdersTable mode="open" />);
+    const headers = [...container.querySelectorAll('th')].map((th) => th.textContent);
+    const col = headers.indexOf('Stop');
+    expect(col).toBe(headers.indexOf('Price') + 1);
+    const stops = [...container.querySelectorAll('tbody tr')].map((tr) => tr.querySelectorAll('td')[col]?.textContent);
+    expect(stops).toEqual(['58,000', '–']);
+    expect(container.querySelector('tbody .untracked-tag')).toBeNull();
+  });
+
+  it('a partially filled open order shows that its stop is not active until the order is filled', async () => {
+    const partial: Order = { ...order, state: 'partially_filled', accFillSz: '1' };
+    useStore.setState({ orders: { o1: { ...partial, slTriggerPx: '58000' }, o2: { ...partial, ordId: 'o2', cTime: order.cTime - 1 } } });
+    await render(<OrdersTable mode="open" />);
+    const col = [...container.querySelectorAll('th')].map((th) => th.textContent).indexOf('Stop');
+    const cells = [...container.querySelectorAll('tbody tr')].map((tr) => tr.querySelectorAll('td')[col]);
+    expect(cells.map((td) => td?.textContent)).toEqual(['58,000not active', '–']);
+    expect(cells[0]?.querySelector('span')?.getAttribute('title')).toContain('only when the order is completely filled');
+    expect(cells[0]?.querySelector('span')?.getAttribute('title')).toContain('WITHOUT a stop');
+  });
+
   it('an empty list after a successful load still reads as empty', async () => {
     orderHistory.mockResolvedValue([]);
     fills.mockResolvedValue([]);
@@ -194,5 +217,60 @@ describe('rows of an instrument outside the tracked list', () => {
     expect(tracked[4]).toBe('60,000');
     expect(tracked[10]).toBe('610.00');
     expect(rows[1]?.querySelector('.untracked-tag')).toBeNull();
+    // no risk state, or nothing over the limit: no row is marked
+    expect(container.querySelector('.over-limit')).toBeNull();
+    expect(container.querySelector('.over-limit-tag')).toBeNull();
+  });
+
+  it('marks the row of a position that has outgrown its limit and shows how much to trim; Close stays enabled', async () => {
+    const risk: RiskState = {
+      killSwitch: false, killSwitchReason: '', cancelSweep: { state: 'idle', message: '', ts: 1 }, dayStartTs: 0, dayStartEquity: '100000', baselineTs: 0,
+      currentEquity: '100000', dailyPnl: '0', openOrders: 0, totalPositionNotional: '36643', updatedAt: 1,
+      overLimit: [{ instId: 'BTC-USDT-SWAP', notional: '36600', limit: '30000', excess: '6600' }], totalOverLimit: '',
+    };
+    // 60 contracts x 0.01 BTC x 61,000 = 36,600: 610 per contract, 6,600 / 610 = 10.8 -> 10 whole contracts
+    const big: Position = { ...pepe, instId: 'BTC-USDT-SWAP', pos: '60', avgPx: '20000', markPx: '61000', liqPx: '', margin: '12200', notionalUsd: '36600' };
+    useStore.setState({ risk, positions: [pepe, big] });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={qc}>
+          <PositionsTable />
+        </QueryClientProvider>,
+      );
+    });
+    const rows = [...container.querySelectorAll('tbody tr')];
+    expect(rows[0]?.classList.contains('over-limit')).toBe(false);
+    expect(rows[0]?.querySelector('.over-limit-tag')).toBeNull();
+    expect(rows[1]?.classList.contains('over-limit')).toBe(true);
+    expect(rows[1]?.querySelector('.over-limit-tag')?.textContent).toBe('over limit: trim 6,600 USD (10 ct)');
+    expect(rows[1]?.querySelectorAll('td')[11]?.textContent).toBe('36,600over limit: trim 6,600 USD (10 ct)');
+    expect(rows[1]?.querySelector('button')?.disabled).toBe(false);
+  });
+
+  it('long/short mode: both legs are marked, the trim is shown on the larger leg only', async () => {
+    const risk: RiskState = {
+      killSwitch: false, killSwitchReason: '', cancelSweep: { state: 'idle', message: '', ts: 1 }, dayStartTs: 0, dayStartEquity: '100000', baselineTs: 0,
+      currentEquity: '100000', dailyPnl: '0', openOrders: 0, totalPositionNotional: '36600', updatedAt: 1,
+      overLimit: [{ instId: 'BTC-USDT-SWAP', notional: '36600', limit: '30000', excess: '6600' }], totalOverLimit: '',
+    };
+    // 20 short + 40 long contracts at 610 each: 12,200 + 24,400 = 36,600 gross, 6,600 over
+    const leg: Position = { ...pepe, instId: 'BTC-USDT-SWAP', avgPx: '20000', markPx: '61000', liqPx: '', margin: '1000' };
+    const short: Position = { ...leg, posSide: 'short', pos: '20', notionalUsd: '12200' };
+    const long: Position = { ...leg, posSide: 'long', pos: '40', notionalUsd: '24400' };
+    useStore.setState({ risk, positions: [short, long] });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={qc}>
+          <PositionsTable />
+        </QueryClientProvider>,
+      );
+    });
+    const rows = [...container.querySelectorAll('tbody tr')];
+    expect(rows.map((r) => r.classList.contains('over-limit'))).toEqual([true, true]);
+    expect(rows[0]?.querySelector('.over-limit-tag')).toBeNull();
+    expect(rows[1]?.querySelector('.over-limit-tag')?.textContent).toBe('over limit: trim 6,600 USD (10 ct)');
+    expect(container.querySelectorAll('.over-limit-tag')).toHaveLength(1);
   });
 });

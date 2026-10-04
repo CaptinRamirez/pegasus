@@ -52,7 +52,7 @@ export function OrderTicket() {
   const instId = inst?.instId ?? null;
   useEffect(() => {
     // The close checkbox and a unit that a pre-fill brought belong to the instrument they were set for.
-    setForm((f) => ({ ...f, px: '', sizeValue: '', reduceOnly: false, sizeUnit: f.restoreUnit ?? f.sizeUnit, restoreUnit: null }));
+    setForm((f) => ({ ...f, px: '', slTriggerPx: '', sizeValue: '', reduceOnly: false, sizeUnit: f.restoreUnit ?? f.sizeUnit, restoreUnit: null }));
   }, [instId]);
 
   useEffect(() => {
@@ -63,7 +63,8 @@ export function OrderTicket() {
   useEffect(() => {
     if (ticketPrefill === null || ticketPrefill.instId !== instId) return;
     const { side, ordType, px, sizeValue, sizeUnit } = ticketPrefill;
-    setForm((f) => ({ ...f, side, ordType, px, sizeValue, sizeUnit, reduceOnly: false, restoreUnit: f.restoreUnit ?? f.sizeUnit }));
+    // A prefill without a stop clears the one the form held: it belonged to another order.
+    setForm((f) => ({ ...f, side, ordType, px, slTriggerPx: ticketPrefill.slTriggerPx ?? '', sizeValue, sizeUnit, reduceOnly: false, restoreUnit: f.restoreUnit ?? f.sizeUnit }));
   }, [ticketPrefill, instId]);
 
   const longShort = posMode === 'long_short_mode';
@@ -82,7 +83,8 @@ export function OrderTicket() {
       attempt.current = null;
       setSubmitError(null);
       const intent = intentOf(order.side, order.posSide);
-      pushToast('success', `Order ${order.state}: ${intent === null ? '' : `${intent}, `}${order.side} ${order.sz} contracts ${order.instId}${order.px !== '' ? ` @ ${order.px}` : ''} (${order.ordId})`);
+      const stop = order.slTriggerPx === undefined ? '' : `, stop ${order.slTriggerPx} (mark)`;
+      pushToast('success', `Order ${order.state}: ${intent === null ? '' : `${intent}, `}${order.side} ${order.sz} contracts ${order.instId}${order.px !== '' ? ` @ ${order.px}` : ''}${stop} (${order.ordId})`);
     },
     onError: (e) => {
       const failed = submitFailure(e, attempt.current?.retry ?? false);
@@ -190,6 +192,15 @@ export function OrderTicket() {
             </select>
           </div>
         </div>
+
+        {!form.reduceOnly && (
+          <div className="field">
+            <label title="Stop-loss attached to the order: OKX creates it only once the order is completely filled; while the order is partially filled, the filled part has no stop. Triggered by the mark price and executed at market. Leave empty for none.">
+              Stop (mark) <span className="dim">(optional, tick {inst.tickSz})</span>
+            </label>
+            <input className="num" inputMode="decimal" value={form.slTriggerPx} placeholder="none" onChange={(e) => patch({ slTriggerPx: e.target.value })} />
+          </div>
+        )}
 
         {posMode === 'net_mode' && (
           <label className="check">

@@ -13,8 +13,8 @@ import type {
   Ticker,
   Trade,
 } from '@pegasus/shared';
-import { accountAsOf, accountUnknown, activeAlerts, isStreamStale, killSwitchSweepNotice } from './alerts';
-import { applyServerMessage, applyWsStatus, stampMessage } from './reducers';
+import { accountAsOf, accountUnknown, activeAlerts, isStreamStale, killSwitchSweepNotice, overLimitNotice, trimAdvice, trimShares } from './alerts';
+import { LOST_STOP_RECENT_MS, applyOrderHistorySeed, applyServerMessage, applyWsStatus, pushToast, stampMessage } from './reducers';
 import { ACCOUNT_NOT_LOADED_BLOCK, READ_ONLY_KEY_BLOCK, getTradingBlock } from './store';
 import { LIMITS, initialState, type TerminalState } from './types';
 
@@ -63,6 +63,8 @@ const risk: RiskState = {
   dailyPnl: '50',
   openOrders: 1,
   totalPositionNotional: '0',
+  overLimit: [],
+  totalOverLimit: '',
   updatedAt: 1,
 };
 
@@ -248,6 +250,103 @@ describe('applyServerMessage', () => {
     expect(s.orderHistory.map((o) => o.ordId)).toEqual(['o1', 'o2']);
   });
 
+  it('an order whose attached stop was not created raises one error toast per order, not one per push', () => {
+    let s = stateAfterHello();
+    expect(s.toasts).toEqual([]);
+    const lost = { slFailReason: '51279: TP trigger price error' };
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o2', { state: 'partially_filled', accFillSz: '0.5', ...lost }) }) };
+    expect(s.toasts).toHaveLength(1);
+    expect(s.toasts[0]?.kind).toBe('error');
+    const message = s.toasts[0]?.message ?? '';
+    expect(message).toContain('STOP-LOSS NOT CREATED: BTC-USDT-SWAP order o2 (buy 1 contracts)');
+    expect(message).toContain('did NOT create the stop attached to it (51279: TP trigger price error)');
+    expect(message).toContain('Place the stop on OKX now.');
+    expect(s.orders['o2']?.slFailReason).toBe(lost.slFailReason);
+
+    // the next pushes of that order, its last one and a reconnect's hello repeat the reason: no second toast
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o2', { state: 'partially_filled', accFillSz: '0.8', ...lost }) }) };
+    s = { ...s, ...applyServerMessage(s, { type: 'hello', data: { ...hello, openOrders: [order('o2', { state: 'partially_filled', accFillSz: '0.8', ...lost })] } }) };
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o2', { state: 'filled', accFillSz: '1', ...lost }) }) };
+    expect(s.toasts).toHaveLength(1);
+    expect(s.orderHistory.map((o) => o.ordId)).toEqual(['o2']);
+
+    // another order is another notice; an order whose stop exists raises none
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o3', { state: 'filled', ...lost }) }) };
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o4', { slTriggerPx: '58000' }) }) };
+    expect(s.toasts.map((t) => t.message.includes('order o3'))).toEqual([false, true]);
+    expect(s.lostStopNotified).toEqual(['o2', 'o3']);
+
+    // a page that loads while such an order is still open is told by hello
+    const fresh = { ...initialState('tok'), ...applyServerMessage(initialState('tok'), { type: 'hello', data: { ...hello, openOrders: [order('o1'), order('o5', lost), order('o6', lost)] } }) };
+    expect(fresh.toasts.map((t) => t.kind)).toEqual(['error', 'error']);
+    expect(fresh.toasts.map((t) => t.id)).toEqual([1, 2]);
+    expect(fresh.lostStopNotified).toEqual(['o5', 'o6']);
+  });
+
+  it('a recent order of the REST history whose stop was not created is told once; an old one is not', () => {
+    const now = 10 * LOST_STOP_RECENT_MS;
+    const lost = { state: 'filled', slFailReason: '51279: TP trigger price error' } as const;
+    // filled while the page was reloading: no push was seen and hello does not list it
+    const history = [order('o7', { ...lost, uTime: now - 60_000 }), order('o8', { ...lost, uTime: now - LOST_STOP_RECENT_MS - 1 }), order('o9', { state: 'filled', uTime: now - 1000 })];
+    let s = stateAfterHello();
+    s = { ...s, ...applyOrderHistorySeed(s, history, now) };
+    expect(s.orderHistory.map((o) => o.ordId)).toEqual(['o9', 'o7', 'o8']);
+    expect(s.toasts).toHaveLength(1);
+    expect(s.toasts[0]).toMatchObject({ kind: 'error', sticky: true });
+    expect(s.toasts[0]?.message).toContain('STOP-LOSS NOT CREATED: BTC-USDT-SWAP order o7');
+    expect(s.lostStopNotified).toEqual(['o7']);
+
+    // the refetch after a reconnect and a late push of the same order do not repeat it
+    s = { ...s, ...applyOrderHistorySeed(s, history, now) };
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o7', { ...lost, uTime: now - 60_000 }) }) };
+    expect(s.toasts).toHaveLength(1);
+  });
+
+  it('an entry with a stop that ends cancelled after a partial fill raises one sticky notice per order', () => {
+    let s = stateAfterHello();
+    const stop = { slTriggerPx: '58000' };
+    // partially filled and resting: the stop is not active yet, which the orders table shows; no notice
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o2', { state: 'partially_filled', accFillSz: '0.4', ...stop }) }) };
+    expect(s.toasts).toEqual([]);
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o2', { state: 'canceled', accFillSz: '0.4', ...stop, uTime: 1002 }) }) };
+    expect(s.toasts).toHaveLength(1);
+    expect(s.toasts[0]).toMatchObject({ kind: 'error', sticky: true });
+    const message = s.toasts[0]?.message ?? '';
+    expect(message).toContain('STOP-LOSS MAY BE MISSING: BTC-USDT-SWAP order o2 (buy) was cancelled after filling 0.4 of 1 contracts');
+    expect(message).toContain('the filled part may have no stop');
+    expect(message).toContain('Check on OKX now and place the stop by hand if it is missing.');
+    expect(s.lostStopNotified).toEqual(['o2']);
+
+    // a repeated push and the history seed of the same order do not repeat it
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o2', { state: 'canceled', accFillSz: '0.4', ...stop, uTime: 1003 }) }) };
+    s = { ...s, ...applyOrderHistorySeed(s, [order('o2', { state: 'canceled', accFillSz: '0.4', ...stop, uTime: 1003 })], 2000) };
+    expect(s.toasts).toHaveLength(1);
+
+    // no notice: cancelled before any fill, cancelled without a stop, and completely filled
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o3', { state: 'canceled', accFillSz: '0', ...stop }) }) };
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o4', { state: 'canceled', accFillSz: '0.4' }) }) };
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o5', { state: 'filled', accFillSz: '1', ...stop }) }) };
+    expect(s.toasts).toHaveLength(1);
+
+    // cancelled while the page was not listening: the history seed tells it; an order already told for its failed stop is not told again
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o7', { state: 'partially_filled', accFillSz: '0.4', slFailReason: '51279: x' }) }) };
+    s = { ...s, ...applyOrderHistorySeed(s, [order('o6', { state: 'canceled', accFillSz: '0.1', ...stop, uTime: 1999 }), order('o7', { state: 'canceled', accFillSz: '0.4', ...stop, uTime: 1999 })], 2000) };
+    expect(s.toasts.map((x) => x.message.split(':')[0])).toEqual(['STOP-LOSS MAY BE MISSING', 'STOP-LOSS NOT CREATED', 'STOP-LOSS MAY BE MISSING']);
+    expect(s.toasts[2]?.message).toContain('order o6');
+    expect(s.lostStopNotified).toEqual(['o2', 'o7', 'o6']);
+  });
+
+  it('the lost-stop notice is not pushed out by later toasts', () => {
+    let s = stateAfterHello();
+    s = { ...s, ...pushToast(s, 'error', 'an earlier error') };
+    s = { ...s, ...applyServerMessage(s, { type: 'order', data: order('o2', { state: 'filled', slFailReason: '1: not created' }) }) };
+    for (let i = 0; i < LIMITS.toasts + 2; i += 1) s = { ...s, ...pushToast(s, i % 2 === 0 ? 'info' : 'error', `later ${i}`) };
+    // the cap holds for the others, oldest dropped first
+    expect(s.toasts).toHaveLength(LIMITS.toasts + 1);
+    expect(s.toasts[0]?.message).toContain('STOP-LOSS NOT CREATED');
+    expect(s.toasts.map((t) => t.message).slice(1)).toEqual(Array.from({ length: LIMITS.toasts }, (_, i) => `later ${i + 2}`));
+  });
+
   it('order history is capped and newest first', () => {
     let s = stateAfterHello();
     for (let i = 0; i < LIMITS.orderHistory + 5; i += 1) {
@@ -296,6 +395,20 @@ describe('applyServerMessage', () => {
 
     s = { ...s, ...applyServerMessage(s, { type: 'connection', data: { ...connection, okxPrivate: 'disconnected' } }) };
     expect(s.connection?.okxPrivate).toBe('disconnected');
+  });
+
+  it('a risk push carries the positions over their limit and the next one clears them; trading is not blocked by it', () => {
+    let s = stateAfterHello();
+    expect(s.risk?.overLimit).toEqual([]);
+    const blockBefore = getTradingBlock(s);
+    const over = { instId: 'BTC-USDT-SWAP', notional: '26500', limit: '20000', excess: '6500' };
+    s = { ...s, ...applyServerMessage(s, { type: 'risk', data: { ...risk, overLimit: [over], totalOverLimit: '1500' } }) };
+    expect(s.risk?.overLimit).toEqual([over]);
+    expect(s.risk?.totalOverLimit).toBe('1500');
+    expect(getTradingBlock(s)).toEqual(blockBefore);
+    s = { ...s, ...applyServerMessage(s, { type: 'risk', data: risk }) };
+    expect(s.risk?.overLimit).toEqual([]);
+    expect(s.risk?.totalOverLimit).toBe('');
   });
 
   it('account corrects the config of a terminal that connected before the account was loaded', () => {
@@ -531,6 +644,55 @@ describe('activeAlerts', () => {
     const notLoaded = killSwitchSweepNotice({ connection: { ...healthy, account: { state: 'error', error: { code: '50105', message: 'x', ts: at }, lastSyncAt: null, readOnly: false } }, account: null });
     expect(notLoaded).toContain('The account is not loaded');
     expect(notLoaded).not.toContain('will be cancelled');
+  });
+
+  it('overLimitNotice: one line naming each instrument and the total, nothing while within the limits', () => {
+    expect(overLimitNotice(null)).toBeNull();
+    expect(overLimitNotice(risk)).toBeNull();
+    const over = { instId: 'BTC-USDT-SWAP', notional: '26500', limit: '20000', excess: '6500' };
+    expect(overLimitNotice({ overLimit: [over], totalOverLimit: '' })).toBe(
+      'Over the per-instrument limit: BTC-USDT-SWAP by 6,500 USD. Trim back to the limit; closing orders are always allowed.',
+    );
+    const both = overLimitNotice({ overLimit: [over, { ...over, instId: 'ETH-USDT-SWAP', excess: '120.4' }], totalOverLimit: '1500' });
+    expect(both).toContain('BTC-USDT-SWAP by 6,500 USD, ETH-USDT-SWAP by 120 USD.');
+    expect(both).toContain('Total position notional is 1,500 USD over the limit.');
+    expect(overLimitNotice({ overLimit: [], totalOverLimit: '1500' })).toBe('Total position notional is 1,500 USD over the limit. Trim back to the limit; closing orders are always allowed.');
+  });
+
+  it('trimAdvice: the excess in quote and in contracts rounded down to the lot', () => {
+    const over = { instId: 'BTC-USDT-SWAP', notional: '30050', limit: '20000', excess: '10050' };
+    // 50 contracts worth 30,050: 601 per contract, 10,050 / 601 = 16.7 -> 16
+    const a = trimAdvice({ ...position('BTC-USDT-SWAP', '-50'), notionalUsd: '30050' }, over, BTC);
+    expect(a.quote.toFixed()).toBe('10050');
+    expect(a.contracts?.toFixed()).toBe('16');
+    // a finer lot keeps the fraction it allows
+    expect(trimAdvice({ ...position('BTC-USDT-SWAP', '50'), notionalUsd: '30050' }, over, { ...BTC, lotSz: '0.1' }).contracts?.toFixed()).toBe('16.7');
+    // no notional reported: valued at the mark price (0.01 BTC x 60,100 = 601 per contract)
+    expect(trimAdvice({ ...position('BTC-USDT-SWAP', '50'), notionalUsd: '' }, over, BTC).contracts?.toFixed()).toBe('16');
+    // a leg smaller than the excess can be closed whole at most
+    const leg = trimAdvice({ ...position('BTC-USDT-SWAP', '10'), posSide: 'short', notionalUsd: '6010' }, over, BTC);
+    expect(leg.quote.toFixed()).toBe('6010');
+    expect(leg.contracts?.toFixed()).toBe('10');
+    // an untracked instrument has no known lot: quote only
+    expect(trimAdvice({ ...position('BTC-USDT-SWAP', '50'), notionalUsd: '30050' }, over).contracts).toBeNull();
+  });
+
+  it('trimShares: the excess goes on the larger leg, the next leg only gets what that one cannot cover', () => {
+    const over = { instId: 'BTC-USDT-SWAP', notional: '30050', limit: '20000', excess: '10050' };
+    const long = { ...position('BTC-USDT-SWAP', '40'), posSide: 'long' as const, notionalUsd: '24040' };
+    const short = { ...position('BTC-USDT-SWAP', '10'), posSide: 'short' as const, notionalUsd: '6010' };
+    const other = { ...position('ETH-USDT-SWAP', '900'), notionalUsd: '90000' };
+    const shares = trimShares([short, other, long], over);
+    expect([...shares.keys()]).toEqual([long]);
+    expect(shares.get(long)?.toFixed()).toBe('10050');
+    // the shares add up to the excess, never to twice it
+    const deep = trimShares([short, long], { ...over, limit: '5000', excess: '25050' });
+    expect(deep.get(long)?.toFixed()).toBe('24040');
+    expect(deep.get(short)?.toFixed()).toBe('1010');
+    // a single net row takes it all; a flat row and an instrument that is not over take nothing
+    const net = { ...position('BTC-USDT-SWAP', '-50'), notionalUsd: '30050' };
+    expect(trimShares([net, { ...net, pos: '0' }], over).get(net)?.toFixed()).toBe('10050');
+    expect(trimShares([other], over).size).toBe(0);
   });
 
   it('isStreamStale: listed streams, and everything while the server cannot be heard', () => {

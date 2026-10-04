@@ -92,8 +92,8 @@ beforeAll(async () => {
   const hub = new Hub(config, market, account, risk, log);
   deps = { config, log, clients, store, market, account, risk, orders, signals, hub };
   account.on('balance', (b) => risk.updateEquity(b.totalEq));
-  account.on('positions', () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional()));
-  account.on('order', () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional()));
+  account.on('positions', () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional(), account.positionList(), (id) => deps.market.specOf(id)));
+  account.on('order', () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional(), account.positionList(), (id) => deps.market.specOf(id)));
   new KillSwitchSweeper(risk, account, orders, log).start();
   hub.wire();
   app = await buildServer(deps);
@@ -138,14 +138,18 @@ describe('api e2e against mock OKX', () => {
 
   it('computes daily signal reports with indicators, regime and sizing', async () => {
     type Plan = { contracts: string; riskQuote: string; multiplier: string };
-    const res = data(await api<{ equity: string | null; sizingParams: { riskPct: string; maxNotionalPct: string }; reports: Array<{ instId: string; indicators?: { asOf: number; bars: number; atr: string; entryHigh: string }; regime?: string; funding?: { avg8h: string; samples: number } | null; sizing?: { long: Plan; short: Plan } | null; signals?: { reasons: string[] }; dataFetchedAt?: number | null; error?: { code: string; message: string } }> }>('GET', '/api/signals?equity=100000'));
-    expect(res.reports).toHaveLength(2);
+    const res = data(await api<{ equity: string | null; sizingParams: { riskPct: string; maxNotionalPct: string }; phases: number[]; reports: Array<{ instId: string; phase: number; indicators?: { asOf: number; bars: number; atr: string; entryHigh: string }; regime?: string; funding?: { avg8h: string; samples: number } | null; sizing?: { long: Plan; short: Plan } | null; signals?: { reasons: string[] }; dataFetchedAt?: number | null; error?: { code: string; message: string } }> }>('GET', '/api/signals?equity=100000'));
+    // one row per instrument and daily cut, ordered by instrument, then cut
+    expect(res.reports.map((r) => r.phase)).toEqual([0, 12, 0, 12]);
+    expect(res.reports[0]!.instId).toBe(res.reports[1]!.instId);
+    expect(res.phases).toEqual([0, 12]);
     expect(res.equity).toBe('100000');
-    expect(res.sizingParams).toMatchObject({ riskPct: '0.0075', maxNotionalPct: '0.10' });
+    // each cut is sized at half a unit
+    expect(res.sizingParams).toMatchObject({ riskPct: '0.00375', maxNotionalPct: '0.05' });
     for (const r of res.reports) {
       expect(r.error).toBeUndefined();
-      // the daily bar is the UTC day (OKX 1Dutc), not OKX's default UTC+8 day that opens at 16:00 UTC
-      expect(r.indicators!.asOf % 86_400_000).toBe(0);
+      // the daily bar opens at the cut in UTC (OKX 1Dutc, or two 12Hutc bars from noon), not on OKX's default UTC+8 day that opens at 16:00 UTC
+      expect(r.indicators!.asOf % 86_400_000).toBe(r.phase * 3_600_000);
       expect(r.dataFetchedAt).toBeGreaterThan(0);
       expect(r.indicators!.bars).toBeGreaterThanOrEqual(100);
       expect(D(r.indicators!.atr).gt(0)).toBe(true);
@@ -154,7 +158,7 @@ describe('api e2e against mock OKX', () => {
       expect(r.funding!.samples).toBeGreaterThanOrEqual(9); // three days of 8h settlements
       expect(D(r.funding!.avg8h).eq('0.0001')).toBe(true);
       expect(r.sizing).not.toBeNull();
-      expect(D(r.sizing!.long.riskQuote).lte('750')).toBe(true); // 0.75% of 100k at most
+      expect(D(r.sizing!.long.riskQuote).lte('375')).toBe(true); // half of 0.75% of 100k at most
       expect(D(r.sizing!.short.multiplier).lte('0.5')).toBe(true); // shorts are sized at half at most
       expect(D(r.sizing!.short.riskQuote).lte(D(r.sizing!.long.riskQuote))).toBe(true);
       expect(r.signals!.reasons.length).toBeGreaterThan(3);
@@ -170,9 +174,15 @@ describe('api e2e against mock OKX', () => {
       expect(st!.openInterest!.change10d).not.toBe('');
     }
     const half = data(await api<{ sizingParams: { riskPct: string } }>('GET', '/api/signals?equity=100000&riskPct=0.005'));
-    expect(half.sizingParams.riskPct).toBe('0.005');
-    const one = data(await api<{ reports: Array<{ instId: string }> }>('GET', '/api/signals?instId=ETH-USDT-SWAP'));
-    expect(one.reports.map((r) => r.instId)).toEqual(['ETH-USDT-SWAP']);
+    expect(half.sizingParams.riskPct).toBe('0.0025');
+    const one = data(await api<{ reports: Array<{ instId: string; phase: number }> }>('GET', '/api/signals?instId=ETH-USDT-SWAP'));
+    expect(one.reports.map((r) => [r.instId, r.phase])).toEqual([['ETH-USDT-SWAP', 0], ['ETH-USDT-SWAP', 12]]);
+    // ?phase filters the rows; the sizing stays that of one of the two cuts
+    const noon = data(await api<{ phases: number[]; sizingParams: { riskPct: string }; reports: Array<{ instId: string; phase: number }> }>('GET', '/api/signals?instId=ETH-USDT-SWAP&phase=12'));
+    expect(noon.reports.map((r) => [r.instId, r.phase])).toEqual([['ETH-USDT-SWAP', 12]]);
+    expect(noon.phases).toEqual([0, 12]);
+    expect(noon.sizingParams.riskPct).toBe('0.00375');
+    expect((await api('GET', '/api/signals?phase=6')).status).toBe(400);
   });
 
   it('previews a limit order with sizing in coin and risk ok', async () => {
@@ -343,6 +353,75 @@ describe('api e2e against mock OKX', () => {
     expect(mock.getState().orders.filter((o) => o.state === 'live' || o.state === 'partially_filled')).toEqual([]);
     const released = data(await api<{ cancelSweep: { state: string } }>('POST', '/api/risk/kill-switch', { enabled: false }));
     expect(released.cancelSweep.state).toBe('idle');
+  });
+
+  it('attaches a mark-triggered stop to an entry; the exchange closes the position when the mark reaches it', async () => {
+    const ETH = 'ETH-USDT-SWAP';
+    type Placed = { order: Order; preview: { slTriggerPx: string; stopLossQuote: string } };
+    try {
+      // a stop on the wrong side is refused before anything is sent
+      const wrong = await api<unknown>('POST', '/api/orders', { instId: ETH, side: 'buy', ordType: 'market', size: { unit: 'contracts', value: '10' }, slTriggerPx: '3300' });
+      expect(wrong.status).toBe(400);
+      if (!wrong.body.ok) expect(wrong.body.error).toMatchObject({ code: 'VALIDATION', details: { slTriggerPx: '3300' } });
+      expect(mock.getState().positions).toEqual([]);
+
+      // a resting entry shows its stop in the order mirror, from the exchange's own order object
+      const resting = data(await api<Placed>('POST', '/api/orders', { instId: 'BTC-USDT-SWAP', side: 'buy', ordType: 'limit', px: '48000', size: { unit: 'contracts', value: '1' }, slTriggerPx: '46000.04' }));
+      expect(resting.order.slTriggerPx).toBe('46000.1');
+      await deps.account.refresh();
+      expect(deps.account.openOrders.get(resting.order.ordId)).toMatchObject({ state: 'live', slTriggerPx: '46000.1' });
+      // nothing has filled: there is no stop yet
+      expect(mock.getState().stops).toEqual([]);
+      data(await api<unknown>('POST', '/api/orders/cancel', { instId: 'BTC-USDT-SWAP', ordId: resting.order.ordId }));
+      await waitFor(() => !deps.account.openOrders.has(resting.order.ordId), 5000, 'order removed');
+
+      const placed = data(await api<Placed>('POST', '/api/orders', { instId: ETH, side: 'buy', ordType: 'market', size: { unit: 'contracts', value: '10' }, slTriggerPx: '2700.004' }));
+      // rounded to the tick towards the entry
+      expect(placed.order.slTriggerPx).toBe('2700.01');
+      expect(placed.preview.slTriggerPx).toBe('2700.01');
+      expect(D(placed.preview.stopLossQuote).gt(200)).toBe(true); // 1 ETH, some 300 below the fill
+      await waitFor(() => deps.account.positionList().find((p) => p.instId === ETH), 5000, 'position');
+      expect(mock.getState().stops).toMatchObject([{ ordId: placed.order.ordId, algoClOrdId: `sl${placed.order.clOrdId}`, instId: ETH, side: 'sell', sz: '10', slTriggerPx: '2700.01', slTriggerPxType: 'mark' }]);
+
+      // the mark comes down but stays above the trigger
+      mock.setMarkPrice(ETH, '2750');
+      await waitFor(() => deps.market.markPrice(ETH)?.markPx === '2750', 5000, 'mark push');
+      expect(mock.getState().stops).toHaveLength(1);
+      expect(deps.account.positionList().some((p) => p.instId === ETH)).toBe(true);
+
+      mock.setMarkPrice(ETH, '2700');
+      await waitFor(() => !deps.account.positionList().some((p) => p.instId === ETH), 5000, 'position closed by the stop');
+      expect(mock.getState().stops).toEqual([]);
+      expect(mock.getState().positions).toEqual([]);
+    } finally {
+      mock.setMarkPrice(ETH, null);
+    }
+    await waitFor(() => D(deps.market.markPrice(ETH)?.markPx ?? '0').gt(2900), 5000, 'mark released');
+  });
+
+  it('the kill switch cancel sweep leaves an active attached stop alone', async () => {
+    const ETH = 'ETH-USDT-SWAP';
+    const entry = data(await api<{ order: Order }>('POST', '/api/orders', { instId: ETH, side: 'buy', ordType: 'market', size: { unit: 'contracts', value: '10' }, slTriggerPx: '2700' }));
+    await waitFor(() => deps.account.positionList().find((p) => p.instId === ETH), 5000, 'position');
+    const resting = data(await api<{ order: Order }>('POST', '/api/orders', { instId: 'BTC-USDT-SWAP', side: 'sell', ordType: 'limit', px: '52000', size: { unit: 'contracts', value: '1' } }));
+    await waitFor(() => deps.account.openOrders.has(resting.order.ordId), 5000, 'order open');
+    expect(mock.getState().stops).toHaveLength(1);
+
+    data(await api<unknown>('POST', '/api/risk/kill-switch', { enabled: true, reason: 'test' }));
+    try {
+      await waitFor(() => deps.risk.state.cancelSweep.state === 'done', 5000, 'cancel sweep done');
+      // the open order is gone; the stop is an algo order and still protects the position
+      expect(mock.getState().orders.filter((o) => o.state === 'live' || o.state === 'partially_filled')).toEqual([]);
+      expect(mock.getState().stops).toMatchObject([{ ordId: entry.order.ordId, instId: ETH, sz: '10', slTriggerPx: '2700' }]);
+      expect(deps.account.positionList().some((p) => p.instId === ETH)).toBe(true);
+
+      // closing is allowed under the halt, and the stop goes with its position
+      data(await api<unknown>('POST', '/api/positions/close', { instId: ETH, mgnMode: 'cross' }));
+      await waitFor(() => !deps.account.positionList().some((p) => p.instId === ETH), 5000, 'position closed');
+      expect(mock.getState().stops).toEqual([]);
+    } finally {
+      data(await api<unknown>('POST', '/api/risk/kill-switch', { enabled: false }));
+    }
   });
 
   it('streams hello, market data and private updates over /ws', async () => {

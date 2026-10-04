@@ -45,7 +45,7 @@ Request bodies are validated with the zod schemas in `packages/shared/src/schema
 | GET | `/api/book` | `?instId` | `OrderBook` (top 50 each side) |
 | GET | `/api/ticker` | `?instId` | `Ticker` |
 | GET | `/api/risk` | – | `{ config: RiskConfig, state: RiskState }` |
-| GET | `/api/signals` | `?instId&equity&riskPct&maxNotionalPct` (all optional) | `SignalsResponse`: `{ generatedAt, equity, sizingParams, reports: SignalReportRow[] }` — daily trend-framework signals; see below and `packages/shared/src/signals.ts` |
+| GET | `/api/signals` | `?instId&phase&equity&riskPct&maxNotionalPct` (all optional; `phase` is `0` or `12`) | `SignalsResponse`: `{ generatedAt, equity, phases, sizingParams, reports: SignalReportRow[] }` — daily trend-framework signals, one row per instrument and daily cut; see below and `packages/shared/src/signals.ts` |
 | POST | `/api/risk/kill-switch` | `KillSwitchRequest` (`{ enabled, reason?, rebase? }`) | `RiskState` (`cancelSweep` already reflects the new switch position); `409 DAILY_LOSS_ACTIVE` for a release without `rebase` while the daily loss limit is breached |
 
 Daily PnL, its baseline and what survives a restart. `RiskState.dailyPnl` is `currentEquity - dayStartEquity`.
@@ -69,6 +69,19 @@ refused with `409 DAILY_LOSS_ACTIVE` (`details`: `{ dailyPnl, limit, equity }`) 
 limit can trip again from there. This is the deliberate override for a transfer out of the account, which the
 equity-based rule cannot tell from a loss; the terminal asks for it in a second confirmation. `rebase` is ignored
 when the limit is not breached and when `enabled` is true.
+
+Positions that have outgrown their limit. The notional limits are checked when an order is placed, but a position
+grows with price afterwards. `RiskState.overLimit` lists every instrument whose position notional now exceeds
+`RISK_MAX_POSITION_NOTIONAL_PER_INSTRUMENT`: `Array<{ instId, notional, limit, excess }>` (decimal strings; `excess` =
+`notional - limit`), `[]` while none does. Only positions count, resting orders do not; the accounting is that of
+the pre-trade rule (a net position at its absolute notional, the long and short legs of long/short mode gross; a
+position without a reported notional is valued at its mark price). `RiskState.totalOverLimit` is the excess of
+`totalPositionNotional` over `RISK_MAX_TOTAL_POSITION_NOTIONAL`, `""` while within it. Both are recomputed on every
+position and order event and sent with the risk state (`/api/risk`, `hello.risk`, every `risk` message); they are
+derived, not saved. They are advisory: the server never trades or refuses anything because of them (an opening
+order on such an instrument is refused by the pre-trade rule as before, a closing order is always allowed). The
+terminal marks the position row with the amount to trim, in quote and in contracts rounded down to `lotSz`, and
+shows one line in the risk panel.
 
 Kill switch and its cancel sweep. While the switch is on, opening orders are refused and **all** open SWAP orders of
 the account are cancelled once per engagement: resting exits and orders placed on OKX directly included, conditional
@@ -102,34 +115,71 @@ interface CancelSweep {
 
 `/api/signals`:
 
-- Signals are computed from confirmed **UTC** daily candles (OKX `1Dutc`; the forming bar is excluded). `indicators.asOf` is the
-  open time of the last confirmed bar, always a UTC midnight; that bar closed at `asOf + 86 400 000`.
-- `sizingParams` (`{ riskPct, maxNotionalPct, atrStopMultiple }`) echoes the sizing actually used. Without `riskPct` the
-  server uses 0.0075; the terminal always sends the owner's choice (0.005 by default).
+- Signals are computed from confirmed daily candles (the forming bar is excluded) at the configured daily cuts (two
+  by default, `SIGNAL_PHASES`), named by the UTC
+  hour the bars close at: `phase: 0` uses OKX's `1Dutc` bars, `phase: 12` uses daily bars built from two consecutive
+  `12Hutc` bars (noon to noon; two pages of 300 half-day bars). `phases` lists the cuts the server computes (`SIGNAL_PHASES` in `.env`, default `0,12`)
+  (`[0, 12]`). `reports` holds one row per instrument and cut, ordered by instrument, then cut; every row, an error
+  row (`{ instId, phase, error }`) included, carries its `phase`. A cut that fails is an error row of its own and
+  leaves the instrument's other row standing. `?phase=0` or `?phase=12` returns the rows of that cut only; `phases`
+  and the sizing are the same as without it.
+- `indicators.asOf` is the open time of the row's last confirmed bar: a UTC midnight for `phase: 0`, a UTC noon for
+  `phase: 12`; that bar closed at `asOf + 86 400 000`.
+- Each cut is sized at its share of a unit, so the lots of an instrument together stay within one unit. `riskPct` and
+  `maxNotionalPct` in the request are those of ONE UNIT (without them the server uses 0.0075 and 0.10; the terminal
+  always sends the owner's `riskPct`, 0.005 by default). `sizingParams` (`{ riskPct, maxNotionalPct, atrStopMultiple }`)
+  echoes the values of one cut's lot, as the plans were computed: the unit's values divided by `phases.length`
+  (`riskPct=0.005` gives `"0.0025"` and `"0.05"`).
 - `sizing` is `{ long: SizingPlan, short: SizingPlan } | null` (null without equity). Each plan carries its own
   `multiplier` and `adjustments` (for example `"short x0.5"`, `"crisis x0.5"`,
   `"crowded x0.75 (funding 0.09%/8h, OI +24% in 10d)"`); the multiplier is applied after the notional cap and before
-  the minimum-order-size check. `signals.reasons` has one line per applied adjustment.
+  the minimum-order-size check. `signals.reasons` has one line per applied adjustment. The 10-day open interest change
+  of the crowding cut is measured over the 10 days ending at the row's own last close (the levels at those two
+  instants; unknown when either is missing), so the two rows of an instrument may differ. Funding is the same for
+  both rows: the window ends at the time of the request.
+- `params.allowShort` (default `false`) switches short entries: while it is false `signals.shortEntry` is never true,
+  the reasons say that shorts are off and carry no `short size:` lines. `signals.shortExit` and `sizing.short` are
+  computed either way; the terminal shows the short side as off.
 - A plan's `rawNotional` is the notional before the cap, `targetNotional` the one aimed at after the cap and the
   multiplier, and `notional` the notional of `contracts`, the order actually proposed after rounding down to whole
   lots (`"0.00"` when `contracts` is `"0"`). `coin` and `riskQuote` describe the same rounded order.
-- `indicators.crisisDaysAgo` is the number of closes since the most recent crisis day inside the hold window (0 = the
-  last bar, null = none); `indicators.nextExitHigh` / `nextExitLow` are the exit channel including the last bar, the
-  level the next close is tested against.
-- `dataFetchedAt` is when the candles and funding behind a report were fetched from the exchange. Exchange data is
-  cached for 5 minutes, never across a UTC midnight.
+- `indicators.shockBars` lists the bars inside the hold window (`params.crisisHoldBars` closes) whose |log return|
+  exceeded `params.crisisReturnSigmas` daily sigmas, most recent first:
+  `{ daysAgo, return, oiChange, crisis }`. `oiChange` is the fractional change of the instrument's open interest (in
+  coin) over that bar (midnight to midnight for `phase: 0`, noon to noon for `phase: 12`), `""` when unknown. `crisis` is true when open interest fell by more than
+  `params.crisisOiDrop` (default `"0.1"`) or when the change is unknown; the direction of the price move does not
+  matter. `indicators.crisisDaysAgo` is the number of closes since the most recent shock bar with `crisis` set (0 =
+  the last bar, null = none). `signals.reasons` has one `shock:` line per shock bar with the move, the open interest
+  change and the verdict.
+- `indicators.nextExitHigh` / `nextExitLow` are the exit channel including the last bar, the level the next close
+  is tested against.
+- `dataFetchedAt` is when the candles and funding behind a report were fetched from the exchange (the older of the
+  two). Candles are cached for 5 minutes per instrument and cut, never across that cut's own close (00:00 UTC for
+  `phase: 0`, 12:00 UTC for `phase: 12`); funding is cached for 5 minutes per instrument, never across either close.
 - `structure.book` is the visible depth/imbalance over 20 levels. `structure.openInterest` is the instrument's own open
-  interest. With `source: "history"` the level (`current`, in USD) is today's still-forming row of the daily history
-  (UTC days, cached for an hour), while `change1d`, `change10d` and `percentile30d` are measured in coin on completed
-  days only: the last completed UTC day against the day before it and against ten days before it. `points` is the
-  number of completed days. With `source: "live"` only the current level is known and the changes are `""`.
+  interest, the same block on both rows of an instrument. With `source: "history"` the level (`current`, in USD) is today's still-forming row of the history
+  (cached for an hour, never across 00:00 or 12:00 UTC), while `change1d`, `change10d` and `percentile30d` are
+  measured in coin on completed days only: the last completed UTC day against the day before it and against ten days
+  before it. `points` is the number of completed days. With `source: "live"` only the current level is known and the
+  changes are `""`.
+- The history is read from OKX's `1Dutc` and `12Hutc` rows together (two calls per instrument), because only the pair
+  says which instant a row refers to (`docs/okx-api-notes.md` §5.9); the level of a completed UTC day is the one at
+  the following 00:00 UTC. The same levels give `shockBars[].oiChange`. When the two do not fit together, or the
+  levels of the last closed daily bar of either cut are missing (00:00 to 00:00 UTC, and 12:00 to 12:00 UTC for the
+  12:00 cut), the server logs a warning, reports what is known (the block falls
+  back to `"live"` when yesterday's level is missing; shock bars without both levels count as crisis days) and asks again after 60 s
+  instead of keeping the result for the hour. While OKX has not yet opened the row of the running day or half-day, its
+  newest row is treated as still forming, so the level at the last close counts as missing until the new row appears.
 - Open interest never holds a report back. A report waits at most 3 s for an instrument's history; after that it is
-  sent with the changes of the rows fetched earlier the same UTC day when there are any, otherwise with the live
-  level, while the call finishes in the background and fills the cache for the next request. Until that call has
-  settled, and for 60 s after a failed one, no report waits for that instrument's history again. The history calls
-  go out one at a time, 400 ms apart, so right after a start or a UTC midnight the last instruments of a full
-  report can come back as `"live"` once.
-- A row that could not be computed is `{ instId, error: { code, message } }` (`SignalReportError`).
+  sent with the rows fetched last when there are any, otherwise with the live level (and unknown per-bar changes),
+  while the calls finish in the background and fill the cache for the next request. Levels at past instants do not
+  change, so rows from an earlier half-day still give `shockBars[].oiChange` for every bar that had closed by then
+  and, within the same UTC day, the 1-day and 10-day changes (`current` is then the live level); after a UTC
+  midnight the bar that has just closed stays unknown and the block is `"live"` until the refresh arrives. Until
+  they have settled, and for 60 s after a failed one, no report waits for that instrument's history again. The
+  history calls go out one at a time, 400 ms apart, so right after a start, a UTC midnight or noon the last
+  instruments of a full report can come back as `"live"` once.
+- A row that could not be computed is `{ instId, phase, error: { code, message } }` (`SignalReportError`).
 
 `OrderPreview` (exported from `@pegasus/shared`):
 
@@ -148,9 +198,56 @@ interface OrderPreview {
   notionalQuote: string;   // USD(T) notional of this order
   estSlippagePct: string;  // market orders only, from the order book; '' otherwise, and for an exit while the book is not synced
   lever: string;           // leverage currently configured for the instrument/mode; '' for an exit (not looked up)
+  slTriggerPx: string;     // normalised trigger of the attached stop-loss; '' when the order carries none
+  stopLossQuote: string;   // quote-currency loss if the stop fills at its trigger with sz, measured from refPrice; '' without a stop
   risk: RiskCheckResult;   // ok=false means the order would be rejected
 }
 ```
+
+Attached stop-loss. `PlaceOrderRequest.slTriggerPx` (optional, a positive decimal string; `POST /api/orders` and
+`POST /api/orders/preview`) attaches a stop-loss to the entry order itself: the server sends it to OKX as
+`attachAlgoOrds: [{ attachAlgoClOrdId, slTriggerPx, slOrdPx: "-1", slTriggerPxType: "mark" }]`, so the exchange
+creates the stop once the order is **completely filled**, triggers it on the **mark price** and executes it at
+market. Pegasus places no second order and does not watch the price itself.
+
+- **A partially filled order has no stop yet.** OKX generates the attached stop only when the parent order is
+  completely filled (docs/okx-api-notes.md 6.1), and none at all for a parent cancelled before any fill. While an
+  order with `slTriggerPx` is `partially_filled` the filled part is a position without a stop: the open-orders
+  table says so in the Stop column (`stopAwaitsFullFill` in `@pegasus/shared`). When such an order ends `canceled`
+  with `accFillSz > 0` (`stopUnconfirmedAfterCancel`), the documentation does not say whether a stop is generated
+  for the filled part, so the terminal raises one error notice per order (it stays until it is clicked away)
+  telling the trader to check on OKX and place the stop by hand if it is missing.
+
+- Only an **opening** order may carry one. On an order that closes (reduce-only in net mode, the closing direction
+  of a leg in long/short mode) the request is refused with `VALIDATION` (400). In net mode the same holds for an
+  order without reduce-only that goes against the open net position of the instrument (a buy while net short, a
+  sell while net long): it reduces or flips that position, and its stop would protect nothing.
+- The trigger is rounded to `tickSz` towards the entry (up for a buy, down for a sell: the smaller loss).
+- It must lie on the losing side of **both** the order's reference price (the limit price, or the estimated fill
+  of a market order: `refPrice`) and the current mark price: below both for a buy, above both for a sell. Otherwise
+  `VALIDATION` (400) with `details: { slTriggerPx, refPrice, markPx }`; a mark-triggered stop on the wrong side of
+  the mark would fire at once. Only the live mark price counts here: while the mark stream is stale or has not
+  delivered yet, a request with `slTriggerPx` is refused with `NO_PRICE` (503) instead of being checked against the
+  last price or the book mid (the same order without the stop is still accepted).
+- `attachAlgoClOrdId` is `sl` followed by the last 30 characters of the order's `clOrdId`.
+- The stop is not an input of the risk check and never relaxes a limit. `stopLossQuote` is information only: a gap
+  through the trigger loses more.
+- A retry that finds the earlier attempt at the exchange sends nothing (see below), so no second stop either; the
+  answer's `order.slTriggerPx` and `preview.slTriggerPx` are those of the order OKX holds, `stopLossQuote` is `''`.
+- `Order.slTriggerPx` (optional, in `POST /api/orders`, `/api/orders/open`, `/api/orders/history` rows of this
+  session and the `order` message) is the trigger of the stop attached to that order, read from the `attachAlgoOrds`
+  OKX echoes on the order object; absent when there is none. An echoed entry with a non-empty `failCode` (other
+  than `0`) is a stop the exchange did not create: it is not reported as `slTriggerPx`, and the server logs an error
+  naming the order. It is not stored in the database: an order row read back from Postgres has no `slTriggerPx`.
+- `Order.slFailReason` (optional, same places) is set to `'<failCode>: <failReason>'` when the exchange did not
+  create the attached stop: the position of that order has no stop. Absent when the stop exists or none was
+  attached; not stored in the database either. The terminal shows one error notice per order (it stays until it is
+  clicked away) telling the trader to place the stop on OKX; the notice is raised from the `order` message and from
+  the open orders of `hello`, not once per push.
+- Pegasus does not list, amend or cancel algo orders. Once the entry has filled, the stop lives on OKX only: the
+  order leaves the open orders, and the terminal shows nothing about the stop any more. Moving it and checking that
+  it still exists is done on OKX. The kill switch's cancel sweep cancels open orders, not algo orders: an active
+  attached stop keeps protecting its position; the stop of an entry that is still resting goes with that entry.
 
 Exits. An order that can only reduce exposure (reduce-only in net mode, the closing direction of a leg in long/short
 mode) skips the leverage, slippage and exposure rules, so it is neither refused with `LEVERAGE_UNAVAILABLE` nor with
@@ -267,7 +364,7 @@ Error codes returned by the API:
 | `UNAUTHORIZED` | missing/invalid token |
 | `FORBIDDEN_HOST` | the `Host` header does not name this machine (403) |
 | `FORBIDDEN_ORIGIN` | the `Origin` header is not one of `WEB_ORIGINS` (403) |
-| `VALIDATION` | request body failed schema validation (`details.issues`) |
+| `VALIDATION` | request body failed schema validation (`details.issues`); or an attached stop-loss was refused: on a closing order, on a net-mode order against the open net position, or on the wrong side of the order price or the mark price (`details`: `slTriggerPx`, `refPrice`, `markPx`) |
 | `UNKNOWN_INSTRUMENT` | instId not tracked |
 | `SIZING` | size/price could not be normalised (`details.code` = `SizingError.code`) |
 | `RISK_REJECTED` | risk engine rejected (`details` = `RiskCheckResult`). While the kill switch is on only orders that reduce exposure (reduce-only in net mode, the closing direction of a leg in long/short mode) are accepted |
@@ -276,7 +373,7 @@ Error codes returned by the API:
 | `NOT_CONNECTED` | no API key configured, the account config (position mode) not loaded yet, or, for `POST /api/orders` only, the private stream not ready (503) |
 | `READ_ONLY_KEY` | the API key has no trade permission; nothing was sent to the exchange (403) |
 | `DAILY_LOSS_ACTIVE` | the kill switch was not released because the daily loss limit is still breached; repeat with `rebase: true` to release and restart the baseline (409, `details`: `dailyPnl`, `limit`, `equity`) |
-| `NO_PRICE` | no reference price for the instrument yet, or its market data is stale (503) |
+| `NO_PRICE` | no reference price for the instrument yet, or its market data is stale (503); also an order with an attached stop-loss while there is no live mark price |
 | `NO_BOOK` | opening market order refused because the order book is not synced or is stale, so slippage cannot be estimated (503) |
 | `NO_DATA` | `/api/ticker` or `/api/book` has nothing yet for the instrument, or the book is stale (503) |
 | `LEVERAGE_UNAVAILABLE` | the leverage lookup failed or returned nothing; an opening order is refused rather than checked against an unknown leverage (503) |

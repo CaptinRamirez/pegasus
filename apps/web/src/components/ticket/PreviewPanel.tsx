@@ -79,6 +79,18 @@ export function PreviewPanel({ preview, error, isFetching, inst }: Props) {
         <span>Leverage</span>
         <span>{preview.lever}x</span>
       </div>
+      {preview.slTriggerPx !== '' && (
+        <>
+          <div className="kv num">
+            <span>Stop (mark)</span>
+            <span>{fmtPx(preview.slTriggerPx, inst)}</span>
+          </div>
+          <div className="kv num">
+            <span>Loss at stop</span>
+            <span className="neg">{preview.stopLossQuote === '' ? '–' : `${fmtNum(preview.stopLossQuote)} ${quote}`}</span>
+          </div>
+        </>
+      )}
       <div className={`risk-msg ${preview.risk.ok ? 'good' : 'bad'}`}>
         {preview.risk.ok ? (closing ? 'Closing order: limits not applied' : 'Risk check passed') : `${preview.risk.code}: ${preview.risk.message}`}
       </div>

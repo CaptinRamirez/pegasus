@@ -232,12 +232,14 @@ describe('MarketDataService stale market data', () => {
     await vi.advanceTimersByTimeAsync(29_000);
     expect(market.connection().staleStreams).toEqual([]);
     expect(market.refPrice(id)).toBe('100.4');
+    expect(market.liveMarkPrice(id)).toBe('100.4');
 
     // 31 s without a mark price: the frozen mark is no longer the reference, the last trade is
     await vi.advanceTimersByTimeAsync(2_000);
     expect(market.connection()).toMatchObject({ public: 'connected', staleStreams: [`${id}:mark`], dataAgeMs: 31_000 });
     expect(market.refPrice(id)).toBe('100.5');
     expect(market.markPrice(id)?.markPx).toBe('100.4'); // kept for display
+    expect(market.liveMarkPrice(id)).toBeUndefined(); // and never replaced by the last price
 
     // 91 s without a book frame
     await vi.advanceTimersByTimeAsync(60_000);

@@ -1,5 +1,5 @@
-import type { ConnectionStatus, InstId, MarketStream } from '@pegasus/shared';
-import { fmtTime } from '../lib/format';
+import { D, Decimal, floorToStep, notionalQuote, type ConnectionStatus, type InstId, type Instrument, type MarketStream, type Position, type PositionOverLimit, type RiskState } from '@pegasus/shared';
+import { fmtNum, fmtTime } from '../lib/format';
 import type { TerminalState } from './types';
 
 /** One line of the banner under the header: English first, then a short Chinese line for the owner. */
@@ -203,4 +203,63 @@ export function killSwitchSweepNotice(s: Pick<TerminalState, 'connection' | 'acc
 export function isStreamStale(s: Pick<TerminalState, 'connection'>, instId: InstId | null, stream: MarketStream): boolean {
   if (s.connection === null) return true;
   return instId !== null && s.connection.staleStreams.includes(`${instId}:${stream}`);
+}
+
+/** How much of one position row to close so that its instrument is back at the per-instrument limit. */
+export interface TrimAdvice {
+  /** Quote (USD) notional to close: the instrument's excess, at most the row's own notional */
+  quote: Decimal;
+  /** The same in contracts, rounded down to lotSz; null when the row cannot be valued per contract (untracked instrument, no price) */
+  contracts: Decimal | null;
+}
+
+/**
+ * The trim shown on a position row of an instrument in RiskState.overLimit. A contract is valued as OKX values the
+ * position (notionalUsd / pos), else at the mark price. `over.excess` is what this row is to close: with several
+ * rows on the instrument (long/short mode) pass the row's share from trimShares, not the instrument's excess.
+ */
+export function trimAdvice(p: Position, over: PositionOverLimit, inst?: Instrument): TrimAdvice {
+  const absPos = D(p.pos || '0').abs();
+  const rowNotional = D(p.notionalUsd || '0').abs();
+  const excess = D(over.excess);
+  const quote = rowNotional.gt(0) ? Decimal.min(excess, rowNotional) : excess;
+  if (inst === undefined || absPos.isZero()) return { quote, contracts: null };
+  const perContract = rowNotional.gt(0) ? rowNotional.div(absPos) : D(p.markPx || '0').gt(0) ? notionalQuote(1, p.markPx, inst) : null;
+  if (perContract === null || perContract.lte(0)) return { quote, contracts: null };
+  return { quote, contracts: floorToStep(Decimal.min(quote.div(perContract), absPos), inst.lotSz) };
+}
+
+/**
+ * How an instrument's excess is spread over its position rows (the two legs of long/short mode): all of it on the
+ * larger leg, and only what that leg cannot cover on the next. Showing the whole excess on every row would have the
+ * trader close it once per row. A row that gets nothing is not in the map; a leg OKX reports no notional for takes
+ * what is left (trimAdvice values it at the mark).
+ */
+export function trimShares(positions: Position[], over: PositionOverLimit): Map<Position, Decimal> {
+  const size = (p: Position): Decimal => D(p.notionalUsd || '0').abs();
+  const legs = positions
+    .filter((p) => p.instId === over.instId && !D(p.pos || '0').isZero())
+    .sort((a, b) => size(b).cmp(size(a)) || D(b.pos).abs().cmp(D(a.pos).abs()));
+  const shares = new Map<Position, Decimal>();
+  let left = D(over.excess);
+  for (const leg of legs) {
+    if (left.lte(0)) break;
+    const share = size(leg).gt(0) ? Decimal.min(left, size(leg)) : left;
+    shares.set(leg, share);
+    left = left.sub(share);
+  }
+  return shares;
+}
+
+/** The one-line advisory of the risk panel while a position has outgrown a notional limit; null while none has. */
+export function overLimitNotice(risk: Pick<RiskState, 'overLimit' | 'totalOverLimit'> | null): string | null {
+  if (risk === null) return null;
+  const parts: string[] = [];
+  if (risk.overLimit.length > 0) {
+    parts.push(`Over the per-instrument limit: ${risk.overLimit.map((o) => `${o.instId} by ${fmtNum(o.excess, 0)} USD`).join(', ')}.`);
+  }
+  if (risk.totalOverLimit !== '') parts.push(`Total position notional is ${fmtNum(risk.totalOverLimit, 0)} USD over the limit.`);
+  if (parts.length === 0) return null;
+  // Advisory only: Pegasus never trades by itself and blocks nothing because of it.
+  return `${parts.join(' ')} Trim back to the limit; closing orders are always allowed.`;
 }

@@ -2,7 +2,8 @@ import { fmt, type Dec } from '../num.js';
 import type { OkxExecType, OkxFill, OkxOrderAck, OkxPosition, OkxResponse, OkxTrade } from '../wire.js';
 import { isRejection, reject, type EngineContext, type Rejection } from './context.js';
 import type { MarketSim } from './market.js';
-import { orderToWire, type OrderRec } from './orders.js';
+import type { PositionRec } from './account.js';
+import { orderToWire, type OrderRec, type StopRec } from './orders.js';
 import { asRecord, str, validateAmend, validatePlace } from './validate.js';
 
 /** OKX `cancelSource` codes. */
@@ -66,6 +67,9 @@ export class Matcher {
       affected = outcome.position;
       this.ctx.emit('order', orderToWire(order, true));
     }
+    // OKX generates the attached stop only once the parent order is completely filled, for the whole order: a
+    // partially filled order that is still resting has no stop.
+    if (order.state === 'filled' && order.attachSl) this.ctx.orders.addStop(order, order.attachSl);
     if (fills.length > 0) {
       this.ctx.emit('trades', { instId: order.instId, trades });
       const push = market.book.delta(now);
@@ -73,6 +77,7 @@ export class Matcher {
       this.ctx.emit('candles', { instId: order.instId, candles: market.liveCandles() });
       this.pushPositions(order.instId, affected);
       this.pushAccount();
+      this.dropOrphanStops(order.instId);
     }
     if (order.state === 'filled') {
       this.ctx.orders.finish(order);
@@ -130,6 +135,13 @@ export class Matcher {
     order.cancelSourceReason = reason;
     order.uTime = this.ctx.now();
     this.ctx.orders.finish(order);
+    // Unverified: OKX documents only that a parent cancelled before any fill generates no stop. The simulator reads
+    // that as "a parent cancelled after a partial fill generates the stop for what has filled"; whether the exchange
+    // does so is to be confirmed on demo trading.
+    if (order.attachSl && order.accFillSz.gt(0)) {
+      this.ctx.orders.addStop(order, order.attachSl);
+      this.dropOrphanStops(order.instId);
+    }
     this.ctx.emit('order', orderToWire(order, false));
     this.pushAccount();
   }
@@ -180,6 +192,51 @@ export class Matcher {
     if (!market) return;
     for (const order of this.ctx.orders.liveOrders(instId)) {
       if (order.px && market.book.crosses(order.side, order.px)) this.execute(order, market, 'M');
+    }
+  }
+
+  /** The position a stop protects, while it is still open in the stop's direction. */
+  private stopPosition(stop: StopRec): PositionRec | undefined {
+    const p = this.ctx.account.find(stop.instId, stop.tdMode, stop.posSide);
+    return p && !p.qty.isZero() && p.dir === (stop.side === 'sell' ? 1 : -1) ? p : undefined;
+  }
+
+  /**
+   * A stop is dropped when its position is gone. Unverified: OKX does not document whether it cancels an attached
+   * stop once the position is closed (docs/okx-api-notes.md 12, item 31); the simulator drops it.
+   */
+  private dropOrphanStops(instId: string): void {
+    for (const stop of this.ctx.orders.activeStops(instId)) if (!this.stopPosition(stop)) this.ctx.orders.removeStop(stop);
+  }
+
+  /**
+   * Triggers the active stops whose trigger price type has reached the trigger: the mark price for 'mark' (and
+   * 'index', which the simulator does not model apart), the latest print for 'last'. A triggered stop closes its
+   * size, at most the position, with a reduce-only market order, and is removed once that order is accepted.
+   */
+  checkStops(instId: string): void {
+    const market = this.ctx.markets.get(instId);
+    if (!market) return;
+    for (const stop of this.ctx.orders.activeStops(instId)) {
+      const position = this.stopPosition(stop);
+      if (!position) {
+        this.ctx.orders.removeStop(stop);
+        continue;
+      }
+      const px = stop.slTriggerPxType === 'last' ? market.lastPx : market.markPx;
+      if (stop.side === 'sell' ? px.gt(stop.slTriggerPx) : px.lt(stop.slTriggerPx)) continue;
+      const params: Record<string, unknown> = {
+        instId,
+        tdMode: stop.tdMode,
+        side: stop.side,
+        ordType: 'market',
+        sz: fmt(stop.sz.lt(position.qty) ? stop.sz : position.qty),
+        reduceOnly: true,
+      };
+      if (stop.posSide !== 'net') params['posSide'] = stop.posSide;
+      // A refused close leaves the position unprotected: the stop stays active (and visible in the state) and is
+      // tried again on the next price, instead of vanishing as if it had fired.
+      if (this.place(params).sCode === '0') this.ctx.orders.removeStop(stop);
     }
   }
 

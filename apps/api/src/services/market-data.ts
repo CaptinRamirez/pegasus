@@ -246,6 +246,12 @@ export class MarketDataService extends EventEmitter<MarketEvents> {
     return this.state.get(instId)?.markPrice ?? null;
   }
 
+  /** The mark price while its stream is live; unlike refPrice it never falls back to the last price or the book. */
+  liveMarkPrice(instId: string): string | undefined {
+    const s = this.state.get(instId);
+    return s?.markPrice && this.isLive(s, 'mark') && D(s.markPrice.markPx).gt(0) ? s.markPrice.markPx : undefined;
+  }
+
   fundingRate(instId: string): FundingRate | null {
     return this.state.get(instId)?.fundingRate ?? null;
   }

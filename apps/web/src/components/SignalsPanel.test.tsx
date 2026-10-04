@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { DEFAULT_TREND_PARAMS, utcDayStart, type Instrument, type InstrumentSignalReport, type Order, type Position, type SignalsResponse, type SizingPlan } from '@pegasus/shared';
+import { D, DEFAULT_TREND_PARAMS, utcDayStart, type Instrument, type InstrumentSignalReport, type Order, type Position, type SignalsResponse, type SizingPlan } from '@pegasus/shared';
 import { api } from '../lib/api';
 import { useStore } from '../store/store';
 import { initialState } from '../store/types';
@@ -82,6 +82,7 @@ const shortPlan: SizingPlan = {
 
 const report: InstrumentSignalReport = {
   instId: 'BTC-USDT-SWAP',
+  phase: 0,
   indicators: {
     asOf: LAST_BAR,
     bars: 299,
@@ -101,6 +102,7 @@ const report: InstrumentSignalReport = {
     volRatio: '1.0833',
     dailyReturn: '0.01',
     dailySigma: '0.027',
+    shockBars: [],
     crisisDaysAgo: null,
     maDistanceAtr: '4',
   },
@@ -122,15 +124,25 @@ const report: InstrumentSignalReport = {
   params: DEFAULT_TREND_PARAMS,
 };
 
-/** The same instrument on a 55-day low: a short entry in a crisis regime, sized at a quarter. */
+/** The same instrument on a 55-day low with shorts switched on: a short entry in a crisis regime, sized at a quarter. */
 const shortReport: InstrumentSignalReport = {
   ...report,
+  params: { ...DEFAULT_TREND_PARAMS, allowShort: true },
   regime: 'crisis',
   signals: { longEntry: false, shortEntry: true, longExit: true, shortExit: false, reasons: ['close vs 55d low 48000: breakout down', 'short size: short x0.5', 'short size: crisis x0.5'] },
   sizing: {
     long: { ...longPlan, notional: '5000.00', multiplier: '0.5', adjustments: ['crisis x0.5'], contracts: '8', coin: '0.08', riskQuote: '299.83' },
     short: { ...shortPlan, notional: '2500.00', multiplier: '0.25', adjustments: ['short x0.5', 'crisis x0.5'], contracts: '4', coin: '0.04', riskQuote: '149.92' },
   },
+};
+
+/** The same instrument at the 12:00 UTC cut: its bar closed at today's noon, its lot is smaller. */
+const noonReport: InstrumentSignalReport = {
+  ...report,
+  phase: 12,
+  indicators: { ...report.indicators, asOf: LAST_BAR + DAY / 2, close: '61800' },
+  signals: { ...report.signals, reasons: ['close 61800 vs 55d high 60500: breakout up'] },
+  sizing: { long: { ...longPlan, entryPx: '61800', contracts: '7', coin: '0.07', notional: '4326.00', riskQuote: '262.50' }, short: shortPlan },
 };
 
 const restingBuy: Order = {
@@ -151,9 +163,14 @@ const rowCells = (container: HTMLElement): HTMLTableCellElement[] => [...contain
 const response: SignalsResponse = {
   generatedAt: LAST_BAR + DAY + 5 * 3_600_000,
   equity: '100000',
-  sizingParams: { riskPct: '0.005', maxNotionalPct: '0.10', atrStopMultiple: '2.5' },
-  reports: [report, { instId: 'ETH-USDT-SWAP', error: { code: 'NOT_ENOUGH_DATA', message: 'need at least 101 confirmed daily bars, got 40' } }],
+  phases: [0, 12],
+  // one cut's lot: half of the unit the owner chose (0.5% risk, 10% cap)
+  sizingParams: { riskPct: '0.0025', maxNotionalPct: '0.05', atrStopMultiple: '2.5' },
+  reports: [report, { instId: 'ETH-USDT-SWAP', phase: 0, error: { code: 'NOT_ENOUGH_DATA', message: 'need at least 101 confirmed daily bars, got 40' } }],
 };
+
+/** The same report from a server that computes the 00:00 cut alone: the lot is the whole unit. */
+const oneCut: SignalsResponse = { ...response, phases: [0], sizingParams: { ...response.sizingParams, riskPct: '0.005', maxNotionalPct: '0.10' } };
 
 async function flush(container: HTMLElement, needle: string): Promise<void> {
   for (let i = 0; i < 50; i++) {
@@ -257,7 +274,8 @@ describe('SignalsPanel', () => {
     expect(reasons?.textContent).toBe('close 61000 vs 55d high 60500: breakout up\nregime trend: new entries allowed');
     expect(container.querySelector('.signal-note:not(.signal-structure)')?.textContent).toContain(report.sizing?.long.note);
     const notes = [...container.querySelectorAll('.signal-note')].map((n) => n.textContent ?? '');
-    expect(notes.some((n) => n.startsWith('sizing short:') && n.includes('short x0.5'))).toBe(true);
+    // shorts are off by default: the short plan is not offered
+    expect(notes).toContain('sizing short: off (short entries are switched off, allowShort = false)');
     // the level the NEXT close is tested against: where the exchange-side stop is trailed to
     expect(notes.some((n) => n.includes('next session') && n.includes('52,400') && n.includes('61,500'))).toBe(true);
     expect(container.querySelector('.signal-structure')?.textContent).toBe(
@@ -307,6 +325,8 @@ describe('SignalsPanel', () => {
       px: '61000',
       sizeValue: '16',
       sizeUnit: 'contracts',
+      // the long plan's stop
+      slTriggerPx: '57250',
       nonce: 1,
     });
     // the row click must not have toggled the details
@@ -314,10 +334,23 @@ describe('SignalsPanel', () => {
 
     // price and size inputs come before the leverage control's input
     const inputs = [...container.querySelectorAll<HTMLInputElement>('.form input.num')].map((i) => i.value);
-    expect(inputs.slice(0, 2)).toEqual(['61000', '16']);
+    expect(inputs.slice(0, 3)).toEqual(['61000', '16', '57250']);
     const unit = container.querySelector<HTMLSelectElement>('.input-group select');
     expect(unit?.value).toBe('contracts');
     expect(container.querySelector('.btn-group .btn.active.buy')).not.toBeNull();
+  });
+
+  it('Apply says so when the plan has no positive stop to carry into the ticket', async () => {
+    // a stop distance wider than the price: the long stop is not a price
+    const noStop: InstrumentSignalReport = { ...report, sizing: report.sizing === null ? null : { ...report.sizing, long: { ...report.sizing.long, stopLong: '-250' } } };
+    expect(noStop.sizing).not.toBeNull();
+    signals.mockResolvedValue({ ...response, reports: [noStop] });
+    await render(true);
+    await click(container.querySelector('button.btn-buy'));
+    expect(useStore.getState().ticketPrefill).toEqual({ instId: 'BTC-USDT-SWAP', side: 'buy', ordType: 'limit', px: '61000', sizeValue: '16', sizeUnit: 'contracts', nonce: 1 });
+    expect(useStore.getState().toasts.at(-1)?.message).toBe(
+      'Ticket filled: buy 16 contracts BTC-USDT-SWAP @ 61000 (00:00 UTC cut). NO stop was carried into the ticket (the plan has no positive stop price): set the stop yourself',
+    );
   });
 
   it('shows both plans per row and Apply on a short entry fills the reduced short size', async () => {
@@ -332,9 +365,45 @@ describe('SignalsPanel', () => {
     for (const el of container.querySelectorAll('.signal-side-on')) expect(el.classList.contains('sub')).toBe(true);
     expect(container.querySelector('button.btn-buy')).toBeNull();
     await click(container.querySelector('button.btn-sell'));
-    expect(useStore.getState().ticketPrefill).toEqual({ instId: 'BTC-USDT-SWAP', side: 'sell', ordType: 'limit', px: '61000', sizeValue: '4', sizeUnit: 'contracts', nonce: 1 });
+    expect(useStore.getState().ticketPrefill).toEqual({ instId: 'BTC-USDT-SWAP', side: 'sell', ordType: 'limit', px: '61000', sizeValue: '4', sizeUnit: 'contracts', slTriggerPx: '64750', nonce: 1 });
     const inputs = [...container.querySelectorAll<HTMLInputElement>('.form input.num')].map((i) => i.value);
-    expect(inputs.slice(0, 2)).toEqual(['61000', '4']);
+    // price, size and the short plan's stop
+    expect(inputs.slice(0, 3)).toEqual(['61000', '4', '64750']);
+  });
+
+  it('shows the short side as off while short entries are switched off', async () => {
+    // a 55-day low with allowShort = false; a stale server that still flagged the entry must not get a badge or a button either
+    const off: InstrumentSignalReport = { ...shortReport, params: DEFAULT_TREND_PARAMS };
+    expect(off.signals.shortEntry).toBe(true);
+    signals.mockResolvedValue({ ...response, reports: [off] });
+    await render(false, 'LONG EXIT');
+    const badges = [...container.querySelectorAll('.signal-badge')].map((b) => b.textContent);
+    expect(badges).not.toContain('SHORT ENTRY');
+    expect(container.querySelector('button.btn-sell')).toBeNull();
+    const row = container.querySelector('tr.signal-row');
+    // no side is signalled: no Apply button at all, and the short plan's size cut is not listed
+    expect(row?.querySelector('button')).toBeNull();
+    expect(row?.querySelector('.signal-adjust')).toBeNull();
+    // the short plan (4 contracts, 2,500 USDT) is not shown; the long plan is
+    expect([...(row?.querySelectorAll('.signal-short-off') ?? [])].map((el) => el.textContent)).toEqual(['short off', '–', '–', '–']);
+    expect(row?.textContent).not.toContain('2,500.00 USDT');
+    expect(row?.textContent).toContain('5,000.00 USDT');
+    expect(container.querySelector('.signals-toolbar')?.textContent).toContain('shorts off');
+    await click(row);
+    const notes = [...container.querySelectorAll('.signal-note')].map((n) => n.textContent ?? '');
+    expect(notes).toContain('sizing short: off (short entries are switched off, allowShort = false)');
+    // the stop of a short that is still open keeps being shown
+    expect(notes.some((n) => n.includes('next session') && n.includes('61,500'))).toBe(true);
+  });
+
+  it('shows the short plan again when short entries are switched on', async () => {
+    signals.mockResolvedValue({ ...response, reports: [{ ...report, params: { ...DEFAULT_TREND_PARAMS, allowShort: true } }] });
+    await render();
+    expect(container.querySelector('.signal-short-off')).toBeNull();
+    expect(container.querySelector('.signals-toolbar')?.textContent).not.toContain('shorts off');
+    await click(container.querySelector('tr.signal-row'));
+    const notes = [...container.querySelectorAll('.signal-note')].map((n) => n.textContent ?? '');
+    expect(notes.some((n) => n.startsWith('sizing short:') && n.includes('short x0.5'))).toBe(true);
   });
 
   it('does not show adjustments on a full-size long entry', async () => {
@@ -371,19 +440,71 @@ describe('SignalsPanel', () => {
   });
 
   it('lets the owner pick the risk per trade, remembers it and states what the server used', async () => {
-    signals.mockImplementation((q) => Promise.resolve({ ...response, sizingParams: { ...response.sizingParams, riskPct: q?.riskPct ?? '0.0075' } }));
+    // the server splits the unit the owner chose between the two cuts
+    signals.mockImplementation((q) => Promise.resolve({ ...response, sizingParams: { ...response.sizingParams, riskPct: D(q?.riskPct ?? '0.0075').div(2).toFixed() } }));
     await render();
-    expect(container.querySelector('.signals-toolbar')?.textContent).toContain('risk 0.50% of equity per trade');
+    expect(container.querySelector('.signals-toolbar')?.textContent).toContain('risk 0.50% of equity per unit');
     expect(container.querySelector('.signals-toolbar')?.textContent).toContain('notional cap 10%');
+    expect(container.querySelector('.signals-toolbar')?.textContent).toContain('each cut sized at 1/2 of a unit');
     const select = container.querySelector<HTMLSelectElement>('.signals-toolbar select');
     expect(select?.value).toBe('0.005');
     await act(async () => {
       if (select) select.value = '0.0075';
       select?.dispatchEvent(new Event('change', { bubbles: true }));
     });
-    await flush(container, 'risk 0.75% of equity per trade');
+    await flush(container, 'risk 0.75% of equity per unit');
     expect(signals).toHaveBeenLastCalledWith({ equity: '10123.45', riskPct: '0.0075' });
     expect(localStorage.getItem(RISK_KEY)).toBe('0.0075');
+  });
+
+  it('shows one row per instrument and cut, marks the cut that closed last and applies the row\'s own lot', async () => {
+    const failedNoon = { instId: 'ETH-USDT-SWAP', phase: 12 as const, error: { code: 'EXCHANGE', message: 'candles unavailable' } };
+    signals.mockResolvedValue({ ...response, generatedAt: NOW, reports: [report, noonReport, ...response.reports.slice(1), failedNoon] });
+    await render(true);
+    const rows = [...container.querySelectorAll('tbody tr')];
+    expect(rows.map((r) => r.querySelector('td')?.textContent?.replace(/^\S* /, ''))).toEqual([
+      'BTC-USDT-SWAP00:00 UTC',
+      'BTC-USDT-SWAP12:00 UTC · latest close',
+      'ETH-USDT-SWAP00:00 UTC',
+      'ETH-USDT-SWAP12:00 UTC · latest close',
+    ]);
+    expect(container.querySelectorAll('.signal-cut-latest')).toHaveLength(2);
+    expect(rows[3]?.querySelector('.signal-error')?.textContent).toBe('EXCHANGE: candles unavailable');
+    const toolbar = container.querySelector('.signals-toolbar')?.textContent ?? '';
+    expect(toolbar).toContain('daily closes at 00:00 UTC and 12:00 UTC');
+    // the bar named is the one that closed last; the 00:00 one is 13 hours old and not overdue
+    expect(container.querySelector('.signals-bar')?.textContent).toContain(`bar closed ${new Date(NOW).toISOString().slice(0, 10)} 12:00 UTC`);
+    expect(container.querySelector('.signals-bar')?.classList.contains('warn')).toBe(false);
+
+    // each row expands on its own
+    await click(rows[1] ?? null);
+    expect([...container.querySelectorAll('.signal-reasons')].map((r) => r.textContent)).toEqual(['close 61800 vs 55d high 60500: breakout up']);
+    expect(container.querySelector('.signal-details')?.textContent).toContain(`bar closed ${new Date(NOW).toISOString().slice(0, 10)} 12:00 UTC`);
+
+    // Apply takes the lot and the close of its own row
+    const buttons = container.querySelectorAll('tr.signal-row button.btn-buy');
+    expect(buttons).toHaveLength(2);
+    await click(buttons[1] ?? null);
+    expect(useStore.getState().ticketPrefill).toMatchObject({ instId: 'BTC-USDT-SWAP', side: 'buy', px: '61800', sizeValue: '7', sizeUnit: 'contracts' });
+    expect(useStore.getState().toasts.at(-1)?.message).toBe('Ticket filled: buy 7 contracts BTC-USDT-SWAP @ 61800 (12:00 UTC cut)');
+    await click(buttons[0] ?? null);
+    expect(useStore.getState().ticketPrefill).toMatchObject({ px: '61000', sizeValue: '16' });
+  });
+
+  it('marks the 00:00 cut in the hours after midnight, and no cut when the server computes one only', async () => {
+    signals.mockResolvedValue({ ...response, reports: [report, noonReport] });
+    await render();
+    // generated at 05:00 UTC: the 00:00 bar is the one that just closed
+    expect([...container.querySelectorAll('.signal-cut')].map((el) => el.textContent)).toEqual(['00:00 UTC · latest close', '12:00 UTC']);
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    signals.mockResolvedValue({ ...response, phases: [0], sizingParams: { ...response.sizingParams, riskPct: '0.005', maxNotionalPct: '0.10' }, reports: [report] });
+    await render();
+    expect([...container.querySelectorAll('.signal-cut')].map((el) => el.textContent)).toEqual(['00:00 UTC']);
+    const toolbar = container.querySelector('.signals-toolbar')?.textContent ?? '';
+    expect(toolbar).toContain('risk 0.50% of equity per trade');
+    expect(toolbar).toContain('UTC daily close');
+    expect(toolbar).not.toContain('of a unit');
   });
 
   it('starts from the remembered risk per trade', async () => {
@@ -408,7 +529,8 @@ describe('SignalsPanel', () => {
     expect(container.querySelector('tr.signal-row .signal-unchecked')?.textContent).toBe('funding unchecked');
   });
 
-  it('flags an open position on the signalled side and does not offer to add to it', async () => {
+  it('one cut: flags an open position on the signalled side and does not offer to add to it', async () => {
+    signals.mockResolvedValue(oneCut);
     useStore.setState({ positions: [btcLong] });
     await render(true);
     expect(container.querySelector('tr.signal-row .signal-held')?.textContent).toBe('in position');
@@ -419,7 +541,40 @@ describe('SignalsPanel', () => {
     expect(useStore.getState().ticketPrefill).toBeNull();
   });
 
-  it('flags a resting entry order on the signalled side and does not offer a second full-size entry', async () => {
+  it('two cuts: one lot open or resting leaves the lot of the other cut to apply; what amounts to both lots does not', async () => {
+    // 3 contracts held against a lot of 16: the other cut's lot may be in, this row's is still offered
+    useStore.setState({ positions: [btcLong] });
+    await render(true);
+    const held = container.querySelector<HTMLElement>('tr.signal-row .signal-held');
+    expect(held?.textContent).toBe('in position');
+    expect(held?.title).toMatch(/only if what is open is the other cut's lot/);
+    const apply = container.querySelector<HTMLButtonElement>('button.btn-buy');
+    expect(apply?.disabled).toBe(false);
+    expect(apply?.title).toMatch(/^Fill the ticket: buy 16 contracts @ 61000\. .*other cut's lot/);
+    await click(apply);
+    expect(useStore.getState().ticketPrefill).toMatchObject({ instId: 'BTC-USDT-SWAP', side: 'buy', sizeValue: '16' });
+    // a lot held and a second one resting (9 unfilled of 16): 3 + 12 + 9 = 24 contracts, a lot and a half
+    await act(async () => {
+      useStore.setState({ positions: [{ ...btcLong, pos: '15' }], orders: { o1: { ...restingBuy, accFillSz: '7' } } });
+    });
+    expect(container.querySelector<HTMLElement>('tr.signal-row .signal-held')?.title).toMatch(/lots of all the daily cuts/);
+    expect(apply?.disabled).toBe(true);
+    expect(apply?.title).toMatch(/lots of all the daily cuts/);
+    // a resting entry alone of one lot's size: the other cut's lot is still offered
+    await act(async () => {
+      useStore.setState({ positions: [], orders: { o1: restingBuy } });
+    });
+    expect(container.querySelector('tr.signal-row .signal-held')?.textContent).toBe('entry pending');
+    expect(apply?.disabled).toBe(false);
+    // an exit resting on the leg is not an entry: it does not count towards the unit
+    await act(async () => {
+      useStore.setState({ positions: [{ ...btcLong, pos: '16' }], orders: { o1: { ...restingBuy, side: 'sell' } } });
+    });
+    expect(apply?.disabled).toBe(false);
+  });
+
+  it('one cut: flags a resting entry order on the signalled side and does not offer a second full-size entry', async () => {
+    signals.mockResolvedValue(oneCut);
     useStore.setState({ account: { posMode: 'long_short_mode', acctLv: '2', canTrade: true }, orders: { o1: restingBuy } });
     await render(true);
     expect(container.querySelector('tr.signal-row .signal-held')?.textContent).toBe('entry pending');
@@ -432,6 +587,7 @@ describe('SignalsPanel', () => {
 
   it('net mode: a same-side order that is not reduce-only is a pending entry, an exit or the other side is not', async () => {
     const net: Order = { ...restingBuy, posSide: 'net' };
+    signals.mockResolvedValue(oneCut);
     useStore.setState({ orders: { o1: net } });
     await render();
     expect(container.querySelector('tr.signal-row .signal-held')?.textContent).toBe('entry pending');

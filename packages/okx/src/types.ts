@@ -223,6 +223,10 @@ export interface OkxOrder {
   feeCcy: string;
   pnl: string;
   category: string;
+  /** Legacy single stop-loss trigger of the order itself; '' when none */
+  slTriggerPx?: string;
+  /** The TP/SL attached at placement, echoed back; the exchange creates the algo order when the order fills */
+  attachAlgoOrds?: OkxAttachAlgoOrd[];
   cTime: string;
   uTime: string;
   /** Present on the private `orders` channel pushes */
@@ -254,6 +258,28 @@ export interface OkxFill {
   ts: string;
 }
 
+export type OkxTriggerPxType = 'last' | 'index' | 'mark';
+
+/** A take-profit / stop-loss attached to an order (`attachAlgoOrds` of the place-order request and of the order object). */
+export interface OkxAttachAlgoOrd {
+  /** Client id of the attached algo order, up to 32 alphanumeric characters */
+  attachAlgoClOrdId?: string;
+  tpTriggerPx?: string;
+  tpOrdPx?: string;
+  slTriggerPx?: string;
+  /** '-1' executes the stop at market */
+  slOrdPx?: string;
+  tpTriggerPxType?: OkxTriggerPxType;
+  /** OKX defaults to 'last' */
+  slTriggerPxType?: OkxTriggerPxType;
+  sz?: string;
+  amendPxOnTriggerType?: '0' | '1';
+  /** Order object only: set when the exchange could not create the attached order; '' or '0' otherwise */
+  failCode?: string;
+  /** Order object only: why it could not be created */
+  failReason?: string;
+}
+
 export interface OkxPlaceOrderParams {
   instId: string;
   tdMode: OkxTdMode;
@@ -267,6 +293,7 @@ export interface OkxPlaceOrderParams {
   reduceOnly?: boolean;
   /** For SWAP: 'base_ccy' | 'quote_ccy' is spot-only; omit for swaps */
   tgtCcy?: string;
+  attachAlgoOrds?: OkxAttachAlgoOrd[];
 }
 
 export interface OkxOrderAck {

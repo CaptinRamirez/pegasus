@@ -60,6 +60,20 @@ describe('loadConfig files and version', () => {
   });
 });
 
+describe('loadConfig SIGNAL_PHASES', () => {
+  it('defaults to both daily cuts, and takes one cut or both in any order', () => {
+    expect(loadConfig({}).signalPhases).toEqual([0, 12]);
+    expect(loadConfig({ SIGNAL_PHASES: '0' }).signalPhases).toEqual([0]);
+    expect(loadConfig({ SIGNAL_PHASES: '12' }).signalPhases).toEqual([12]);
+    expect(loadConfig({ SIGNAL_PHASES: ' 12 , 0, 12' }).signalPhases).toEqual([0, 12]);
+  });
+
+  it('refuses an empty list and an hour that is not a cut', () => {
+    expect(() => loadConfig({ SIGNAL_PHASES: '' })).toThrow(/SIGNAL_PHASES must list one or more of 0, 12/);
+    expect(() => loadConfig({ SIGNAL_PHASES: '0,6' })).toThrow(/SIGNAL_PHASES/);
+  });
+});
+
 describe('loadConfig WEB_ORIGINS', () => {
   it('defaults to the terminal page on the Vite port, under both local names', () => {
     expect(loadConfig({}).server.webOrigins).toEqual(['http://localhost:5174', 'http://127.0.0.1:5174']);

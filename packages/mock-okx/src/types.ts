@@ -1,4 +1,4 @@
-import type { OkxBalance, OkxFill, OkxInstrument, OkxOrder, OkxPosMode, OkxPosition } from './wire.js';
+import type { MockStop, OkxBalance, OkxFill, OkxInstrument, OkxOrder, OkxPosMode, OkxPosition } from './wire.js';
 
 export interface MockCredentials {
   apiKey: string;
@@ -34,6 +34,8 @@ export interface MockState {
   positions: OkxPosition[];
   balance: OkxBalance;
   fills: OkxFill[];
+  /** Active attached stop-losses (algo orders: they are not in `orders`). */
+  stops: MockStop[];
 }
 
 export interface MockOkxHandle {
@@ -43,8 +45,13 @@ export interface MockOkxHandle {
   wsPrivateUrl: string;
   wsBusinessUrl: string;
   close(): Promise<void>;
-  /** Jumps the simulated mid price (and runs matching for resting orders). */
+  /** Jumps the simulated mid price (and runs matching for resting orders). The book and the last price follow; so does the mark unless it is pinned. */
   setPrice(instId: string, px: string): void;
+  /**
+   * Pins the mark price at `px`, apart from the book and the last price, and checks the attached stops against
+   * it; it stays there through later ticks and setPrice calls until `null` lets it follow the mid price again.
+   */
+  setMarkPrice(instId: string, px: string | null): void;
   getState(): MockState;
   /** Advances one simulated tick manually. */
   tick(): void;

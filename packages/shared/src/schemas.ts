@@ -50,6 +50,11 @@ export const placeOrderRequestSchema = z
     px: positiveDecimalString.optional(),
     size: orderSizeSchema,
     reduceOnly: z.boolean().optional(),
+    /**
+     * Stop-loss attached to an opening order: the exchange creates it when the order fills, triggered by the
+     * mark price and executed at market. Refused on an order that closes a position.
+     */
+    slTriggerPx: positiveDecimalString.optional(),
     clOrdId: clOrdIdSchema.optional(),
     /**
      * True when `clOrdId` was already sent in an earlier attempt whose outcome is unknown: the server looks the

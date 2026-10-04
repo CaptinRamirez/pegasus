@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import type { CandleBar, Fill, InstId, Instrument, Order, RiskState, ServerMessage } from '@pegasus/shared';
 import { readStoredToken, writeStoredToken } from '../lib/http';
 import type { WsStatus } from '../lib/ws';
-import { applyRiskReply, applyServerMessage, applyWsStatus, mergeFills, mergeOrderHistory, pushToast, stampMessage } from './reducers';
+import { applyOrderHistorySeed, applyRiskReply, applyServerMessage, applyWsStatus, mergeFills, pushToast, stampMessage } from './reducers';
 import { emptyMarket, initialState, type MarketData, type TerminalState, type TicketPrefillInput, type ToastKind } from './types';
 
 export interface TerminalActions {
@@ -48,7 +48,7 @@ export const useStore = create<TerminalStore>()((set, get) => ({
   },
   pushToast: (kind, message) => set((s) => pushToast(s, kind, message)),
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
-  seedOrderHistory: (orders) => set((s) => ({ orderHistory: mergeOrderHistory(s.orderHistory, orders) })),
+  seedOrderHistory: (orders) => set((s) => applyOrderHistorySeed(s, orders, Date.now())),
   seedFills: (fills) => set((s) => ({ fills: mergeFills(s.fills, fills) })),
   setTicketPrice: (px) => set((s) => ({ ticketPrice: { px, nonce: (s.ticketPrice?.nonce ?? 0) + 1 } })),
   applyTicketPrefill: (prefill) =>

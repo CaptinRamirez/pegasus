@@ -116,6 +116,31 @@ importers:
         specifier: ^4.1.11
         version: 4.1.11(@types/node@22.20.5)(jsdom@30.1.1)(vite@7.3.6(@types/node@22.20.5)(tsx@4.23.15))
 
+  packages/backtest:
+    dependencies:
+      '@pegasus/okx':
+        specifier: workspace:*
+        version: link:../okx
+      '@pegasus/shared':
+        specifier: workspace:*
+        version: link:../shared
+      decimal.js:
+        specifier: ^10.6.0
+        version: 10.6.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.20.5
+        version: 22.20.5
+      tsx:
+        specifier: ^4.23.15
+        version: 4.23.15
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: ^4.1.11
+        version: 4.1.11(@types/node@22.20.5)(jsdom@30.1.1)(vite@7.3.6(@types/node@22.20.5)(tsx@4.23.15))
+
   packages/mock-okx:
     dependencies:
       decimal.js:

@@ -5,4 +5,5 @@ export * from './endpoints.js';
 export * from './checksum.js';
 export * from './rest.js';
 export * from './orderbook.js';
+export * from './open-interest.js';
 export * from './ws.js';

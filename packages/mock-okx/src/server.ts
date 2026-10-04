@@ -102,6 +102,7 @@ export async function startMockOkx(opts: MockOkxOptions = {}): Promise<MockOkxHa
       });
     },
     setPrice: (instId, px) => engine.setPrice(instId, px),
+    setMarkPrice: (instId, px) => engine.setMarkPrice(instId, px),
     getState: () => engine.state(),
     tick: () => engine.tick(),
   };

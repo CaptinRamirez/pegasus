@@ -51,17 +51,20 @@ const previewOf = (req: PlaceOrderRequest): OrderPreview => ({
   notionalQuote: '600',
   estSlippagePct: '',
   lever: '3',
+  slTriggerPx: req.slTriggerPx ?? '',
+  stopLossQuote: req.slTriggerPx === undefined ? '' : '40',
   risk: { ok: true, code: 'OK', message: '' },
 });
 
 const orderOf = (req: PlaceOrderRequest): Order => ({
+  ...(req.slTriggerPx === undefined ? {} : { slTriggerPx: req.slTriggerPx }),
   ordId: 'o1', clOrdId: req.clOrdId ?? '', instId: req.instId, side: req.side, posSide: req.posSide ?? 'net', tdMode: 'cross', ordType: req.ordType, px: req.px ?? '', sz: req.size.value,
   accFillSz: '0', avgPx: '', state: 'live', reduceOnly: false, lever: '3', fee: '0', feeCcy: '', pnl: '0', cTime: 1, uTime: 1,
 });
 
 const riskOn: RiskState = {
   killSwitch: true, killSwitchReason: 'manual (terminal)', cancelSweep: { state: 'done', message: 'open orders cancelled', ts: 1 }, dayStartTs: 0,
-  dayStartEquity: '10000', baselineTs: 0, currentEquity: '10000', dailyPnl: '0', openOrders: 0, totalPositionNotional: '0', updatedAt: 1,
+  dayStartEquity: '10000', baselineTs: 0, currentEquity: '10000', dailyPnl: '0', openOrders: 0, totalPositionNotional: '0', overLimit: [], totalOverLimit: '', updatedAt: 1,
 };
 
 describe('OrderTicket', () => {
@@ -167,6 +170,60 @@ describe('OrderTicket', () => {
     await until('the toast', () => useStore.getState().toasts.length === 1);
     expect(useStore.getState().toasts[0]?.message).toBe('Order live: Open long, buy 2 contracts ETH-USDT-SWAP @ 3000 (o1)');
     expect(submit()?.title).toBe('Open long: buy 2 contracts ETH-USDT-SWAP @ 3000');
+  });
+
+  it('an opening order carries the stop typed into the ticket; the preview shows it with the loss, and a closing order has no stop', async () => {
+    await render();
+    const stopInput = (): HTMLInputElement | undefined => inputs()[2];
+    expect(container.textContent).toContain('Stop (mark)');
+    // the field's tooltip states OKX's rule: no stop until the order is completely filled
+    const stopTitle = stopInput()?.closest('.field')?.querySelector('label')?.title ?? '';
+    expect(stopTitle).toContain('only once the order is completely filled');
+    expect(stopTitle).toContain('the filled part has no stop');
+    expect(stopTitle).not.toContain('sized to the fill');
+    await fill('3000', '2');
+    expect(lastPreviewed()).not.toHaveProperty('slTriggerPx');
+    expect(container.querySelector('.preview')?.textContent).not.toContain('Stop (mark)');
+
+    await type(stopInput(), '2800');
+    await until('the stop preview', () => lastPreviewed()?.slTriggerPx === '2800' && submit()?.disabled === false);
+    expect(container.querySelector('.preview')?.textContent).toContain('Stop (mark)2,800Loss at stop40.00 USDT');
+    expect(container.querySelector('.preview')?.textContent).toContain('Loss at stop40.00 USDT');
+    expect(submit()?.title).toBe('Open long: buy 2 coin ETH-USDT-SWAP @ 3000, stop 2800 (mark)');
+
+    // a stop that is not a price leaves the form incomplete: nothing can be submitted without the stop the user asked for
+    await type(stopInput(), '28x');
+    await until('the incomplete form', () => submit()?.disabled === true && submit()?.title === 'Complete the form');
+    await type(stopInput(), '2800');
+    await until('the stop preview again', () => lastPreviewed()?.slTriggerPx === '2800' && submit()?.disabled === false);
+
+    await click(submit());
+    await until('the order', () => placeOrder.mock.calls.length === 1);
+    expect(placeOrder.mock.calls[0]?.[0]).toMatchObject({ side: 'buy', posSide: 'long', px: '3000', slTriggerPx: '2800' });
+    await until('the toast', () => useStore.getState().toasts.length === 1);
+    expect(useStore.getState().toasts[0]?.message).toBe('Order live: Open long, buy 2 contracts ETH-USDT-SWAP @ 3000, stop 2800 (mark) (o1)');
+
+    // closing: the field is gone and the stop is not sent
+    await click(closeBox());
+    expect(inputs().map((i) => i.value)).not.toContain('2800');
+    await until('the closing preview', () => lastPreviewed()?.posSide === 'short' && !(container.textContent ?? '').includes('Stop (mark)'));
+    expect(lastPreviewed()).not.toHaveProperty('slTriggerPx');
+  });
+
+  it('a pre-fill brings its stop, a pre-fill without one clears it, and an instrument change clears it', async () => {
+    await render();
+    await act(async () => {
+      useStore.getState().applyTicketPrefill({ instId: 'ETH-USDT-SWAP', side: 'buy', ordType: 'limit', px: '3000', sizeValue: '2', sizeUnit: 'contracts', slTriggerPx: '2750' });
+    });
+    expect(inputs().slice(0, 3).map((i) => i.value)).toEqual(['3000', '2', '2750']);
+    await until('the preview', () => lastPreviewed()?.slTriggerPx === '2750');
+    await prefillShort();
+    expect(inputs().slice(0, 3).map((i) => i.value)).toEqual(['3000', '2', '']);
+    await type(inputs()[2], '3200');
+    await act(async () => {
+      useStore.getState().selectInstrument('BTC-USDT-SWAP');
+    });
+    expect(inputs()[2]?.value).toBe('');
   });
 
   it('long/short mode: the close checkbox sends the closing direction of the leg and says so', async () => {
@@ -307,7 +364,8 @@ describe('OrderTicket', () => {
     );
     useStore.setState({ instruments: [eth, btc, { ...eth, instId: 'SOL-USDT-SWAP', baseCcy: 'SOL' }] });
     await render();
-    const lever = (): HTMLInputElement | undefined => inputs()[2];
+    // price, size, stop, then the leverage box
+    const lever = (): HTMLInputElement | undefined => inputs()[3];
     await until('the leverage', () => lever()?.value === '3');
     // half-typed on ETH, then on to an instrument with the same leverage
     await type(lever(), '7');

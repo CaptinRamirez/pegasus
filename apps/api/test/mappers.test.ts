@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { OkxInstrument, OkxOrder, OkxPosition } from '@pegasus/okx';
 import { CANDLE_BARS } from '@pegasus/shared';
-import { fillFromOrderPush, fromOkxBar, mapInstrument, mapOrder, mapPosition, toOkxBar } from '../src/okx/mappers.js';
+import { failedAttachedStop, fillFromOrderPush, fromOkxBar, mapInstrument, mapOrder, mapPosition, toOkxBar } from '../src/okx/mappers.js';
 
 const rawInst: OkxInstrument = {
   instType: 'SWAP', instId: 'BTC-USDT-SWAP', uly: 'BTC-USDT', instFamily: 'BTC-USDT', baseCcy: '', quoteCcy: '', settleCcy: 'USDT',
@@ -31,6 +31,32 @@ describe('mappers', () => {
     const f = fillFromOrderPush(rawOrder);
     expect(f).toMatchObject({ tradeId: 't1', fillPx: '49999.9', fillSz: '1', fee: '-0.1', execType: 'M', ts: 1700000000123 });
     expect(fillFromOrderPush({ ...rawOrder, tradeId: '', fillSz: '0' })).toBeNull();
+  });
+  it('reads the attached stop-loss from attachAlgoOrds, else from the order itself, and leaves it out when there is none', () => {
+    expect(mapOrder(rawOrder)).not.toHaveProperty('slTriggerPx');
+    expect(mapOrder({ ...rawOrder, slTriggerPx: '', attachAlgoOrds: [] })).not.toHaveProperty('slTriggerPx');
+    expect(mapOrder({ ...rawOrder, slTriggerPx: '', attachAlgoOrds: [{ attachAlgoClOrdId: 'slpgabc', slTriggerPx: '48000', slOrdPx: '-1', slTriggerPxType: 'mark' }] }).slTriggerPx).toBe('48000');
+    // a take-profit only entry carries no stop
+    expect(mapOrder({ ...rawOrder, attachAlgoOrds: [{ tpTriggerPx: '55000', tpOrdPx: '-1', slTriggerPx: '' }] })).not.toHaveProperty('slTriggerPx');
+    expect(mapOrder({ ...rawOrder, slTriggerPx: '47000' }).slTriggerPx).toBe('47000');
+  });
+  it('does not show a stop the exchange failed to create', () => {
+    const stop = { attachAlgoClOrdId: 'slpgabc', slTriggerPx: '48000', slOrdPx: '-1', slTriggerPxType: 'mark' as const };
+    const failed = { ...rawOrder, slTriggerPx: '', attachAlgoOrds: [{ ...stop, failCode: '1', failReason: 'not created' }] };
+    expect(mapOrder(failed)).not.toHaveProperty('slTriggerPx');
+    // the reason travels with the order so that the terminal can tell the trader
+    expect(mapOrder(failed).slFailReason).toBe('1: not created');
+    expect(mapOrder({ ...rawOrder, attachAlgoOrds: [{ ...stop, failCode: '51279' }] }).slFailReason).toBe('51279: ');
+    expect(failedAttachedStop(failed)).toMatchObject({ slTriggerPx: '48000', failCode: '1' });
+    // an empty or zero failCode is a stop that exists
+    for (const failCode of ['', '0']) {
+      const ok = { ...rawOrder, attachAlgoOrds: [{ ...stop, failCode, failReason: '' }] };
+      expect(mapOrder(ok).slTriggerPx).toBe('48000');
+      expect(mapOrder(ok)).not.toHaveProperty('slFailReason');
+      expect(failedAttachedStop(ok)).toBeNull();
+    }
+    expect(mapOrder(rawOrder)).not.toHaveProperty('slFailReason');
+    expect(failedAttachedStop(rawOrder)).toBeNull();
   });
 });
 

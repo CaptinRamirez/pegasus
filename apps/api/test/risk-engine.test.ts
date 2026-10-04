@@ -192,6 +192,73 @@ describe('RiskEngine.check', () => {
   });
 });
 
+describe('RiskEngine.updateExposure: positions that have outgrown the limits', () => {
+  const engine = () => new RiskEngine(config, new MemoryStore(), log, () => Date.UTC(2026, 0, 1, 12));
+  const instrumentOf = (id: string): Instrument | undefined => INSTRUMENTS.get(id);
+  const total = (positions: Position[]): string => positions.reduce((acc, p) => acc + Math.abs(Number(p.notionalUsd || '0')), 0).toString();
+  const feed = (e: RiskEngine, positions: Position[], totalNotional = total(positions)): void => e.updateExposure(0, totalNotional, positions, instrumentOf);
+
+  it('starts with nothing over the limit, and a position at the limit is not over it', () => {
+    const e = engine();
+    expect(e.state.overLimit).toEqual([]);
+    expect(e.state.totalOverLimit).toBe('');
+    feed(e, [position(BTC.instId, '20000'), position(ETH.instId, '10000')]);
+    expect(e.state.overLimit).toEqual([]);
+    expect(e.state.totalOverLimit).toBe('');
+  });
+
+  it('lists an instrument whose position grew past the per-instrument limit, long or short, and fans it out', () => {
+    const e = engine();
+    const states: string[] = [];
+    e.on('state', (s) => states.push(JSON.stringify(s.overLimit)));
+    feed(e, [position(BTC.instId, '26500.5'), position(ETH.instId, '-21000', 'net', '-1')]);
+    expect(e.state.overLimit).toEqual([
+      { instId: BTC.instId, notional: '26500.5', limit: '20000', excess: '6500.5' },
+      { instId: ETH.instId, notional: '21000', limit: '20000', excess: '1000' },
+    ]);
+    expect(states).toHaveLength(1);
+    expect(states[0]).toContain('6500.5');
+    // trimmed back: the entry goes away
+    feed(e, [position(BTC.instId, '20000')]);
+    expect(e.state.overLimit).toEqual([]);
+  });
+
+  it('long/short mode counts the gross of both legs, like the pre-trade rule', () => {
+    const e = engine();
+    feed(e, [position(BTC.instId, '12000', 'long', '24'), position(BTC.instId, '11000', 'short', '22')]);
+    expect(e.state.overLimit).toEqual([{ instId: BTC.instId, notional: '23000', limit: '20000', excess: '3000' }]);
+  });
+
+  it('values a position without a reported notional at its mark price; resting orders are not counted', () => {
+    const e = engine();
+    // 50 contracts x 0.01 BTC x 50,000 = 25,000
+    e.updateExposure(3, '0', [position(BTC.instId, '', 'net', '50')], instrumentOf);
+    expect(e.state.openOrders).toBe(3);
+    expect(e.state.overLimit).toEqual([{ instId: BTC.instId, notional: '25000', limit: '20000', excess: '5000' }]);
+  });
+
+  it('reports the excess of the total over the total limit', () => {
+    const e = engine();
+    feed(e, [position(BTC.instId, '18000'), position(ETH.instId, '-15000.25', 'net', '-1')]);
+    expect(e.state.overLimit).toEqual([]);
+    expect(e.state.totalOverLimit).toBe('3000.25');
+    feed(e, [position(BTC.instId, '18000')]);
+    expect(e.state.totalOverLimit).toBe('');
+  });
+
+  it('is advisory: no halt, opening orders elsewhere and closing orders still pass, and it is not persisted', async () => {
+    const store = new MemoryStore();
+    const e = new RiskEngine(config, store, log, () => Date.UTC(2026, 0, 1, 12));
+    const positions = [position(BTC.instId, '26000')];
+    feed(e, positions);
+    expect(e.state.killSwitch).toBe(false);
+    expect(e.check(input({ side: 'sell', reduceOnly: true, notional: '6000', positions })).ok).toBe(true);
+    expect(e.check(input({ inst: ETH, px: '3000', refPrice: '3000', positions })).ok).toBe(true);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(await store.getSetting<unknown>('risk.state')).toBeNull();
+  });
+});
+
 describe('RiskEngine daily loss', () => {
   it('trips the kill switch when equity drops by the limit and resets on a new day', async () => {
     let now = Date.UTC(2026, 0, 1, 12);

@@ -1,6 +1,6 @@
-import type { Candle, Fill, HelloPayload, Order, RiskState, ServerMessage, Trade } from '@pegasus/shared';
+import { stopUnconfirmedAfterCancel, type Candle, type Fill, type HelloPayload, type Order, type RiskState, type ServerMessage, type Trade } from '@pegasus/shared';
 import type { WsStatus } from '../lib/ws';
-import { LIMITS, emptyMarket, type MarketData, type TerminalState, type ToastKind } from './types';
+import { LIMITS, emptyMarket, type MarketData, type TerminalState, type Toast, type ToastKind } from './types';
 
 /**
  * Pure reducers: each returns the slice of state that changes for a server
@@ -84,7 +84,13 @@ export function applyHello(state: TerminalState, data: HelloPayload): Partial<Te
     state.selectedInstId !== null && data.instruments.some((i) => i.instId === state.selectedInstId);
   const selectedInstId = stillTracked ? state.selectedInstId : (data.instruments[0]?.instId ?? null);
 
+  // an open order whose stop was not created is as urgent after a reload or a reconnect as on its push
+  // (an order cancelled after a partial fill is not open: the history seed tells that one)
+  let notices: Partial<TerminalState> = {};
+  for (const o of data.openOrders) notices = { ...notices, ...noteLostStop({ ...state, ...notices }, o) };
+
   return {
+    ...notices,
     helloSeq: state.helloSeq + 1,
     demo: data.demo,
     instruments: data.instruments,
@@ -141,14 +147,57 @@ export function isTerminalOrder(o: Order): boolean {
 }
 
 export function applyOrder(state: TerminalState, order: Order): Partial<TerminalState> {
+  const notice = noteLostStop(state, order);
   if (!isTerminalOrder(order)) {
-    return { orders: { ...state.orders, [order.ordId]: order } };
+    return { ...notice, orders: { ...state.orders, [order.ordId]: order } };
   }
   const orders: Record<string, Order> = {};
   for (const [id, o] of Object.entries(state.orders)) {
     if (id !== order.ordId) orders[id] = o;
   }
-  return { orders, orderHistory: mergeOrderHistory(state.orderHistory, [order]) };
+  return { ...notice, orders, orderHistory: mergeOrderHistory(state.orderHistory, [order]) };
+}
+
+/**
+ * The error toast for an order whose position may have no stop-loss: the exchange did not create the stop
+ * attached to it (Order.slFailReason), or the order was cancelled after a partial fill, where OKX does not say
+ * whether the filled part gets its stop (stopUnconfirmedAfterCancel). An error toast stays until it is clicked
+ * away, and this one is sticky: later toasts do not push it out. Every push of the order repeats the
+ * condition, so the order is remembered and told once, for whichever of the two comes first.
+ */
+export function noteLostStop(state: TerminalState, order: Order): Partial<TerminalState> {
+  if (state.lostStopNotified.includes(order.ordId)) return {};
+  let en: string;
+  let zh: string;
+  if (order.slFailReason !== undefined) {
+    en = `STOP-LOSS NOT CREATED: ${order.instId} order ${order.ordId} (${order.side} ${order.sz} contracts). The exchange did NOT create the stop attached to it (${order.slFailReason}): the position has no stop. Place the stop on OKX now.`;
+    zh = `止损单未创建：${order.instId} 订单 ${order.ordId} 的仓位没有止损，请立即在 OKX 上设置止损`;
+  } else if (stopUnconfirmedAfterCancel(order)) {
+    en = `STOP-LOSS MAY BE MISSING: ${order.instId} order ${order.ordId} (${order.side}) was cancelled after filling ${order.accFillSz} of ${order.sz} contracts. OKX creates the attached stop only when an order is completely filled: the filled part may have no stop. Check on OKX now and place the stop by hand if it is missing.`;
+    zh = `止损单可能缺失：${order.instId} 订单 ${order.ordId} 部分成交（${order.accFillSz}/${order.sz} 张）后被撤销，已成交部分可能没有止损，请立即在 OKX 上核对，缺失则手动补上`;
+  } else {
+    return {};
+  }
+  return {
+    ...pushToast(state, 'error', `${en}\n${zh}`, true),
+    lostStopNotified: [...state.lostStopNotified, order.ordId].slice(-LIMITS.lostStopNotified),
+  };
+}
+
+/** How far back an order of the REST history still raises the lost-stop notice: older ones were dealt with long ago. */
+export const LOST_STOP_RECENT_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Order history loaded over REST (page load, and again after every reconnect). An order that was filled or
+ * canceled while the page was not listening never arrives as a push and is not among hello's open orders, so
+ * a recent one whose stop was not created, or may be missing after a cancel, is told here.
+ */
+export function applyOrderHistorySeed(state: TerminalState, incoming: Order[], now: number): Partial<TerminalState> {
+  let notices: Partial<TerminalState> = {};
+  for (const o of incoming) {
+    if (o.uTime >= now - LOST_STOP_RECENT_MS) notices = { ...notices, ...noteLostStop({ ...state, ...notices }, o) };
+  }
+  return { ...notices, orderHistory: mergeOrderHistory(state.orderHistory, incoming) };
 }
 
 /** Merges terminal orders into the history list (newest first, deduped by ordId, capped). */
@@ -171,10 +220,18 @@ export function mergeFills(fills: Fill[], incoming: Fill[]): Fill[] {
   return [...byKey.values()].sort((a, b) => b.ts - a.ts).slice(0, LIMITS.fills);
 }
 
-export function pushToast(state: TerminalState, kind: ToastKind, message: string): Partial<TerminalState> {
-  const toast = { id: state.nextToastId, kind, message, ts: Date.now() };
+/**
+ * Appends a toast and keeps the newest LIMITS.toasts of those that may be dropped. A sticky toast (the
+ * lost-stop notice) is outside the cap: it leaves only when the trader clicks it away.
+ */
+export function pushToast(state: TerminalState, kind: ToastKind, message: string, sticky = false): Partial<TerminalState> {
+  const toast: Toast = { id: state.nextToastId, kind, message, ts: Date.now() };
+  if (sticky) toast.sticky = true;
+  const all = [...state.toasts, toast];
+  const droppable = all.filter((t) => t.sticky !== true);
+  const dropped = new Set(droppable.slice(0, Math.max(0, droppable.length - LIMITS.toasts)).map((t) => t.id));
   return {
-    toasts: [...state.toasts, toast].slice(-LIMITS.toasts),
+    toasts: all.filter((t) => !dropped.has(t.id)),
     nextToastId: state.nextToastId + 1,
   };
 }

@@ -1,17 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import {
   atr,
+  barOiChanges,
   buildSignalReport,
   classifyRegime,
   computeIndicators,
+  dailyBarsFromHalfDays,
   DEFAULT_TREND_PARAMS,
   efficiencyRatio,
   evaluateTrendSignals,
+  phaseDayStart,
   planSize,
   previousChannel,
   realizedVol,
   sizeAdjustment,
   sma,
+  splitSizingAcrossPhases,
   summarizeFunding,
   trailingChannel,
   type Candle,
@@ -192,6 +196,175 @@ describe('crisis detection', () => {
     const longer = { ...DEFAULT_TREND_PARAMS, crisisHoldBars: 10 };
     expect(classifyRegime(computeIndicators(shocked(5), longer), longer)).toBe('crisis');
   });
+
+  it('does not call a 3-sigma UP breakout with rising open interest a crisis', () => {
+    const candles = shocked(0, 0.06);
+    const last = candles[candles.length - 1]!;
+    const ind = computeIndicators(candles, DEFAULT_TREND_PARAMS, [{ ts: last.ts, change: '0.04' }]);
+    expect(Number(ind.dailyReturn)).toBeGreaterThan(3 * Number(ind.dailySigma));
+    expect(ind.shockBars).toEqual([{ daysAgo: 0, return: ind.dailyReturn, oiChange: '0.04', crisis: false }]);
+    expect(ind.crisisDaysAgo).toBeNull();
+    const regime = classifyRegime(ind);
+    expect(regime).not.toBe('crisis');
+    const sig = evaluateTrendSignals(ind, regime, null);
+    expect(sig.longEntry).toBe(true);
+    expect(sig.reasons).toContain('shock: the last bar moved +6.00% (more than 3 sigma); OI +4.0%: not a deleveraging day');
+    expect(sizeAdjustment('long', regime, null, null).multiplier).toBe('1');
+    // the direction of the move does not matter: the same bar with open interest down 12% is a crisis day
+    const forced = computeIndicators(candles, DEFAULT_TREND_PARAMS, [{ ts: last.ts, change: '-0.12' }]);
+    expect(forced.crisisDaysAgo).toBe(0);
+    // a fall of exactly 10% is not "more than 10%"
+    expect(computeIndicators(candles, DEFAULT_TREND_PARAMS, [{ ts: last.ts, change: '-0.1' }]).crisisDaysAgo).toBeNull();
+    expect(computeIndicators(candles, { ...DEFAULT_TREND_PARAMS, crisisOiDrop: '0.05' }, [{ ts: last.ts, change: '-0.1' }]).crisisDaysAgo).toBe(0);
+  });
+
+  it('holds a 3-sigma bar with open interest down 12% as a crisis for exactly the hold window', () => {
+    for (let ago = 0; ago <= 5; ago++) {
+      const candles = shocked(ago);
+      const bar = candles[candles.length - 1 - ago]!;
+      const ind = computeIndicators(candles, DEFAULT_TREND_PARAMS, [{ ts: bar.ts, change: '-0.12' }]);
+      if (ago < 5) {
+        expect(ind.shockBars).toHaveLength(1);
+        expect(ind.shockBars[0]).toMatchObject({ daysAgo: ago, oiChange: '-0.12', crisis: true });
+        expect(ind.crisisDaysAgo).toBe(ago);
+        expect(classifyRegime(ind)).toBe('crisis');
+      } else {
+        expect(ind.shockBars).toEqual([]);
+        expect(ind.crisisDaysAgo).toBeNull();
+        expect(classifyRegime(ind)).not.toBe('crisis');
+      }
+    }
+    const two = shocked(2);
+    const sig = evaluateTrendSignals(computeIndicators(two, DEFAULT_TREND_PARAMS, [{ ts: two[two.length - 3]!.ts, change: '-0.12' }]), 'crisis', null);
+    expect(sig.reasons.some((r) => /regime crisis: the bar 2 closes ago was a crisis day; .*half size.*2 more closes/.test(r))).toBe(true);
+    expect(sig.reasons).toContain('shock: the bar 2 closes ago moved -4.00% (more than 3 sigma); OI -12.0%: crisis');
+  });
+
+  it('counts a shock bar whose open interest change is unknown as a crisis and says so', () => {
+    const candles = shocked(1);
+    // changes are known for other bars, not for the shock bar
+    const ind = computeIndicators(candles, DEFAULT_TREND_PARAMS, [{ ts: candles[candles.length - 1]!.ts, change: '0.01' }]);
+    expect(ind.shockBars).toEqual([{ daysAgo: 1, return: ind.shockBars[0]!.return, oiChange: '', crisis: true }]);
+    expect(ind.crisisDaysAgo).toBe(1);
+    const sig = evaluateTrendSignals(ind, classifyRegime(ind), null);
+    expect(sig.reasons).toContain('shock: the bar 1 close ago moved -4.00% (more than 3 sigma); OI change unavailable, counted as crisis');
+    expect(computeIndicators(candles, DEFAULT_TREND_PARAMS, null).crisisDaysAgo).toBe(1);
+  });
+
+  it('reports every shock bar and takes the most recent crisis one', () => {
+    const candles = shocked(3);
+    // a second shock on the last bar, with rising open interest; the older one was a deleveraging day
+    const last = candles[candles.length - 1]!;
+    const up = Number(last.open) * 1.07;
+    candles[candles.length - 1] = { ...last, close: up.toFixed(1), high: (up * 1.004).toFixed(1) };
+    const ind = computeIndicators(candles, DEFAULT_TREND_PARAMS, [{ ts: last.ts, change: '0.03' }, { ts: candles[candles.length - 4]!.ts, change: '-0.15' }]);
+    expect(ind.shockBars.map((b) => [b.daysAgo, b.crisis])).toEqual([[0, false], [3, true]]);
+    expect(ind.crisisDaysAgo).toBe(3);
+    const reasons = evaluateTrendSignals(ind, classifyRegime(ind), null).reasons;
+    expect(reasons.filter((r) => r.startsWith('shock: '))).toHaveLength(2);
+  });
+});
+
+describe('open interest change per bar', () => {
+  it('needs the level at both ends of a bar and leaves the others out', () => {
+    // real BTC-USDT-SWAP levels around the 2025-10-10 cascade
+    const d = Date.UTC(2025, 9, 9);
+    const snaps = [{ ts: d, value: '28266.2' }, { ts: d + DAY, value: '28199.1' }, { ts: d + 2 * DAY, value: '22513.2' }, { ts: d + 4 * DAY, value: '21000' }, { ts: d + 5 * DAY, value: '' }];
+    const changes = barOiChanges(snaps, [d - DAY, d, d + DAY, d + 2 * DAY, d + 3 * DAY, d + 4 * DAY]);
+    expect(changes).toEqual([{ ts: d, change: '-0.002374' }, { ts: d + DAY, change: '-0.201634' }]);
+    // a level 12 hours off is not the level at the close
+    expect(barOiChanges([{ ts: d, value: '100' }, { ts: d + DAY + 12 * 3_600_000, value: '90' }], [d])).toEqual([]);
+    expect(barOiChanges([{ ts: d, value: '100' }, { ts: d + 12 * 3_600_000, value: '90' }], [d], 12 * 3_600_000)).toEqual([{ ts: d, change: '-0.100000' }]);
+  });
+});
+
+describe('short entries', () => {
+  /** Falling series on a 55-day low below the MA. */
+  const falling = series(130, 50_000, -0.003, 0.002);
+
+  it('are off by default; the short exit is still evaluated', () => {
+    const ind = computeIndicators(falling);
+    expect(Number(ind.close)).toBeLessThan(Number(ind.entryLow));
+    expect(DEFAULT_TREND_PARAMS.allowShort).toBe(false);
+    const off = evaluateTrendSignals(ind, classifyRegime(ind), null);
+    expect(off.shortEntry).toBe(false);
+    expect(off.reasons).toContain('shorts off (allowShort = false): no short entries; the short exit is still evaluated');
+    const on = evaluateTrendSignals(ind, classifyRegime(ind), null, { ...DEFAULT_TREND_PARAMS, allowShort: true });
+    expect(on.shortEntry).toBe(true);
+    expect(on.reasons.some((r) => r.startsWith('shorts off'))).toBe(false);
+    const rising = computeIndicators(series(131, 50_000, 0.003, 0.002));
+    expect(evaluateTrendSignals(rising, 'trend', null).shortExit).toBe(true);
+  });
+
+  it('keep the short plan but not its size lines while off', () => {
+    const report = buildSignalReport('BTC-USDT-SWAP', falling, null, Date.now(), BTC, '100000');
+    expect(report.signals.shortEntry).toBe(false);
+    expect(report.sizing?.short.multiplier).toBe('0.5');
+    expect(report.signals.reasons.some((r) => r.startsWith('short size:'))).toBe(false);
+    const on = buildSignalReport('BTC-USDT-SWAP', falling, null, Date.now(), BTC, '100000', { ...DEFAULT_TREND_PARAMS, allowShort: true });
+    expect(on.signals.shortEntry).toBe(true);
+    expect(on.signals.reasons).toContain('short size: short x0.5');
+  });
+});
+
+describe('second daily cut', () => {
+  const H = 3_600_000;
+  const day = Date.UTC(2026, 9, 3);
+
+  it('phaseDayStart floors to phase:00 UTC', () => {
+    expect(phaseDayStart(day + 5 * H, 0)).toBe(day);
+    expect(phaseDayStart(day, 0)).toBe(day);
+    expect(phaseDayStart(day + 23 * H, 0)).toBe(day);
+    // the 12:00 day runs from noon to noon
+    expect(phaseDayStart(day + 5 * H, 12)).toBe(day - 12 * H);
+    expect(phaseDayStart(day + 12 * H, 12)).toBe(day + 12 * H);
+    expect(phaseDayStart(day + 13 * H, 12)).toBe(day + 12 * H);
+    expect(phaseDayStart(day + 12 * H - 1, 12)).toBe(day - 12 * H);
+  });
+
+  it('dailyBarsFromHalfDays joins the two halves of each phase-day', () => {
+    const half = (ts: number, open: string, high: string, low: string, close: string, confirm = true): Candle => ({ ts, open, high, low, close, vol: '1.5', volCcy: '0.25', confirm });
+    const halves = [
+      half(day + 12 * H, '103', '108', '99', '107'),
+      half(day, '100', '105', '98', '103'),
+      half(day + 24 * H, '107', '109', '104', '105'),
+      half(day + 36 * H, '105', '106', '101', '102', false),
+      // the next day has no second half yet
+      half(day + 48 * H, '102', '103', '100', '101', false),
+    ];
+    expect(dailyBarsFromHalfDays(halves, 0)).toEqual([
+      { ts: day, open: '100', high: '108', low: '98', close: '107', vol: '3', volCcy: '0.5', confirm: true },
+      { ts: day + 24 * H, open: '107', high: '109', low: '101', close: '102', vol: '3', volCcy: '0.5', confirm: false },
+    ]);
+    // the 12:00 cut pairs each afternoon with the next morning
+    expect(dailyBarsFromHalfDays(halves, 12)).toEqual([
+      { ts: day + 12 * H, open: '103', high: '109', low: '99', close: '105', vol: '3', volCcy: '0.5', confirm: true },
+      { ts: day + 36 * H, open: '105', high: '106', low: '100', close: '101', vol: '3', volCcy: '0.5', confirm: false },
+    ]);
+    expect(dailyBarsFromHalfDays([], 12)).toEqual([]);
+  });
+});
+
+describe('sizing across phases', () => {
+  it('shares the risk and the notional cap of a unit equally between the cuts', () => {
+    const unit = { riskPct: '0.0075', maxNotionalPct: '0.10', atrStopMultiple: '2.5' };
+    expect(splitSizingAcrossPhases(unit, 1)).toEqual({ riskPct: '0.0075', maxNotionalPct: '0.1', atrStopMultiple: '2.5' });
+    expect(splitSizingAcrossPhases(unit, 2)).toEqual({ riskPct: '0.00375', maxNotionalPct: '0.05', atrStopMultiple: '2.5' });
+    expect(() => splitSizingAcrossPhases(unit, 0)).toThrow(/phaseCount/);
+    expect(() => splitSizingAcrossPhases(unit, 1.5)).toThrow(/phaseCount/);
+  });
+
+  it('two half lots never risk or hold more than one unit', () => {
+    const half = splitSizingAcrossPhases({ riskPct: '0.0075', maxNotionalPct: '0.10', atrStopMultiple: '2.5' }, 2);
+    // stop distance 2.5 x 1500 / 50000 = 7.5%: one unit is 10% of equity, one phase's lot 5%
+    const lot = planSize('100000', '50000', '1500', BTC, half);
+    expect(lot.rawNotional).toBe('5000.00');
+    expect(lot.capped).toBe(false);
+    // a quiet market (stop distance 5%) hits the cap of the lot: 5% of equity, not 10%
+    const quiet = planSize('100000', '50000', '1000', BTC, half);
+    expect(quiet.capped).toBe(true);
+    expect(quiet.targetNotional).toBe('5000.00');
+  });
 });
 
 describe('next-session exit channel', () => {
@@ -316,19 +489,40 @@ describe('buildSignalReport', () => {
     // one plan per side: the short side is always at half size
     expect(report.sizing?.short.multiplier).toBe('0.5');
     expect(Number(report.sizing?.short.contracts)).toBeLessThanOrEqual(Number(report.sizing?.long.contracts) / 2);
-    expect(report.signals.reasons).toContain('short size: short x0.5');
+    // shorts are off by default: the plan is there, its size lines are not
+    expect(report.signals.reasons.some((r) => r.startsWith('short size:'))).toBe(false);
     expect(report.params).toEqual(DEFAULT_TREND_PARAMS);
     expect(report.signals.longEntry).toBe(true);
     expect(report.dataFetchedAt).toBeNull();
+    // the 00:00 UTC cut unless the caller names another
+    expect(report.phase).toBe(0);
+  });
+
+  it('carries the daily cut its bars close at', () => {
+    const H = 3_600_000;
+    // 262 half-days from a UTC midnight: 130 noon-to-noon days, the first and the last half-day belong to none
+    const halves = series(262, 50_000, 0.0015, 0.001).map((c, i) => ({ ...c, ts: Date.UTC(2026, 0, 1) + i * 12 * H }));
+    const days = dailyBarsFromHalfDays(halves, 12);
+    expect(days).toHaveLength(130);
+    const half = splitSizingAcrossPhases({ riskPct: '0.0075', maxNotionalPct: '0.10', atrStopMultiple: '2.5' }, 2);
+    const noon = buildSignalReport('BTC-USDT-SWAP', days, null, Date.now(), BTC, '100000', DEFAULT_TREND_PARAMS, half, null, null, 12);
+    expect(noon.phase).toBe(12);
+    expect(noon.indicators.asOf).toBe(days[days.length - 1]!.ts);
+    expect(noon.indicators.asOf % DAY).toBe(12 * H);
+    // sized with the parameters of one cut's lot
+    const unit = buildSignalReport('BTC-USDT-SWAP', days, null, Date.now(), BTC, '100000');
+    expect(Number(noon.sizing?.long.rawNotional)).toBeCloseTo(Number(unit.sizing?.long.rawNotional) / 2, 1);
+    expect(noon.sizing?.long.stopLong).toBe(unit.sizing?.long.stopLong);
   });
 
   it('sizes a short entry in a crisis regime at a quarter and the crowded long at three quarters', () => {
-    // falling series with a -12% last bar: 55-day low breakout below the MA, and a crisis day
+    // falling series with a -12% last bar: 55-day low breakout below the MA, and a crisis day (shorts switched on)
+    const shorts = { ...DEFAULT_TREND_PARAMS, allowShort: true };
     const candles = series(131, 50_000, -0.003, 0.002);
     const last = candles[candles.length - 1]!;
     candles[candles.length - 1] = { ...last, close: (Number(last.open) * 0.88).toFixed(1), low: (Number(last.open) * 0.87).toFixed(1) };
     const full = planSize('100000', candles[candles.length - 1]!.close, computeIndicators(candles).atr, BTC);
-    const report = buildSignalReport('BTC-USDT-SWAP', candles, null, Date.now(), BTC, '100000');
+    const report = buildSignalReport('BTC-USDT-SWAP', candles, null, Date.now(), BTC, '100000', shorts);
     expect(report.regime).toBe('crisis');
     expect(report.signals.shortEntry).toBe(true);
     expect(report.sizing?.short.multiplier).toBe('0.25');
@@ -346,6 +540,24 @@ describe('buildSignalReport', () => {
     expect(crowded.sizing?.long.multiplier).toBe('0.75');
     expect(crowded.sizing?.short.multiplier).toBe('0.5');
     expect(buildSignalReport('BTC-USDT-SWAP', rising, hot, now, BTC, '100000', DEFAULT_TREND_PARAMS, undefined, '0.1').sizing?.long.multiplier).toBe('1');
+  });
+
+  it('passes the open interest change per bar through to the crisis rule', () => {
+    // a quiet rising series whose last bar jumps 1.2%: a breakout and a 3-sigma day, the vol ratio still below 2
+    const candles = series(131, 50_000, 0.003, 0.002);
+    const last = candles[candles.length - 1]!;
+    const close = Number(last.open) * 1.012;
+    candles[candles.length - 1] = { ...last, close: close.toFixed(1), high: (close * 1.004).toFixed(1) };
+    const unknown = buildSignalReport('BTC-USDT-SWAP', candles, null, Date.now(), BTC, '100000');
+    expect(unknown.regime).toBe('crisis');
+    expect(unknown.sizing?.long.multiplier).toBe('0.5');
+    const snaps = [{ ts: last.ts, value: '1000' }, { ts: last.ts + DAY, value: '1040' }];
+    const known = buildSignalReport('BTC-USDT-SWAP', candles, null, Date.now(), BTC, '100000', DEFAULT_TREND_PARAMS, undefined, null, barOiChanges(snaps, candles.map((c) => c.ts)));
+    expect(known.signals.longEntry).toBe(true);
+    expect(known.regime).not.toBe('crisis');
+    expect(known.indicators.shockBars).toMatchObject([{ daysAgo: 0, oiChange: '0.040000', crisis: false }]);
+    expect(known.sizing?.long.multiplier).toBe('1');
+    expect(known.signals.reasons.some((r) => r.includes('OI +4.0%: not a deleveraging day'))).toBe(true);
   });
 });
 

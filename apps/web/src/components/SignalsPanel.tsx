@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { DEFAULT_TREND_PARAMS, isSignalReportError, toPlainString, type InstrumentSignalReport, type Side, type TrendParams } from '@pegasus/shared';
+import { ceilToStep, D, DEFAULT_TREND_PARAMS, floorToStep, isSignalReportError, phaseDayStart, toPlainString, type InstrumentSignalReport, type Side, type SignalPhase, type SignalReportRow, type TrendParams } from '@pegasus/shared';
 import { api, type SignalsQuery } from '../lib/api';
 import { errorMessage } from '../lib/http';
 import { fmtAgeCoarse, fmtDateTime, fmtNum, fmtPct, fmtUtcMinute, safeDecimal } from '../lib/format';
 import { useStore } from '../store/store';
-import { SignalRow } from './signals/SignalRow';
+import { SignalRow, cutLabel } from './signals/SignalRow';
 import { RISK_CHOICES, readStoredRiskPct, writeStoredRiskPct, type RiskChoice } from './signals/riskPref';
 
 const REFETCH_MS = 5 * 60_000;
@@ -16,6 +16,11 @@ const CLOCK_MS = 30_000;
 const DAY_MS = 86_400_000;
 /** A daily bar that closed longer ago than this is not the latest one: a newer bar should exist by now. */
 const BAR_STALE_MS = DAY_MS + 10 * 60_000;
+
+/** One table row per instrument and cut. */
+const rowKey = (row: SignalReportRow): string => `${row.instId}:${row.phase}`;
+
+const NO_PHASES: SignalPhase[] = [];
 
 /** Live equity as the API accepts it (plain positive decimal), or undefined to let the server pick. */
 function equityParam(totalEq: string | null): string | undefined {
@@ -62,13 +67,29 @@ export function SignalsPanel() {
     setRiskPct(choice);
   };
 
-  /** Close time of the oldest daily bar among the reports (open time plus one day), or null without reports. */
-  const barClosedAt = useMemo(() => {
+  /**
+   * Close times of the daily bars behind the reports (open time plus one day): the newest one is the bar shown,
+   * the oldest one decides whether some row is overdue. null without reports.
+   */
+  const barClosed = useMemo(() => {
     let oldest: number | null = null;
+    let newest: number | null = null;
     for (const r of q.data?.reports ?? []) {
-      if (!isSignalReportError(r) && (oldest === null || r.indicators.asOf < oldest)) oldest = r.indicators.asOf;
+      if (isSignalReportError(r)) continue;
+      if (oldest === null || r.indicators.asOf < oldest) oldest = r.indicators.asOf;
+      if (newest === null || r.indicators.asOf > newest) newest = r.indicators.asOf;
     }
-    return oldest === null ? null : oldest + DAY_MS;
+    return oldest === null || newest === null ? null : { oldest: oldest + DAY_MS, newest: newest + DAY_MS };
+  }, [q.data]);
+
+  /** The daily cuts the server computes. */
+  const phases = q.data?.phases ?? NO_PHASES;
+
+  /** The cut whose daily bar closed most recently before the report was generated; null when there is only one cut. */
+  const latestPhase = useMemo(() => {
+    if (q.data === undefined || q.data.phases.length < 2) return null;
+    const generatedAt = q.data.generatedAt;
+    return q.data.phases.reduce((a, b) => (phaseDayStart(generatedAt, b) > phaseDayStart(generatedAt, a) ? b : a));
   }, [q.data]);
 
   const params: TrendParams = useMemo(() => {
@@ -76,18 +97,28 @@ export function SignalsPanel() {
     return first !== undefined && !isSignalReportError(first) ? first.params : DEFAULT_TREND_PARAMS;
   }, [q.data]);
 
+  const shortsOff = params.allowShort === false;
+
   const orders = useMemo(() => Object.values(openOrders), [openOrders]);
 
-  const toggle = (instId: string) => setExpanded((e) => ({ ...e, [instId]: !(e[instId] ?? false) }));
+  const toggle = (key: string) => setExpanded((e) => ({ ...e, [key]: !(e[key] ?? false) }));
 
   const apply = (r: InstrumentSignalReport, side: Side) => {
     if (r.sizing === null) return;
-    // each side has its own plan: shorts, crisis entries and crowded entries are sized down
+    // the row's own plan: one cut's lot, and each side has its own (shorts, crisis entries and crowded entries are sized down)
     const plan = side === 'buy' ? r.sizing.long : r.sizing.short;
     const inst = instruments.find((i) => i.instId === r.instId);
     const px = inst === undefined ? r.indicators.close : toPlainString(r.indicators.close, inst.tickSz);
-    applyTicketPrefill({ instId: r.instId, side, ordType: 'limit', px, sizeValue: plan.contracts, sizeUnit: 'contracts' });
-    pushToast('info', `Ticket filled: ${side} ${plan.contracts} contracts ${r.instId} @ ${px}`);
+    // the plan's stop for that side, on the tick towards the entry as the server would round it
+    const rawStop = side === 'buy' ? plan.stopLong : plan.stopShort;
+    const slTriggerPx = inst === undefined ? rawStop : toPlainString(side === 'buy' ? ceilToStep(rawStop, inst.tickSz) : floorToStep(rawStop, inst.tickSz), inst.tickSz);
+    // a stop distance wider than the price leaves no stop to place
+    const withStop = D(slTriggerPx).gt(0);
+    applyTicketPrefill({ instId: r.instId, side, ordType: 'limit', px, sizeValue: plan.contracts, sizeUnit: 'contracts', ...(withStop ? { slTriggerPx } : {}) });
+    const cut = phases.length > 1 ? ` (${cutLabel(r.phase)} cut)` : '';
+    // the trader must not assume the plan's stop came along when it did not
+    const stop = withStop ? '' : '. NO stop was carried into the ticket (the plan has no positive stop price): set the stop yourself';
+    pushToast('info', `Ticket filled: ${side} ${plan.contracts} contracts ${r.instId} @ ${px}${cut}${stop}`);
   };
 
   const toolbar = (
@@ -95,7 +126,11 @@ export function SignalsPanel() {
       <button className="btn btn-sm" onClick={() => void q.refetch()} disabled={q.isFetching}>
         {q.isFetching ? 'Refreshing…' : 'Refresh'}
       </button>
-      <label title="Risk per trade as a fraction of equity. The framework uses 0.5% for the first three months and 0.75% afterwards.">
+      <label
+        title={`Risk per trade as a fraction of equity. The framework uses 0.5% for the first three months and 0.75% afterwards.${
+          phases.length > 1 ? ` It is the risk of one unit, shared equally between the ${phases.length} daily cuts.` : ''
+        }`}
+      >
         risk{' '}
         <select value={riskPct} onChange={(e) => chooseRisk(e.target.value)}>
           {RISK_CHOICES.map((c) => (
@@ -107,12 +142,12 @@ export function SignalsPanel() {
       </label>
       {q.data !== undefined && (
         <>
-          {barClosedAt !== null && (
+          {barClosed !== null && (
             <span
-              className={`signals-bar num${Date.now() - barClosedAt > BAR_STALE_MS ? ' warn' : ''}`}
-              title="The daily candle (UTC day) the signals are computed from. Shown in the warning colour when a newer bar should already exist."
+              className={`signals-bar num${Date.now() - barClosed.oldest > BAR_STALE_MS ? ' warn' : ''}`}
+              title="The most recent daily candle the signals are computed from; every cut has its own (see the rows). Shown in the warning colour when a newer bar should already exist for one of the rows."
             >
-              bar closed {fmtUtcMinute(barClosedAt)}, {fmtAgeCoarse(Date.now() - barClosedAt)} ago
+              bar closed {fmtUtcMinute(barClosed.newest)}, {fmtAgeCoarse(Date.now() - barClosed.newest)} ago
             </span>
           )}
           <span>
@@ -121,13 +156,21 @@ export function SignalsPanel() {
           <span>
             equity <span className="num">{q.data.equity === null ? 'n/a' : fmtNum(q.data.equity, 2)}</span>
           </span>
-          <span>
-            risk {fmtPct(q.data.sizingParams.riskPct, 2)} of equity per trade · notional cap {fmtPct(q.data.sizingParams.maxNotionalPct, 0)}
-          </span>
+          {phases.length > 1 ? (
+            // sizingParams are those of one cut's lot; the unit the owner chose is the lots together
+            <span title={`One cut's lot: risk ${fmtPct(q.data.sizingParams.riskPct, 3)} of equity, notional cap ${fmtPct(q.data.sizingParams.maxNotionalPct, 1)}. The lots of an instrument together are one unit.`}>
+              risk {fmtPct(D(q.data.sizingParams.riskPct).mul(phases.length).toFixed(), 2)} of equity per unit · notional cap{' '}
+              {fmtPct(D(q.data.sizingParams.maxNotionalPct).mul(phases.length).toFixed(), 0)} · each cut sized at 1/{phases.length} of a unit
+            </span>
+          ) : (
+            <span>
+              risk {fmtPct(q.data.sizingParams.riskPct, 2)} of equity per trade · notional cap {fmtPct(q.data.sizingParams.maxNotionalPct, 0)}
+            </span>
+          )}
         </>
       )}
       <span className="dim">
-        UTC daily close · {params.entryChannel}d breakout · MA{params.trendMaPeriod} · {params.atrStopMultiple}×ATR({params.atrPeriod}) stop · auto-refresh 5m
+        {phases.length > 1 ? `daily closes at ${phases.map(cutLabel).join(' and ')}` : phases[0] === undefined || phases[0] === 0 ? 'UTC daily close' : `daily close at ${cutLabel(phases[0])}`} · {params.entryChannel}d breakout · MA{params.trendMaPeriod} · {params.atrStopMultiple}×ATR({params.atrPeriod}) stop{shortsOff ? ' · shorts off' : ''} · auto-refresh 5m
       </span>
       {q.isError && <span className="neg">{errorMessage(q.error)}</span>}
     </div>
@@ -202,7 +245,7 @@ export function SignalsPanel() {
               <span className="sub">stop short</span>
             </th>
             <th>Stop %</th>
-            <th title="Size of a new long; the sub line is the size of a new short (shorts are sized at half)">
+            <th title={shortsOff ? 'Size of a new long. Short entries are switched off (allowShort = false).' : 'Size of a new long; the sub line is the size of a new short (shorts are sized at half)'}>
               Contracts long
               <span className="sub">short</span>
             </th>
@@ -224,14 +267,16 @@ export function SignalsPanel() {
         <tbody>
           {q.data.reports.map((row) => (
             <SignalRow
-              key={row.instId}
+              key={rowKey(row)}
               row={row}
+              latest={latestPhase !== null && row.phase === latestPhase}
+              cuts={phases.length}
               inst={instruments.find((i) => i.instId === row.instId)}
               positions={positions}
               orders={orders}
               outdated={outdated}
-              expanded={expanded[row.instId] ?? false}
-              onToggle={() => toggle(row.instId)}
+              expanded={expanded[rowKey(row)] ?? false}
+              onToggle={() => toggle(rowKey(row))}
               onApply={apply}
             />
           ))}

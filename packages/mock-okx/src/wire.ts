@@ -251,6 +251,41 @@ export interface OkxLeverageInfo {
   lever: string;
 }
 
+export type OkxTriggerPxType = 'last' | 'index' | 'mark';
+
+/** A stop-loss attached to an order, as echoed in the order's `attachAlgoOrds` (take-profit is not simulated). */
+export interface OkxAttachAlgoOrd {
+  attachAlgoId: string;
+  attachAlgoClOrdId: string;
+  tpTriggerPx: string;
+  tpOrdPx: string;
+  tpTriggerPxType: string;
+  slTriggerPx: string;
+  slOrdPx: string;
+  slTriggerPxType: OkxTriggerPxType;
+  sz: string;
+  amendPxOnTriggerType: string;
+  failCode: string;
+  failReason: string;
+}
+
+/** An active stop-loss generated when an order that carried `attachAlgoOrds` was completely filled (mock state, not an OKX wire shape). */
+export interface MockStop {
+  algoId: string;
+  algoClOrdId: string;
+  /** The order it was attached to */
+  ordId: string;
+  instId: string;
+  tdMode: OkxMgnMode;
+  posSide: OkxPosSide;
+  /** Side of the closing order it sends when triggered */
+  side: OkxSide;
+  /** Contracts it closes: the filled size of the parent order */
+  sz: string;
+  slTriggerPx: string;
+  slTriggerPxType: OkxTriggerPxType;
+}
+
 export interface OkxOrder {
   instType: OkxInstType;
   instId: string;
@@ -290,7 +325,7 @@ export interface OkxOrder {
   stpMode: string;
   algoClOrdId: string;
   algoId: string;
-  attachAlgoOrds: unknown[];
+  attachAlgoOrds: OkxAttachAlgoOrd[];
   cTime: string;
   uTime: string;
   execType: OkxExecType;
@@ -352,6 +387,7 @@ export interface OkxPlaceOrderParams {
   clOrdId?: string;
   tag?: string;
   reduceOnly?: boolean | string;
+  attachAlgoOrds?: Array<Partial<OkxAttachAlgoOrd>>;
 }
 
 export interface OkxWsArg {

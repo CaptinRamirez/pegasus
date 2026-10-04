@@ -32,6 +32,8 @@ export class MarketSim {
   private mid: Dec;
   private last: Dec;
   private lastSz: Dec = ZERO;
+  /** Mark price held apart from the mid (tests move mark and last independently); null when it follows the mid. */
+  private pinnedMark: Dec | null = null;
   /** Shared across instruments: real exchange trade ids are globally unique. */
   private static tradeSeq = 0;
   private readonly tick: Dec;
@@ -69,7 +71,16 @@ export class MarketSim {
   }
 
   get markPx(): Dec {
-    return roundToStep(this.mid, this.tick);
+    return roundToStep(this.pinnedMark ?? this.mid, this.tick);
+  }
+
+  /** Price of the latest print. */
+  get lastPx(): Dec {
+    return this.last;
+  }
+
+  pinMark(px: Dec | null): void {
+    this.pinnedMark = px;
   }
 
   /** Advances the price process by one tick, or jumps to `forcedMid`. */

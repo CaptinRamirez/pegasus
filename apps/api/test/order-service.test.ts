@@ -137,6 +137,10 @@ describe('OrderService order path against a stubbed exchange', () => {
       leverageFails: false,
       leverageCalls: 0,
       bookSynced: true,
+      /** The mark price the market service reports */
+      mark: '50000',
+      /** false: the mark stream is stale, refPrice falls back to the last price */
+      markLive: true,
       placed: [] as OkxPlaceOrderParams[],
       /** What the exchange does with an order after recording it; the default acknowledges it. */
       answer: (params: OkxPlaceOrderParams, n: number): OkxOrderAck | Promise<OkxOrderAck> => ({ ordId: `o${n}`, clOrdId: params.clOrdId ?? '', tag: '', sCode: '0', sMsg: '' }),
@@ -176,7 +180,8 @@ describe('OrderService order path against a stubbed exchange', () => {
       },
       specOf: (instId: string) => (instId === BTC.instId ? BTC : undefined),
       bestPrice: () => (exchange.bookSynced ? '50000' : undefined),
-      refPrice: () => '50000',
+      refPrice: () => exchange.mark,
+      liveMarkPrice: () => (exchange.markLive ? exchange.mark : undefined),
       estimateMarketFill: () => (exchange.bookSynced ? { avgPx: '50000', slippagePct: '0', complete: true } : null),
     } as unknown as MarketDataService;
     const risk = new RiskEngine(riskConfig, store, log);
@@ -533,6 +538,160 @@ describe('OrderService order path against a stubbed exchange', () => {
       expect((await h.orders.preview(order({ size: { unit: 'contracts', value: '8' } }))).risk.ok).toBe(true);
       await h.account.stop();
     }
+  });
+
+  describe('attached stop-loss', () => {
+    /** 2 contracts * 0.01 BTC = 0.02 BTC, 1,000 USD at 50,000 */
+    const small = (overrides: Partial<PlaceOrderRequest> = {}): PlaceOrderRequest => order({ ordType: 'limit', px: '50000', size: { unit: 'contracts', value: '2' }, ...overrides });
+
+    it('is refused on a closing order, in long/short mode and in net mode', async () => {
+      const h = await harness();
+      const closing = small({ side: 'sell', posSide: 'long', slTriggerPx: '51000' });
+      expect(await settle(h.orders.preview(closing))).toMatchObject({ code: 'VALIDATION', status: 400 });
+      expect(await settle(h.orders.place(closing))).toMatchObject({ code: 'VALIDATION', status: 400 });
+      expect(h.exchange.placed).toEqual([]);
+      await h.account.stop();
+
+      const net = await harness({ posMode: 'net_mode' });
+      const reduce: PlaceOrderRequest = { instId: BTC.instId, side: 'sell', ordType: 'limit', px: '50000', size: { unit: 'contracts', value: '2' }, reduceOnly: true, slTriggerPx: '51000' };
+      expect(await settle(net.orders.place(reduce))).toMatchObject({ code: 'VALIDATION', status: 400 });
+      expect(net.exchange.placed).toEqual([]);
+      // the same order opening a short carries it
+      await net.orders.place({ ...reduce, reduceOnly: false });
+      expect(net.exchange.placed).toMatchObject([{ side: 'sell', attachAlgoOrds: [{ slTriggerPx: '51000' }] }]);
+      await net.account.stop();
+    });
+
+    it('is refused on the wrong side of the order price or of the mark price, with both prices in the details', async () => {
+      const h = await harness();
+      // a buy: at or above the limit price
+      for (const slTriggerPx of ['50000', '50500']) {
+        expect(await settle(h.orders.place(small({ slTriggerPx })))).toMatchObject({ code: 'VALIDATION', status: 400, details: { slTriggerPx, refPrice: '50000', markPx: '50000' } });
+      }
+      // below the limit price but not below the mark: a mark-triggered stop would fire at once
+      h.exchange.mark = '49000';
+      expect(await settle(h.orders.place(small({ slTriggerPx: '49500' })))).toMatchObject({ code: 'VALIDATION', status: 400, details: { slTriggerPx: '49500', refPrice: '50000', markPx: '49000' } });
+      expect(await settle(h.orders.place(small({ slTriggerPx: '49000' })))).toMatchObject({ code: 'VALIDATION' });
+      expect((await h.orders.preview(small({ slTriggerPx: '48999.9' }))).slTriggerPx).toBe('48999.9');
+
+      // a sell that opens a short: the mirror image
+      h.exchange.mark = '50000';
+      const short = (slTriggerPx: string): PlaceOrderRequest => small({ side: 'sell', posSide: 'short', slTriggerPx });
+      expect(await settle(h.orders.place(short('49000')))).toMatchObject({ code: 'VALIDATION', details: { refPrice: '50000', markPx: '50000' } });
+      h.exchange.mark = '51000';
+      expect(await settle(h.orders.place(short('50500')))).toMatchObject({ code: 'VALIDATION', details: { slTriggerPx: '50500', refPrice: '50000', markPx: '51000' } });
+      expect((await h.orders.preview(short('51000.1'))).slTriggerPx).toBe('51000.1');
+
+      // a market order is measured against its estimated fill
+      h.exchange.mark = '50000';
+      expect(await settle(h.orders.place(order({ size: { unit: 'contracts', value: '2' }, slTriggerPx: '50000' })))).toMatchObject({ code: 'VALIDATION', details: { refPrice: '50000', markPx: '50000' } });
+      expect(h.exchange.placed).toEqual([]);
+      // a refused stop holds no reservation: the full size still passes
+      expect((await h.orders.preview(order())).risk.ok).toBe(true);
+      await h.account.stop();
+    });
+
+    it('is refused without a live mark price, whatever the last price says; the order without the stop still goes', async () => {
+      const h = await harness();
+      // the mark stream is stale: the reference price is the last trade, which says nothing about where the mark is
+      h.exchange.markLive = false;
+      expect(await settle(h.orders.preview(small({ slTriggerPx: '49000' })))).toMatchObject({ code: 'NO_PRICE', status: 503 });
+      expect(await settle(h.orders.place(small({ slTriggerPx: '49000' })))).toMatchObject({ code: 'NO_PRICE', status: 503 });
+      expect(h.exchange.placed).toEqual([]);
+      await h.orders.place(small());
+      expect(h.exchange.placed).toHaveLength(1);
+      expect(h.exchange.placed[0]).not.toHaveProperty('attachAlgoOrds');
+      await h.account.stop();
+    });
+
+    it('net mode: is refused on an order that reduces the open net position even without reduce-only', async () => {
+      const net = await harness({ posMode: 'net_mode' });
+      net.ws.emit('data', positionPush('-10', NOW, 'net'));
+      const buy: PlaceOrderRequest = { instId: BTC.instId, side: 'buy', ordType: 'limit', px: '50000', size: { unit: 'contracts', value: '2' }, slTriggerPx: '49000' };
+      expect(await settle(net.orders.preview(buy))).toMatchObject({ code: 'VALIDATION', status: 400 });
+      expect(await settle(net.orders.place(buy))).toMatchObject({ code: 'VALIDATION', status: 400 });
+      expect(net.exchange.placed).toEqual([]);
+      // adding to the short is an opening order and carries its stop
+      await net.orders.place({ ...buy, side: 'sell', slTriggerPx: '51000' });
+      expect(net.exchange.placed).toMatchObject([{ side: 'sell', attachAlgoOrds: [{ slTriggerPx: '51000' }] }]);
+      await net.account.stop();
+    });
+
+    it('rounds the trigger to the tick towards the entry and previews the loss at the stop', async () => {
+      const h = await harness();
+      const long = await h.orders.preview(small({ slTriggerPx: '48000.03' }));
+      // 0.02 BTC * (50,000 - 48,000.1)
+      expect(long).toMatchObject({ slTriggerPx: '48000.1', stopLossQuote: '39.998', risk: { ok: true } });
+      const short = await h.orders.preview(small({ side: 'sell', posSide: 'short', slTriggerPx: '52000.07' }));
+      expect(short).toMatchObject({ slTriggerPx: '52000', stopLossQuote: '40' });
+      // rounding must not carry the trigger onto the entry
+      expect(await settle(h.orders.preview(small({ slTriggerPx: '49999.95' })))).toMatchObject({ code: 'VALIDATION', details: { slTriggerPx: '50000' } });
+      // no stop: both fields are empty
+      expect(await h.orders.preview(small())).toMatchObject({ slTriggerPx: '', stopLossQuote: '' });
+      await h.account.stop();
+    });
+
+    it('REST: sends a mark-triggered market stop with its own client id, and only when one was asked for', async () => {
+      const h = await harness();
+      const placed = await h.orders.place(small({ slTriggerPx: '48000.03', clOrdId: 'abc1' }));
+      expect(h.exchange.placed[0]).toMatchObject({ clOrdId: 'abc1', side: 'buy', posSide: 'long', px: '50000', sz: '2' });
+      expect(h.exchange.placed[0]?.attachAlgoOrds).toEqual([{ attachAlgoClOrdId: 'slabc1', slTriggerPx: '48000.1', slOrdPx: '-1', slTriggerPxType: 'mark' }]);
+      expect(placed.order).toMatchObject({ state: 'live', slTriggerPx: '48000.1' });
+      expect(placed.preview).toMatchObject({ slTriggerPx: '48000.1', stopLossQuote: '39.998' });
+
+      const plain = await h.orders.place(small());
+      expect(h.exchange.placed[1]).not.toHaveProperty('attachAlgoOrds');
+      expect(plain.order).not.toHaveProperty('slTriggerPx');
+
+      // the longest client order id still gives an id inside OKX's 32 alphanumeric characters
+      const longId = 'pgw' + 'a1'.repeat(14) + 'z';
+      expect(longId).toHaveLength(32);
+      await h.orders.place(small({ slTriggerPx: '48000', clOrdId: longId }));
+      expect(h.exchange.placed[2]?.attachAlgoOrds?.[0]?.attachAlgoClOrdId).toBe(`sl${longId.slice(2)}`);
+      expect(h.exchange.placed[2]?.attachAlgoOrds?.[0]?.attachAlgoClOrdId).toMatch(/^[A-Za-z0-9]{32}$/);
+      await h.account.stop();
+    });
+
+    it('never relaxes a limit: an order over the notional limit is rejected with or without a stop', async () => {
+      const h = await harness();
+      const big = order({ ordType: 'limit', px: '50000', size: { unit: 'contracts', value: '60' } });
+      const without = await h.orders.preview(big);
+      const withStop = await h.orders.preview({ ...big, slTriggerPx: '49999' });
+      expect(without.risk).toMatchObject({ ok: false, code: 'MAX_ORDER_NOTIONAL' });
+      expect(withStop.risk).toEqual(without.risk);
+      expect(await settle(h.orders.place({ ...big, slTriggerPx: '49999' }))).toMatchObject({ code: 'RISK_REJECTED' });
+      expect(h.exchange.placed).toEqual([]);
+      await h.account.stop();
+    });
+
+    it('WebSocket: the same params go out on the order op', async () => {
+      const h = await harness({ wsTrading: true });
+      h.ws.request.mockImplementation(async (_op: string, args: OkxPlaceOrderParams[]) => ({ id: '1', op: 'order', code: '0', msg: '', data: [{ ordId: 'w1', clOrdId: args[0]?.clOrdId ?? '', tag: '', sCode: '0', sMsg: '' }] }));
+      const placed = await h.orders.place(small({ side: 'sell', posSide: 'short', slTriggerPx: '52000.07', clOrdId: 'ws1' }));
+      expect(placed.order).toMatchObject({ ordId: 'w1', slTriggerPx: '52000' });
+      expect(h.ws.request).toHaveBeenCalledTimes(1);
+      const [op, args] = h.ws.request.mock.calls[0] as [string, OkxPlaceOrderParams[]];
+      expect(op).toBe('order');
+      expect(args).toHaveLength(1);
+      expect(args[0]).toMatchObject({ instId: BTC.instId, side: 'sell', posSide: 'short', clOrdId: 'ws1', px: '50000', sz: '2' });
+      expect(args[0]?.attachAlgoOrds).toEqual([{ attachAlgoClOrdId: 'slws1', slTriggerPx: '52000', slOrdPx: '-1', slTriggerPxType: 'mark' }]);
+      expect(h.exchange.placed).toEqual([]);
+      await h.account.stop();
+    });
+
+    it('a retry that finds the earlier attempt at the exchange sends no second order and no second stop', async () => {
+      const h = await harness();
+      const req = small({ slTriggerPx: '48000', clOrdId: 'rs1' });
+      await h.orders.place(req);
+      expect(h.exchange.placed).toHaveLength(1);
+      // the first attempt filled, which freed its id at OKX; its stop is active
+      h.exchange.lookup = (clOrdId) => ({ ...rawOrder(clOrdId, { ordId: 'o1', ordType: 'limit', px: '50000', sz: '2', state: 'filled', accFillSz: '2', avgPx: '50000' }), attachAlgoOrds: [{ attachAlgoClOrdId: 'slrs1', slTriggerPx: '48000', slOrdPx: '-1', slTriggerPxType: 'mark' }] });
+      const retried = await h.orders.place({ ...req, retry: true });
+      expect(retried.order).toMatchObject({ ordId: 'o1', state: 'filled', slTriggerPx: '48000' });
+      expect(retried.preview).toMatchObject({ slTriggerPx: '48000', stopLossQuote: '', risk: { ok: true } });
+      expect(h.exchange.placed).toHaveLength(1);
+      await h.account.stop();
+    });
   });
 
   it('a push for the other leg does not release a reservation', async () => {

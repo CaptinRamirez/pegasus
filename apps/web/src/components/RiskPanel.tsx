@@ -1,6 +1,7 @@
 import { D, type CancelSweepState, type DecimalInput } from '@pegasus/shared';
 import { Panel } from './Panel';
 import { fmtNum, fmtPct, fmtSigned, fmtUtcMinute, safeDecimal, signOf } from '../lib/format';
+import { overLimitNotice } from '../store/alerts';
 import { useStore } from '../store/store';
 
 /** Ratio used/limit as a 0..100 number (chart coordinate only). */
@@ -52,6 +53,7 @@ export function RiskPanel() {
   const notionalPct = usagePct(state?.totalPositionNotional, config.maxTotalPositionNotional);
   const openOrders = state?.openOrders ?? openOrdersLocal;
   const ordersPct = config.maxOpenOrders > 0 ? Math.min(100, (openOrders / config.maxOpenOrders) * 100) : 0;
+  const overLimit = overLimitNotice(state);
 
   return (
     <Panel title="Risk" pad>
@@ -65,6 +67,11 @@ export function RiskPanel() {
         <div className={`notice ${SWEEP_TONE[state.cancelSweep.state]}`} style={{ marginBottom: 8 }}>
           Cancel all open orders: {state.cancelSweep.message}
           {state.cancelSweep.state === 'failed' || state.cancelSweep.state === 'skipped' ? '. Open orders are NOT cancelled; cancel them on OKX.' : ''}
+        </div>
+      )}
+      {overLimit !== null && (
+        <div className="notice notice-warn" style={{ marginBottom: 8 }}>
+          {overLimit}
         </div>
       )}
       <div className="kv-list">

@@ -109,6 +109,7 @@ pnpm db:migrate
 | `OKX_DEMO` | `1` 模拟盘，`0` 实盘 |
 | `INSTRUMENTS` | 启动时跟踪的合约，逗号分隔，例如 `BTC-USDT-SWAP,ETH-USDT-SWAP` |
 | `DEFAULT_TD_MODE` | 默认保证金模式 `cross` / `isolated` |
+| `SIGNAL_PHASES` | SIGNALS 面板计算的日线切点（UTC 小时），`0`、`12` 或 `0,12`（默认）。每个切点按 1/n 个单位算仓位：两个切点时同一标的分两笔各半仓 |
 | `OKX_WS_TRADING` | 保持 `0`（用 REST 下单撤单）。设为 `1` 会被拒绝启动：OKX 已弃用 WebSocket 下单接口的 `instId` 参数，Pegasus 尚未迁移到 `instIdCode` |
 | `OKX_REST_URL` 等四个地址变量 | 只在连 mock 时需要，四个必须一起设或都不设；一般用 `--mock` 即可，不必手动设 |
 | `API_TOKEN` | 前端访问后端的共享密钥 |
@@ -132,6 +133,7 @@ pnpm db:migrate
 pnpm typecheck   # 所有包类型检查
 pnpm test        # 所有包单元测试 / 端到端测试（端到端用 mock 交易所）
 pnpm build       # 前端构建
+pnpm backtest    # 用实盘同一份信号代码回测 BTC、ETH（约两分钟；--help 看全部参数）
 ```
 
 ## 接口

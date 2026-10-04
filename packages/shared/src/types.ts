@@ -146,6 +146,13 @@ export interface Order {
   fee: string;
   feeCcy: string;
   pnl: string;
+  /**
+   * Trigger price of the stop-loss attached to the order (mark-triggered, market execution); absent when none. Not persisted.
+   * The exchange generates the stop only once the order is completely filled (see stopAwaitsFullFill, stopUnconfirmedAfterCancel).
+   */
+  slTriggerPx?: string;
+  /** Why the exchange did not create the stop-loss attached to the order ('<failCode>: <failReason>'): the position has no stop. Absent when the stop exists or none was attached. Not persisted. */
+  slFailReason?: string;
   cTime: number;
   uTime: number;
 }
@@ -258,7 +265,25 @@ export interface RiskState {
   dailyPnl: string;
   openOrders: number;
   totalPositionNotional: string;
+  /**
+   * Instruments whose open position has outgrown maxPositionNotionalPerInstrument (a position grows with price;
+   * the limit is otherwise only checked when an order is placed). Advisory: nothing is blocked or traded because of it.
+   */
+  overLimit: PositionOverLimit[];
+  /** Excess of totalPositionNotional over maxTotalPositionNotional; '' while within the limit */
+  totalOverLimit: string;
   updatedAt: number;
+}
+
+/** An instrument whose position notional exceeds the per-instrument limit. Positions only, resting orders are not counted. */
+export interface PositionOverLimit {
+  instId: string;
+  /** USD notional of the instrument's position; in long/short mode the gross of both legs */
+  notional: string;
+  /** maxPositionNotionalPerInstrument */
+  limit: string;
+  /** notional - limit: how much to trim to be back at the limit */
+  excess: string;
 }
 
 export type ConnState = 'connected' | 'connecting' | 'disconnected';
@@ -328,6 +353,10 @@ export interface OrderPreview {
   estSlippagePct: string;
   /** Leverage currently configured for the instrument/mode */
   lever: string;
+  /** Normalised trigger price of the attached stop-loss; '' when the order carries none */
+  slTriggerPx: string;
+  /** Quote-currency loss if the stop fills at its trigger with `sz`, measured from refPrice; '' when there is no stop */
+  stopLossQuote: string;
   /** ok=false means the order would be rejected */
   risk: RiskCheckResult;
 }

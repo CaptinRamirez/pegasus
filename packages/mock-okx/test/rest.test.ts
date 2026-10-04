@@ -121,11 +121,39 @@ describe('public REST', () => {
       expect(Number(row[2])).toBeCloseTo(Number(row[1]) * 0.01, 6);
       expect(Number(row[3])).toBeGreaterThan(Number(row[2]));
     }
+    // completed rows never change; the newest row is the forming period and follows the clock
     const again = await rest<string[]>(h, 'GET', path);
-    expect(again.data.map((row) => row.slice(0, 3))).toEqual(r.data.map((row) => row.slice(0, 3)));
+    expect(again.data.slice(1).map((row) => row.slice(0, 3))).toEqual(r.data.slice(1).map((row) => row.slice(0, 3)));
+    // the changes of completed days are non-zero: yesterday against the day before and against ten days before
+    const coin = (i: number): number => Number(r.data[i]?.[2]);
+    expect(coin(1)).not.toBe(coin(2));
+    expect(coin(1)).not.toBe(coin(11));
+    expect(Math.abs(coin(1) / coin(2) - 1)).toBeLessThan(0.02);
     expect((await rest<string[]>(h, 'GET', `${path}&limit=12`)).data).toHaveLength(12);
     expect((await rest(h, 'GET', '/api/v5/rubik/stat/contracts/open-interest-history?instId=NOPE-USDT-SWAP&period=1Dutc')).code).toBe('51001');
     expect((await rest(h, 'GET', '/api/v5/rubik/stat/contracts/open-interest-history?instId=BTC-USDT-SWAP&period=7m')).code).toBe('51000');
+  });
+
+  it('fills open interest history rows by the END convention, consistently across periods', async () => {
+    const HOUR = 3_600_000;
+    const base = '/api/v5/rubik/stat/contracts/open-interest-history?instId=ETH-USDT-SWAP';
+    const daily = (await rest<string[]>(h, 'GET', `${base}&period=1Dutc`)).data;
+    const half = (await rest<string[]>(h, 'GET', `${base}&period=12Hutc`)).data;
+    const halfByTs = new Map(half.map((row) => [Number(row[0]), row]));
+    for (const row of half) expect(Number(row[0]) % (12 * HOUR)).toBe(0);
+    // a completed day holds the level at its end, which is where its second half-day row ends too
+    let compared = 0;
+    for (const row of daily.slice(1)) {
+      const second = halfByTs.get(Number(row[0]) + 12 * HOUR);
+      const first = halfByTs.get(Number(row[0]));
+      if (!second || !first) continue;
+      expect(row.slice(1, 3)).toEqual(second.slice(1, 3));
+      expect(row[2]).not.toBe(first[2]);
+      compared++;
+    }
+    expect(compared).toBeGreaterThanOrEqual(45);
+    // the forming rows of both periods hold the current level
+    expect(Number(daily[0]?.[2])).toBeCloseTo(Number(half[0]?.[2]), 0);
   });
 
   it('advances the market on tick() and setPrice()', async () => {

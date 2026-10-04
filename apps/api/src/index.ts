@@ -55,13 +55,13 @@ async function main(): Promise<void> {
   const risk = new RiskEngine(config.risk, store, log);
   await risk.init();
   const orders = new OrderService(clients, market, account, risk, store, log, { defaultTdMode: config.defaultTdMode, wsTrading: config.okx.wsTrading });
-  const signals = new SignalsService(clients, market, account, log);
+  const signals = new SignalsService(clients, market, account, log, undefined, config.signalPhases);
   const hub = new Hub(config, market, account, risk, log);
   const deps: Deps = { config, log, clients, store, market, account, risk, orders, signals, hub };
 
   // Risk wiring: equity feeds the daily PnL / loss limit; exposure feeds the state shown in the UI.
   account.on('balance', (b) => risk.updateEquity(b.totalEq));
-  const refreshExposure = () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional());
+  const refreshExposure = () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional(), account.positionList(), (id) => market.specOf(id));
   account.on('positions', refreshExposure);
   account.on('order', refreshExposure);
   // Kill switch: the open orders are cancelled when it goes on, and after a restart with the switch restored unless that sweep had already completed.

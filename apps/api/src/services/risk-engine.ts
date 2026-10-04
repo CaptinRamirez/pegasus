@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { D, Decimal, ZERO, notionalQuote, utcDayStart, type CancelSweepState, type Instrument, type Order, type OrdType, type PosSide, type Position, type RiskCheckResult, type RiskConfig, type RiskState, type Side } from '@pegasus/shared';
+import { D, Decimal, ZERO, notionalQuote, utcDayStart, type CancelSweepState, type Instrument, type Order, type OrdType, type PosSide, type Position, type PositionOverLimit, type RiskCheckResult, type RiskConfig, type RiskState, type Side } from '@pegasus/shared';
 import type { Store } from '../db/store.js';
 import { AppError } from '../errors.js';
 import type { Logger } from '../logger.js';
@@ -107,6 +107,8 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
       dailyPnl: '0',
       openOrders: 0,
       totalPositionNotional: '0',
+      overLimit: [],
+      totalOverLimit: '',
       updatedAt: t,
     };
   }
@@ -186,9 +188,17 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
     this.emit('state', this.state);
   }
 
-  updateExposure(openOrders: number, totalPositionNotional: string): void {
+  /**
+   * Feed the open-order count and the positions. Also derives which positions have outgrown the notional limits:
+   * the limits are checked when an order is placed, but a position grows with price afterwards. That is shown,
+   * never acted on: nothing is traded or blocked because of it, and it is not persisted.
+   */
+  updateExposure(openOrders: number, totalPositionNotional: string, positions: Position[], instrumentOf: (instId: string) => Instrument | undefined): void {
     this.state.openOrders = openOrders;
     this.state.totalPositionNotional = totalPositionNotional;
+    this.state.overLimit = positionsOverLimit(positions, this.config.maxPositionNotionalPerInstrument, instrumentOf);
+    const totalExcess = D(totalPositionNotional).minus(this.config.maxTotalPositionNotional);
+    this.state.totalOverLimit = totalExcess.gt(0) ? totalExcess.toFixed() : '';
     this.state.updatedAt = this.now();
     this.emit('state', this.state);
   }
@@ -323,6 +333,28 @@ export function positionSignedNotional(p: Position, inst?: Instrument): ReturnTy
   }
   const isShort = p.posSide === 'short' || (p.posSide === 'net' && pos.lt(0));
   return isShort ? abs.neg() : abs;
+}
+
+/**
+ * Instruments whose position notional exceeds the per-instrument limit, in the order the positions list them.
+ * Positions only (no resting orders), with the accounting of the pre-trade rule: a net position counts at its
+ * absolute notional, the long and short legs of long/short mode count gross.
+ */
+export function positionsOverLimit(positions: Position[], limit: string, instrumentOf: (instId: string) => Instrument | undefined): PositionOverLimit[] {
+  const byInst = new Map<string, { net: Decimal; legs: Decimal }>();
+  for (const p of positions) {
+    const n = positionSignedNotional(p, instrumentOf(p.instId));
+    const acc = byInst.get(p.instId) ?? { net: ZERO, legs: ZERO };
+    if (p.posSide === 'net') acc.net = acc.net.plus(n);
+    else acc.legs = acc.legs.plus(n.abs());
+    byInst.set(p.instId, acc);
+  }
+  const over: PositionOverLimit[] = [];
+  for (const [instId, acc] of byInst) {
+    const notional = acc.net.abs().plus(acc.legs);
+    if (notional.gt(limit)) over.push({ instId, notional: notional.toFixed(), limit, excess: notional.minus(limit).toFixed() });
+  }
+  return over;
 }
 
 /**

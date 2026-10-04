@@ -13,3 +13,6 @@ pgdata/
 # written by the API: the saved kill switch / day baseline (STATE_FILE) and the daily log files (LOG_DIR)
 /data/
 /logs/
+# written by the backtester: downloaded history and run output
+/packages/backtest/.cache/
+/packages/backtest/out/

@@ -1,5 +1,6 @@
 import { D, Decimal, ZERO, floorToStep, type DecimalInput } from './decimal.js';
 import { contractsToCoin, notionalQuote } from './sizing.js';
+import { utcDayStart } from './time.js';
 import type { Candle, Instrument } from './types.js';
 
 /**
@@ -7,7 +8,8 @@ import type { Candle, Instrument } from './types.js';
  *
  * Everything here is a pure function of CONFIRMED daily candles sorted oldest
  * first. The forming bar must be excluded by the caller: every rule in the
- * framework is evaluated once, after the UTC close.
+ * framework is evaluated once per bar, after its close (00:00 UTC, or the
+ * second daily cut at 12:00 UTC; see the 'second daily cut' section).
  *
  * Conventions: "previous N bars" means the N bars before the last one, so a
  * breakout compares today's close with the channel built from yesterday back.
@@ -32,8 +34,13 @@ export interface TrendParams {
   volLongPeriod: number;
   /** vol20 / vol100 above which the market counts as a crisis */
   crisisVolRatio: string;
-  /** |daily return| above this many daily sigmas (of the bars before it) is a crisis day */
+  /** |daily return| above this many daily sigmas (of the bars before it) is a shock bar */
   crisisReturnSigmas: string;
+  /**
+   * A shock bar is a crisis day when open interest fell by more than this fraction over the bar
+   * (a forced deleveraging), or when its open interest change is unknown.
+   */
+  crisisOiDrop: string;
   /**
    * Closes for which a crisis day keeps the regime at crisis, the crisis bar included.
    * The framework says 5 to 10 trading days and leaves the number to a backtest; 5 is the low end.
@@ -54,6 +61,11 @@ export interface TrendParams {
   crowdedFunding: string;
   /** 10-day open interest increase above which, together with crowdedFunding, the paying side is crowded (fraction) */
   crowdedOiChange: string;
+  /**
+   * Allow short entries. Off by default: short breakouts showed no expectancy in the backtest
+   * (docs/strategy.md 3.1). Short exits and the short sizing plan are computed either way.
+   */
+  allowShort: boolean;
   /** Size multiplier for every short entry (the cost of the positive drift) */
   shortSizeMultiplier: string;
   /** Size multiplier for new entries on either side in the crisis regime */
@@ -82,12 +94,14 @@ export const DEFAULT_TREND_PARAMS: TrendParams = {
   volLongPeriod: 100,
   crisisVolRatio: '2',
   crisisReturnSigmas: '3',
+  crisisOiDrop: '0.1',
   crisisHoldBars: 5,
   maxFundingForLong: '0.001',
   minFundingForShort: '-0.0005',
   fundingWindowHours: 72,
   crowdedFunding: '0.0008',
   crowdedOiChange: '0.2',
+  allowShort: false,
   shortSizeMultiplier: '0.5',
   crisisSizeMultiplier: '0.5',
   crowdedSizeMultiplier: '0.75',
@@ -271,7 +285,45 @@ export function summarizeFunding(records: readonly FundingRecord[], now: number,
   return { avg8h: avg.toFixed(), latest8h: (latest ?? ZERO).toFixed(), samples: normalised.length, annualized: avg.mul(3 * 365).toFixed() };
 }
 
+// ---- open interest per bar ----
+
+/** Fractional open interest change over the bar that OPENS at `ts`: the level at ts + bar length over the level at ts, minus 1. */
+export interface BarOiChange {
+  ts: number;
+  change: string;
+}
+
+/**
+ * Open interest change of each bar from levels at known instants. A bar gets an entry only when the
+ * levels at BOTH its open and its close exist exactly; a bar without one is left out (unknown).
+ */
+export function barOiChanges(snapshots: ReadonlyArray<{ ts: number; value: string }>, barOpenTimes: readonly number[], barMs = 86_400_000): BarOiChange[] {
+  const levels = new Map<number, string>();
+  for (const s of snapshots) {
+    if (s.value !== '' && D(s.value).gt(0)) levels.set(s.ts, s.value);
+  }
+  const out: BarOiChange[] = [];
+  for (const ts of barOpenTimes) {
+    const open = levels.get(ts);
+    const close = levels.get(ts + barMs);
+    if (open !== undefined && close !== undefined) out.push({ ts, change: D(close).div(open).minus(1).toFixed(6) });
+  }
+  return out;
+}
+
 // ---- regime and signals ----
+
+/** A bar inside the crisis hold window whose return exceeded crisisReturnSigmas. */
+export interface ShockBar {
+  /** Closes since the bar (0 = the last bar) */
+  daysAgo: number;
+  /** Log return of the bar */
+  return: string;
+  /** Fractional open interest change over the bar, '' when unknown */
+  oiChange: string;
+  /** Open interest fell by more than crisisOiDrop, or its change is unknown */
+  crisis: boolean;
+}
 
 export interface IndicatorSnapshot {
   /** Open time of the last confirmed bar */
@@ -295,13 +347,20 @@ export interface IndicatorSnapshot {
   dailyReturn: string;
   /** Standard deviation of the volShortPeriod daily log returns BEFORE the last bar (the last return is not in its own yardstick) */
   dailySigma: string;
-  /** Closes since the most recent crisis day inside the hold window (0 = the last bar); null when there is none */
+  /** Shock bars inside the hold window, most recent first; only those with `crisis` set cut the size */
+  shockBars: ShockBar[];
+  /** Closes since the most recent crisis bar inside the hold window (0 = the last bar); null when there is none */
   crisisDaysAgo: number | null;
   /** Distance of close from the MA in ATRs, signed */
   maDistanceAtr: string;
 }
 
-export function computeIndicators(candles: readonly Candle[], p: TrendParams = DEFAULT_TREND_PARAMS): IndicatorSnapshot {
+export function computeIndicators(
+  candles: readonly Candle[],
+  p: TrendParams = DEFAULT_TREND_PARAMS,
+  /** Open interest change per bar (see barOiChanges); a bar without an entry counts as unknown */
+  oiChanges: readonly BarOiChange[] | null = null,
+): IndicatorSnapshot {
   const need = minBarsRequired(p);
   if (candles.length < need) throw new SignalError('NOT_ENOUGH_DATA', `need at least ${need} confirmed daily bars, got ${candles.length}`);
   for (let i = 1; i < candles.length; i++) {
@@ -321,13 +380,20 @@ export function computeIndicators(candles: readonly Candle[], p: TrendParams = D
   const volLong = realizedVol(closes, p.volLongPeriod);
   const sigma = dailyVol(closes.slice(0, -1), p.volShortPeriod);
   const dailyReturn = close.div(prev.close).ln();
-  let crisisDaysAgo: number | null = null;
-  for (let ago = 0; ago < p.crisisHoldBars && crisisDaysAgo === null; ago++) {
+  // A shock in either direction is a crisis day only when open interest fell with it (a forced deleveraging).
+  // An unknown open interest change counts as one: where the data is silent the smaller size wins.
+  const oiByBar = new Map<number, string>();
+  for (const c of oiChanges ?? []) oiByBar.set(c.ts, c.change);
+  const shockBars: ShockBar[] = [];
+  for (let ago = 0; ago < p.crisisHoldBars; ago++) {
     const i = closes.length - 1 - ago;
     const ret = D(closes[i] as string).div(closes[i - 1] as string).ln();
     const priorSigma = ago === 0 ? sigma : dailyVol(closes.slice(0, i), p.volShortPeriod);
-    if (priorSigma.gt(0) && ret.abs().gt(priorSigma.mul(p.crisisReturnSigmas))) crisisDaysAgo = ago;
+    if (!priorSigma.gt(0) || !ret.abs().gt(priorSigma.mul(p.crisisReturnSigmas))) continue;
+    const oiChange = oiByBar.get((candles[i] as Candle).ts) ?? '';
+    shockBars.push({ daysAgo: ago, return: ret.toFixed(), oiChange, crisis: oiChange === '' || D(oiChange).lt(D(p.crisisOiDrop).neg()) });
   }
+  const crisisDaysAgo = shockBars.find((b) => b.crisis)?.daysAgo ?? null;
   return {
     asOf: last.ts,
     bars: candles.length,
@@ -347,6 +413,7 @@ export function computeIndicators(candles: readonly Candle[], p: TrendParams = D
     volRatio: volLong.isZero() ? '0' : volShort.div(volLong).toFixed(),
     dailyReturn: dailyReturn.toFixed(),
     dailySigma: sigma.toFixed(),
+    shockBars,
     crisisDaysAgo,
     maDistanceAtr: a.isZero() ? '0' : close.minus(ma).div(a).toFixed(),
   };
@@ -381,8 +448,10 @@ export function evaluateTrendSignals(ind: IndicatorSnapshot, regime: Regime, fun
   const fundingOkLong = funding === null || D(funding.avg8h).lt(p.maxFundingForLong);
   const fundingOkShort = funding === null || D(funding.avg8h).gt(p.minFundingForShort);
   const regimeOk = !p.useRangeFilter || regime !== 'range';
+  const closesAgo = (ago: number): string => (ago === 0 ? 'the last bar' : `the bar ${ago} ${ago === 1 ? 'close' : 'closes'} ago`);
   reasons.push(`close ${ind.close} vs ${p.entryChannel}d high ${ind.entryHigh}: ${breakUp ? 'breakout up' : 'no'}`);
   reasons.push(`close vs ${p.entryChannel}d low ${ind.entryLow}: ${breakDown ? 'breakout down' : 'no'}`);
+  if (!p.allowShort) reasons.push('shorts off (allowShort = false): no short entries; the short exit is still evaluated');
   reasons.push(`close vs MA${p.trendMaPeriod} ${ind.ma}: ${aboveMa ? 'above' : belowMa ? 'below' : 'equal'}`);
   if (regime === 'crisis') {
     const halfSize = `new entries at half size (x${p.crisisSizeMultiplier})`;
@@ -390,19 +459,24 @@ export function evaluateTrendSignals(ind: IndicatorSnapshot, regime: Regime, fun
       reasons.push(`regime crisis: ${p.volShortPeriod}d/${p.volLongPeriod}d vol ratio ${D(ind.volRatio).toFixed(2)} above ${p.crisisVolRatio}; ${halfSize} while it lasts`);
     } else {
       const left = p.crisisHoldBars - 1 - ind.crisisDaysAgo;
-      const which = ind.crisisDaysAgo === 0 ? 'the last bar' : `the bar ${ind.crisisDaysAgo} ${ind.crisisDaysAgo === 1 ? 'close' : 'closes'} ago`;
-      reasons.push(`regime crisis: ${which} moved more than ${p.crisisReturnSigmas} sigma; ${halfSize} for this close and ${left} more ${left === 1 ? 'close' : 'closes'}`);
+      reasons.push(`regime crisis: ${closesAgo(ind.crisisDaysAgo)} was a crisis day; ${halfSize} for this close and ${left} more ${left === 1 ? 'close' : 'closes'}`);
     }
   } else {
     reasons.push(`regime ${regime}: ${regimeOk ? 'new entries allowed' : 'no new entries'}${p.useRangeFilter ? '' : ' (range filter off)'}`);
   }
-  reasons.push(funding === null ? 'funding: no data (filter skipped)' : `funding 3d avg ${D(funding.avg8h).mul(100).toFixed(4)}%/8h: long ${fundingOkLong ? 'ok' : 'blocked'}, short ${fundingOkShort ? 'ok' : 'blocked'}`);
+  for (const b of ind.shockBars) {
+    const move = D(b.return).exp().minus(1).mul(100);
+    const oi = b.oiChange === '' ? 'OI change unavailable, counted as crisis' : `OI ${D(b.oiChange).gte(0) ? '+' : ''}${D(b.oiChange).mul(100).toFixed(1)}%: ${b.crisis ? 'crisis' : 'not a deleveraging day'}`;
+    reasons.push(`shock: ${closesAgo(b.daysAgo)} moved ${move.gte(0) ? '+' : ''}${move.toFixed(2)}% (more than ${p.crisisReturnSigmas} sigma); ${oi}`);
+  }
+  const fundingShort = p.allowShort ? `, short ${fundingOkShort ? 'ok' : 'blocked'}` : '';
+  reasons.push(funding === null ? 'funding: no data (filter skipped)' : `funding 3d avg ${D(funding.avg8h).mul(100).toFixed(4)}%/8h: long ${fundingOkLong ? 'ok' : 'blocked'}${fundingShort}`);
   const longExit = close.lt(ind.exitLow);
   const shortExit = close.gt(ind.exitHigh);
   reasons.push(`exit: close vs ${p.exitChannel}d low ${ind.exitLow} → long exit ${longExit ? 'YES' : 'no'}; vs ${p.exitChannel}d high ${ind.exitHigh} → short exit ${shortExit ? 'YES' : 'no'}`);
   return {
     longEntry: breakUp && aboveMa && regimeOk && fundingOkLong,
-    shortEntry: breakDown && belowMa && regimeOk && fundingOkShort,
+    shortEntry: p.allowShort && breakDown && belowMa && regimeOk && fundingOkShort,
     longExit,
     shortExit,
     reasons,
@@ -543,6 +617,8 @@ export function planSize(equity: DecimalInput, entryPx: DecimalInput, atrValue: 
 
 export interface InstrumentSignalReport {
   instId: string;
+  /** The daily cut the bars of this report close at (UTC hour) */
+  phase: SignalPhase;
   indicators: IndicatorSnapshot;
   regime: Regime;
   funding: FundingSummary | null;
@@ -567,27 +643,83 @@ export function buildSignalReport(
   s: SizingParams = DEFAULT_SIZING,
   /** Fractional 10-day change of the instrument's open interest (crowding rule), null when unknown */
   oiChange10d: DecimalInput | null = null,
+  /** Open interest change per daily bar (crisis rule, see barOiChanges); null when unknown for every bar */
+  oiChanges: readonly BarOiChange[] | null = null,
+  /** The daily cut `candles` close at; the caller builds the bars of that cut (see dailyBarsFromHalfDays) */
+  phase: SignalPhase = 0,
 ): InstrumentSignalReport {
   const confirmed = candles.filter((c) => c.confirm);
-  const indicators = computeIndicators(confirmed, p);
+  const indicators = computeIndicators(confirmed, p, oiChanges);
   const regime = classifyRegime(indicators, p);
   const fundingSummary = funding ? summarizeFunding(funding, now, p.fundingWindowHours) : null;
   const signals = evaluateTrendSignals(indicators, regime, fundingSummary, p);
   const adjLong = sizeAdjustment('long', regime, fundingSummary, oiChange10d, p);
   const adjShort = sizeAdjustment('short', regime, fundingSummary, oiChange10d, p);
   for (const a of adjLong.adjustments) signals.reasons.push(`long size: ${a}`);
-  for (const a of adjShort.adjustments) signals.reasons.push(`short size: ${a}`);
+  if (p.allowShort) for (const a of adjShort.adjustments) signals.reasons.push(`short size: ${a}`);
   const sizingParams = { ...s, atrStopMultiple: p.atrStopMultiple };
   const sizing =
     inst && equity !== null && D(equity).gt(0)
       ? { long: planSize(equity, indicators.close, indicators.atr, inst, sizingParams, adjLong), short: planSize(equity, indicators.close, indicators.atr, inst, sizingParams, adjShort) }
       : null;
-  return { instId, indicators, regime, funding: fundingSummary, signals, sizing, structure: null, dataFetchedAt: null, params: p };
+  return { instId, phase, indicators, regime, funding: fundingSummary, signals, sizing, structure: null, dataFetchedAt: null, params: p };
+}
+
+// ---- second daily cut ----
+
+/** UTC hours at which a signal day may close. */
+export const SIGNAL_PHASE_HOURS = [0, 12] as const;
+export type SignalPhase = 0 | 12;
+
+const HOUR_MS = 3_600_000;
+const HALF_DAY_MS = 12 * HOUR_MS;
+
+/** Start of the phase-day containing `ts`: phase-days run from phase:00 UTC to phase:00 UTC the next day (phase 0 is the UTC day). */
+export function phaseDayStart(ts: number, phase: SignalPhase): number {
+  return utcDayStart(ts - phase * HOUR_MS) + phase * HOUR_MS;
+}
+
+/**
+ * Daily candles that open at phase:00 UTC, each built from the two consecutive 12-hour UTC candles
+ * that open at phase:00 and 12 hours later. A day is emitted only when both halves are present and
+ * is confirmed only when both are. Oldest first.
+ */
+export function dailyBarsFromHalfDays(halfDayCandles: readonly Candle[], phase: SignalPhase): Candle[] {
+  const byTs = new Map<number, Candle>();
+  for (const c of halfDayCandles) byTs.set(c.ts, c);
+  const out: Candle[] = [];
+  for (const first of [...byTs.values()].sort((a, b) => a.ts - b.ts)) {
+    if (phaseDayStart(first.ts, phase) !== first.ts) continue;
+    const second = byTs.get(first.ts + HALF_DAY_MS);
+    if (!second) continue;
+    out.push({
+      ts: first.ts,
+      open: first.open,
+      high: Decimal.max(first.high, second.high).toFixed(),
+      low: Decimal.min(first.low, second.low).toFixed(),
+      close: second.close,
+      vol: D(first.vol).plus(second.vol).toFixed(),
+      volCcy: D(first.volCcy).plus(second.volCcy).toFixed(),
+      confirm: first.confirm && second.confirm,
+    });
+  }
+  return out;
+}
+
+/**
+ * Sizing of one phase's lot when the signal is computed at `phaseCount` daily cuts: the risk and the
+ * notional cap of a unit are shared equally between the cuts, so the lots together stay within one unit.
+ */
+export function splitSizingAcrossPhases(s: SizingParams, phaseCount: number): SizingParams {
+  if (!Number.isInteger(phaseCount) || phaseCount < 1) throw new SignalError('BAD_INPUT', 'phaseCount must be a positive integer');
+  return { ...s, riskPct: D(s.riskPct).div(phaseCount).toFixed(), maxNotionalPct: D(s.maxNotionalPct).div(phaseCount).toFixed() };
 }
 
 /** A row of GET /api/signals that could not be computed. */
 export interface SignalReportError {
   instId: string;
+  /** The daily cut that could not be computed */
+  phase: SignalPhase;
   error: { code: string; message: string };
 }
 
@@ -601,7 +733,9 @@ export function isSignalReportError(row: SignalReportRow): row is SignalReportEr
 export interface SignalsResponse {
   generatedAt: number;
   equity: string | null;
-  /** The sizing parameters the plans were computed with (request overrides applied) */
+  /** The daily cuts the server computes, whether or not the request filtered the rows to one of them */
+  phases: SignalPhase[];
+  /** The sizing parameters of ONE cut's lot, as the plans were computed: the unit's values (request overrides applied) split across `phases` */
   sizingParams: SizingParams;
   reports: SignalReportRow[];
 }

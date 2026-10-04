@@ -14,6 +14,8 @@ export interface TicketForm {
   side: Side;
   ordType: OrdType;
   px: string;
+  /** Trigger price of the stop-loss attached to an opening order; '' for none */
+  slTriggerPx: string;
   sizeValue: string;
   sizeUnit: SizeUnit;
   /** Net mode: OKX's reduce-only flag. Long/short mode: the order closes (reduces) a position instead of opening one. */
@@ -33,6 +35,7 @@ export function defaultForm(): TicketForm {
     side: 'buy',
     ordType: 'limit',
     px: '',
+    slTriggerPx: '',
     sizeValue: '',
     sizeUnit: 'coin',
     reduceOnly: false,
@@ -89,6 +92,8 @@ export function buildRequest(form: TicketForm, instId: string | null, posMode: P
   };
   if (needsPrice(form.ordType)) candidate['px'] = form.px.trim();
   if (posMode === 'long_short_mode') candidate['posSide'] = derivePosSide(form.side, form.reduceOnly);
+  // Only an opening order carries a stop; the server refuses one on a closing order.
+  if (!form.reduceOnly && form.slTriggerPx.trim() !== '') candidate['slTriggerPx'] = form.slTriggerPx.trim();
   const parsed = placeOrderRequestSchema.safeParse(candidate);
   return parsed.success ? parsed.data : null;
 }
@@ -102,5 +107,6 @@ export function newClOrdId(now = Date.now()): string {
 export function describeRequest(req: PlaceOrderRequest): string {
   const px = req.px === undefined ? 'market' : `@ ${req.px}`;
   const intent = intentOf(req.side, req.posSide);
-  return `${intent === null ? '' : `${intent}: `}${req.side} ${req.size.value} ${req.size.unit} ${req.instId} ${px}`;
+  const stop = req.slTriggerPx === undefined ? '' : `, stop ${req.slTriggerPx} (mark)`;
+  return `${intent === null ? '' : `${intent}: `}${req.side} ${req.size.value} ${req.size.unit} ${req.instId} ${px}${stop}`;
 }

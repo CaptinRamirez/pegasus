@@ -2,7 +2,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { defaultEndpoints, type OkxCredentials, type OkxEndpoints } from '@pegasus/okx';
-import { D, type RiskConfig, type TdMode } from '@pegasus/shared';
+import { D, SIGNAL_PHASE_HOURS, type RiskConfig, type SignalPhase, type TdMode } from '@pegasus/shared';
 
 /** The repository root, from where this module lives: the launcher, `pnpm dev:api` and tests run with different working directories. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -33,6 +33,8 @@ const envSchema = z.object({
   WEB_ORIGINS: z.string().default('http://localhost:5174,http://127.0.0.1:5174'),
   INSTRUMENTS: z.string().default('BTC-USDT-SWAP,ETH-USDT-SWAP'),
   DEFAULT_TD_MODE: z.enum(['cross', 'isolated']).default('cross'),
+  /** Daily cuts the SIGNALS tab computes, UTC hours, comma separated: 0, 12 or both. Each cut is sized at 1/n of a unit. */
+  SIGNAL_PHASES: z.string().default(SIGNAL_PHASE_HOURS.join(',')),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
   DATABASE_URL: z.string().optional(),
   /** Where the kill switch and the day baseline are kept without a database; relative paths are under the repository root. */
@@ -69,6 +71,8 @@ export interface AppConfig {
     logLevel: z.infer<typeof envSchema>['LOG_LEVEL'];
   };
   instruments: string[];
+  /** Daily cuts the signals are computed at, ascending. */
+  signalPhases: SignalPhase[];
   defaultTdMode: TdMode;
   databaseUrl: string | undefined;
   /** Absolute path of the file the memory store keeps its settings in. */
@@ -109,6 +113,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   const instruments = [...new Set(e.INSTRUMENTS.split(',').map((s) => s.trim().toUpperCase()).filter((s) => s.length > 0))];
   if (instruments.length === 0) throw new Error('INSTRUMENTS must list at least one instrument');
+  const phaseNames = e.SIGNAL_PHASES.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+  const unknownPhases = phaseNames.filter((s) => !SIGNAL_PHASE_HOURS.some((h) => String(h) === s));
+  if (phaseNames.length === 0 || unknownPhases.length > 0) {
+    throw new Error(`invalid configuration: SIGNAL_PHASES must list one or more of ${SIGNAL_PHASE_HOURS.join(', ')} (UTC hours of the daily cuts), got '${e.SIGNAL_PHASES}'`);
+  }
+  const signalPhases = SIGNAL_PHASE_HOURS.filter((h) => phaseNames.includes(String(h)));
   // An Origin header never ends in a slash; one typed into .env is dropped rather than left to never match.
   const webOrigins = e.WEB_ORIGINS.split(',').map((s) => s.trim().replace(/\/$/, '')).filter((s) => s.length > 0);
   return {
@@ -120,6 +130,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     server: { host: e.API_HOST, port: e.API_PORT, token: e.API_TOKEN, webOrigins, logLevel: e.LOG_LEVEL },
     instruments,
+    signalPhases,
     defaultTdMode: e.DEFAULT_TD_MODE,
     databaseUrl: e.DATABASE_URL,
     stateFile: resolve(REPO_ROOT, e.STATE_FILE),

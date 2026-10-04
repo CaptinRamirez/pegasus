@@ -7,7 +7,7 @@ import type { Bar, CandleQuery } from './candles.js';
 import type { EngineContext, EngineEvents, EventName, Listener } from './context.js';
 import { MarketSim, type TickResult } from './market.js';
 import { Matcher } from './matching.js';
-import { OrderStore, orderToWire } from './orders.js';
+import { OrderStore, orderToWire, stopToWire } from './orders.js';
 
 export interface EngineConfig {
   posMode: OkxPosMode;
@@ -100,12 +100,30 @@ export class Engine implements EngineContext {
     this.afterMove(instId, market, market.step(now, d(px)), now);
   }
 
+  /** Pins the mark price apart from the mid (null: it follows the mid again) and checks the stops against it. */
+  setMarkPrice(instId: string, px: string | null): void {
+    const market = this.markets.get(instId);
+    if (!market) throw new Error(`unknown instrument ${instId}`);
+    market.pinMark(px === null ? null : d(px));
+    this.account.markToMarket(instId, market.markPx);
+    this.matcher.checkStops(instId);
+    this.tickSeq += 1;
+    // Publishes the new mark on the mark-price channel.
+    this.emit('tick', { instId, seq: this.tickSeq });
+    const positions = this.account.positionsWire(instId, this.now());
+    if (positions.length > 0) {
+      this.emit('positions', { instId, positions });
+      this.matcher.pushAccount();
+    }
+  }
+
   private afterMove(instId: string, market: MarketSim, result: TickResult, now: number): void {
     this.account.markToMarket(instId, market.markPx);
     if (result.books) this.emit('books', { instId, push: result.books });
     this.emit('trades', { instId, trades: result.trades });
     this.emit('candles', { instId, candles: result.candles });
     this.matcher.matchResting(instId);
+    this.matcher.checkStops(instId);
     this.tickSeq += 1;
     this.emit('tick', { instId, seq: this.tickSeq });
     const positions = this.account.positionsWire(instId, now);
@@ -229,6 +247,7 @@ export class Engine implements EngineContext {
       positions: this.positions(),
       balance: this.balance(),
       fills: this.fills(undefined, 1000),
+      stops: this.orders.activeStops().map(stopToWire),
     };
   }
 }

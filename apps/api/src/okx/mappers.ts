@@ -1,4 +1,5 @@
 import type {
+  OkxAttachAlgoOrd,
   OkxBalance,
   OkxCandleRow,
   OkxFill,
@@ -117,8 +118,24 @@ function mapOrdType(t: string): OrdType {
   }
 }
 
+/** The stop-loss entries of an order's attachAlgoOrds (a take-profit only entry carries no slTriggerPx). */
+function attachedStops(o: OkxOrder): OkxAttachAlgoOrd[] {
+  return (o.attachAlgoOrds ?? []).filter((a) => a.slTriggerPx !== undefined && a.slTriggerPx !== '');
+}
+
+const stopFailed = (a: OkxAttachAlgoOrd): boolean => a.failCode !== undefined && a.failCode !== '' && a.failCode !== '0';
+
+/** The attached stop-loss the exchange reports as not created (its failCode is set), or null: that position has no stop. */
+export function failedAttachedStop(o: OkxOrder): OkxAttachAlgoOrd | null {
+  return attachedStops(o).find(stopFailed) ?? null;
+}
+
 export function mapOrder(o: OkxOrder): Order {
-  return {
+  // The stop attached at placement is echoed in attachAlgoOrds; the order's own slTriggerPx is the older single field.
+  // An entry with a failCode is a stop the exchange did not create: it must not be shown as if it existed.
+  const attached = attachedStops(o);
+  const slTriggerPx = attached.length > 0 ? (attached.find((a) => !stopFailed(a))?.slTriggerPx ?? '') : (o.slTriggerPx ?? '');
+  const order: Order = {
     ordId: o.ordId,
     clOrdId: o.clOrdId ?? '',
     instId: o.instId,
@@ -139,6 +156,11 @@ export function mapOrder(o: OkxOrder): Order {
     cTime: num(o.cTime),
     uTime: num(o.uTime),
   };
+  if (slTriggerPx !== '') order.slTriggerPx = slTriggerPx;
+  // The trader must hear about the missing stop, so the reason travels with the order.
+  const lost = attached.find(stopFailed);
+  if (lost !== undefined) order.slFailReason = `${lost.failCode ?? ''}: ${lost.failReason ?? ''}`;
+  return order;
 }
 
 /** Builds a Fill from an `orders` channel push that carries a fill; returns null when the push has no fill. */

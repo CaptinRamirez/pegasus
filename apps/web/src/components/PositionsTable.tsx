@@ -3,7 +3,7 @@ import { D, type ClosePositionRequest, type Position } from '@pegasus/shared';
 import { api } from '../lib/api';
 import { errorMessage } from '../lib/http';
 import { UNTRACKED_TITLE, fmtCoin, fmtContracts, fmtNum, fmtPct, fmtPx, fmtSigned, fmtTime, signOf } from '../lib/format';
-import { accountAsOf, accountUnknown, type AccountUnknown } from '../store/alerts';
+import { accountAsOf, accountUnknown, trimAdvice, trimShares, type AccountUnknown } from '../store/alerts';
 import { blockTitle, getTradingBlock, useStore } from '../store/store';
 
 const UNKNOWN_TEXT: Record<AccountUnknown, string> = {
@@ -24,6 +24,8 @@ export function PositionsTable() {
   const positions = useStore((s) => s.positions);
   const instruments = useStore((s) => s.instruments);
   const posMode = useStore((s) => s.account?.posMode ?? null);
+  // Instruments whose position has outgrown the per-instrument limit: shown on the row, nothing is blocked.
+  const overLimit = useStore((s) => s.risk?.overLimit);
   const tradingBlock = useStore(getTradingBlock);
   // Re-sent by the server every 5 s, which also keeps the "as of" label current.
   const connection = useStore((s) => s.connection);
@@ -76,8 +78,13 @@ export function PositionsTable() {
           const inst = instruments.find((i) => i.instId === p.instId);
           const side = sideOf(p);
           const absPos = D(p.pos).abs();
+          const over = overLimit?.find((o) => o.instId === p.instId);
+          // Both legs of long/short mode are marked, but the trim is shown once: on the larger leg (and on the
+          // other only for what the larger cannot cover), so that following every row closes the excess once.
+          const share = over === undefined ? undefined : trimShares(open, over).get(p);
+          const trim = over === undefined || share === undefined ? null : trimAdvice(p, { ...over, excess: share.toFixed() }, inst);
           return (
-            <tr key={`${p.instId}:${p.posSide}:${p.mgnMode}`} className="num">
+            <tr key={`${p.instId}:${p.posSide}:${p.mgnMode}`} className={over === undefined ? 'num' : 'num over-limit'}>
               <td className="left">
                 {p.instId}
                 {inst === undefined && (
@@ -100,7 +107,17 @@ export function PositionsTable() {
               <td>{p.lever}x</td>
               <td>{fmtPx(p.liqPx, inst)}</td>
               <td>{fmtNum(p.margin, 2)}</td>
-              <td>{fmtNum(p.notionalUsd, 0)}</td>
+              <td>
+                {fmtNum(p.notionalUsd, 0)}
+                {over !== undefined && trim !== null && (
+                  <span
+                    className="over-limit-tag"
+                    title={`${p.instId} position notional ${fmtNum(over.notional, 0)} USD is over the per-instrument limit ${fmtNum(over.limit, 0)} USD: trim it back to the limit`}
+                  >
+                    over limit: trim {fmtNum(trim.quote, 0)} USD{trim.contracts !== null ? ` (${fmtContracts(trim.contracts, inst)} ct)` : ''}
+                  </span>
+                )}
+              </td>
               <td>
                 <button
                   className="btn btn-sm btn-danger"

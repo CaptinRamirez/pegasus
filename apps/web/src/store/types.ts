@@ -40,6 +40,8 @@ export interface Toast {
   kind: ToastKind;
   message: string;
   ts: number;
+  /** Never dropped to make room for newer toasts (the lost-stop notice) */
+  sticky?: true;
 }
 
 export interface TicketPrice {
@@ -56,6 +58,8 @@ export interface TicketPrefill {
   px: string;
   sizeValue: string;
   sizeUnit: SizeUnit;
+  /** Stop-loss trigger to attach to the order; absent for none */
+  slTriggerPx?: string;
   /** Changes on every apply so the same prefill can be re-applied */
   nonce: number;
 }
@@ -98,6 +102,8 @@ export interface TerminalState {
   lastMessageAt: number | null;
   toasts: Toast[];
   nextToastId: number;
+  /** ordIds whose missing stop-loss the trader was already told about: one notice per order, not one per push */
+  lostStopNotified: string[];
   ticketPrice: TicketPrice | null;
   ticketPrefill: TicketPrefill | null;
 }
@@ -108,6 +114,7 @@ export const LIMITS = {
   fills: 100,
   candles: 600,
   toasts: 6,
+  lostStopNotified: 200,
 } as const;
 
 export const DEFAULT_BAR: CandleBar = '5m';
@@ -143,6 +150,7 @@ export function initialState(token: string | null): TerminalState {
     lastMessageAt: null,
     toasts: [],
     nextToastId: 1,
+    lostStopNotified: [],
     ticketPrice: null,
     ticketPrefill: null,
   };
