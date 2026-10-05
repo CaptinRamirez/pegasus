@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { OkxApiError, OkxTransportError, type OkxLeverageInfo, type OkxOrder, type OkxOrderAck, type OkxPlaceOrderParams } from '@pegasus/okx';
+import { OkxApiError, OkxTransportError, type OkxLeverageInfo, type OkxMarginBalanceParams, type OkxOrder, type OkxOrderAck, type OkxPlaceOrderParams, type OkxSetLeverageParams } from '@pegasus/okx';
 import { D, type Instrument, type PlaceOrderRequest, type RiskConfig } from '@pegasus/shared';
 import { pino } from 'pino';
 import { MemoryStore } from '../src/db/store.js';
@@ -146,8 +146,19 @@ describe('OrderService order path against a stubbed exchange', () => {
       answer: (params: OkxPlaceOrderParams, n: number): OkxOrderAck | Promise<OkxOrderAck> => ({ ordId: `o${n}`, clOrdId: params.clOrdId ?? '', tag: '', sCode: '0', sMsg: '' }),
       lookup: notFound as (clOrdId: string) => OkxOrder,
       lookups: 0,
+      /** What went to the margin-balance and set-leverage endpoints */
+      margins: [] as OkxMarginBalanceParams[],
+      levers: [] as OkxSetLeverageParams[],
     };
     const rest = {
+      adjustMargin: async (params: OkxMarginBalanceParams) => {
+        exchange.margins.push(params);
+        return { instId: params.instId, posSide: params.posSide, amt: params.amt, type: params.type, leverage: '10', ccy: 'USDT' };
+      },
+      setLeverage: async (params: OkxSetLeverageParams) => {
+        exchange.levers.push(params);
+        return [{ instId: params.instId ?? '', mgnMode: params.mgnMode, posSide: params.posSide ?? 'net', lever: params.lever }];
+      },
       getAccountConfig: async () => ({ uid: '1', acctLv: '2', posMode, autoLoan: false, level: 'Lv1', perm: 'read_only,trade' }),
       getBalance: async () => ({ totalEq: '100000', uTime: '1', details: [] }),
       getPositions: async () => [],
@@ -690,6 +701,55 @@ describe('OrderService order path against a stubbed exchange', () => {
       expect(retried.order).toMatchObject({ ordId: 'o1', state: 'filled', slTriggerPx: '48000' });
       expect(retried.preview).toMatchObject({ slTriggerPx: '48000', stopLossQuote: '', risk: { ok: true } });
       expect(h.exchange.placed).toHaveLength(1);
+      await h.account.stop();
+    });
+  });
+
+  describe('isolated margin of the campaign', () => {
+    it('moves margin of the position the mode names; taking it out is halted by the kill switch, adding it never is', async () => {
+      const net = await harness({ posMode: 'net_mode' });
+      await net.orders.adjustIsolatedMargin({ instId: BTC.instId, posSide: 'net', type: 'add', amt: '12.5' });
+      expect(await settle(net.orders.adjustIsolatedMargin({ instId: BTC.instId, posSide: 'long', type: 'add', amt: '1' }))).toMatchObject({ code: 'VALIDATION' });
+      expect(await settle(net.orders.adjustIsolatedMargin({ instId: BTC.instId, posSide: 'net', type: 'reduce', amt: '0' }))).toMatchObject({ code: 'VALIDATION' });
+      net.risk.setKillSwitch(true, 'test');
+      expect(await settle(net.orders.adjustIsolatedMargin({ instId: BTC.instId, posSide: 'net', type: 'reduce', amt: '1' }))).toMatchObject({ code: 'RISK_REJECTED', details: { code: 'KILL_SWITCH' } });
+      await net.orders.adjustIsolatedMargin({ instId: BTC.instId, posSide: 'net', type: 'add', amt: '1' });
+      expect(net.exchange.margins).toEqual([
+        { instId: BTC.instId, posSide: 'net', type: 'add', amt: '12.5' },
+        { instId: BTC.instId, posSide: 'net', type: 'add', amt: '1' },
+      ]);
+      await net.account.stop();
+
+      const hedged = await harness();
+      expect(await settle(hedged.orders.adjustIsolatedMargin({ instId: BTC.instId, posSide: 'net', type: 'add', amt: '1' }))).toMatchObject({ code: 'VALIDATION' });
+      await hedged.orders.adjustIsolatedMargin({ instId: BTC.instId, posSide: 'long', type: 'reduce', amt: '2' });
+      expect(hedged.exchange.margins).toEqual([{ instId: BTC.instId, posSide: 'long', type: 'reduce', amt: '2' }]);
+      await hedged.account.stop();
+    });
+
+    it('sets the isolated leverage beyond RISK_MAX_LEVERAGE, of one side in long/short mode', async () => {
+      const hedged = await harness();
+      expect(await settle(hedged.orders.setIsolatedLeverage(BTC.instId, '100', 'net'))).toMatchObject({ code: 'VALIDATION' });
+      await hedged.orders.setIsolatedLeverage(BTC.instId, '100', 'long');
+      expect(hedged.exchange.levers).toEqual([{ instId: BTC.instId, lever: '100', mgnMode: 'isolated', posSide: 'long' }]);
+      await hedged.account.stop();
+      const net = await harness({ posMode: 'net_mode' });
+      await net.orders.setIsolatedLeverage(BTC.instId, '100', 'net');
+      expect(net.exchange.levers).toEqual([{ instId: BTC.instId, lever: '100', mgnMode: 'isolated' }]);
+      await net.account.stop();
+    });
+
+    it('a campaign context is for isolated orders only, and replaces the check of the leverage set by the one of the leverage run at', async () => {
+      const h = await harness();
+      h.exchange.lever = '100';
+      // 30 contracts at 50,000: 15,000 on a margin of 1,500 is 10x
+      const isolated = order({ tdMode: 'isolated' });
+      expect(await settle(h.orders.preview(order(), { leverage: '10', margin: '1500' }))).toMatchObject({ code: 'VALIDATION' });
+      expect((await h.orders.preview(isolated)).risk).toMatchObject({ ok: false, code: 'MAX_LEVERAGE' });
+      expect((await h.orders.preview(isolated, { leverage: '10', margin: '1500' })).risk).toMatchObject({ ok: true });
+      expect((await h.orders.preview(isolated, { leverage: '10', margin: '1400' })).risk).toMatchObject({ ok: false, code: 'MAX_LEVERAGE' });
+      await h.orders.place(isolated, { leverage: '10', margin: '1500' });
+      expect(h.exchange.placed).toMatchObject([{ tdMode: 'isolated', side: 'buy', posSide: 'long', sz: '30' }]);
       await h.account.stop();
     });
   });

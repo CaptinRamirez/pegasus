@@ -1,13 +1,31 @@
 import { startExchangeServer, type ExchangeServerHandle, type OkxInstrument, type OkxPosMode } from '@pegasus/mock-okx/engine';
 import { OkxRestClient, OkxWsClient, defaultEndpoints, type OkxWsData } from '@pegasus/okx';
+import { CAMPAIGN_INSTRUMENTS } from '@pegasus/shared';
 import { PaperExchange, instrumentsOf, type PaperConfig } from './exchange.js';
-import { okxBarSource, okxFundingSource } from './okx-sources.js';
+import { okxBarSource, okxFundingSource, okxTier1Mmr } from './okx-sources.js';
 import { loadState } from './state.js';
+
+/** The USDT swaps the paper exchange trades unless PAPER_INSTRUMENTS says otherwise: the campaign's ten (CAMPAIGN_INSTRUMENTS of @pegasus/shared). */
+export const DEFAULT_PAPER_INSTRUMENTS: readonly string[] = CAMPAIGN_INSTRUMENTS;
+
+/**
+ * The instruments of the paper exchange, from the environment: its own list (`PAPER_INSTRUMENTS`, comma
+ * separated; the ten default swaps when it is not set), whatever the terminal tracks (`INSTRUMENTS`, the
+ * API's variable), so that everything the terminal shows can be traded on paper, and, while the campaign is
+ * enabled (`CAMPAIGN_ENABLED=1`), the instruments it runs on (`CAMPAIGN_INSTRUMENTS`, the API's variable; the
+ * ten when it is not set), which it must be able to trade whatever PAPER_INSTRUMENTS says.
+ */
+export function paperInstruments(env: Record<string, string | undefined>): string[] {
+  const list = (value: string | undefined): string[] => (value ?? '').split(',').map((s) => s.trim().toUpperCase()).filter((s) => s.length > 0);
+  const own = env['PAPER_INSTRUMENTS'] === undefined ? [...DEFAULT_PAPER_INSTRUMENTS] : list(env['PAPER_INSTRUMENTS']);
+  const campaign = env['CAMPAIGN_ENABLED'] !== '1' ? [] : env['CAMPAIGN_INSTRUMENTS'] === undefined ? [...CAMPAIGN_INSTRUMENTS] : list(env['CAMPAIGN_INSTRUMENTS']);
+  return [...new Set([...own, ...list(env['INSTRUMENTS']), ...campaign])];
+}
 
 export interface PaperOptions {
   port?: number;
   host?: string;
-  /** Instruments the terminal trades; the ones the saved account still holds are added. */
+  /** Instruments the paper exchange trades (see paperInstruments); the ones the saved account still holds are added. */
   instruments: string[];
   stateFile: string;
   initialBalance?: string;
@@ -57,8 +75,11 @@ export async function startPaperExchange(opts: PaperOptions): Promise<PaperHandl
     instruments.push({ ...INSTRUMENT_DEFAULTS, ...raw });
   }
 
-  const paper = new PaperExchange(config, { instruments, bars: okxBarSource(rest), funding: okxFundingSource(rest), log });
+  // What isolated positions are liquidated by; an instrument OKX gives no rate for falls back on a safe one.
+  const mmr = await okxTier1Mmr(rest, instruments, log);
+  const paper = new PaperExchange(config, { instruments, bars: okxBarSource(rest), funding: okxFundingSource(rest), mmr, log });
   log(paper.restored ? `paper account read from ${config.stateFile}` : `new paper account with ${config.initialBalance} USDT, kept in ${config.stateFile}`);
+  log(`trading ${instruments.map((i) => `${i.instId} (maintenance margin ${paper.engine.mmr.get(i.instId)?.toFixed() ?? '?'})`).join(', ')}`);
   await paper.catchUp();
 
   const serverOpts: { port?: number; host?: string; log: (msg: string) => void; onWrite: () => void } = { log, onWrite: () => paper.save() };

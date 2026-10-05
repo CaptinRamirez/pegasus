@@ -10,6 +10,15 @@ export type PosSide = 'long' | 'short' | 'net';
 export type TdMode = 'cross' | 'isolated';
 export type OrdType = 'market' | 'limit' | 'post_only' | 'fok' | 'ioc';
 export type OrderState = 'live' | 'partially_filled' | 'filled' | 'canceled';
+/**
+ * Who an order comes from, in the exchange's words: `normal` is an order of the trader; `full_liquidation` and
+ * `partial_liquidation` are the orders the exchange closes a liquidated position with, `adl` the one of an
+ * auto-deleveraging.
+ */
+export type OrderCategory = 'normal' | 'twap' | 'adl' | 'full_liquidation' | 'partial_liquidation' | 'delivery' | 'ddh' | 'auto_conversion';
+
+export const ORDER_CATEGORIES: readonly OrderCategory[] = ['normal', 'twap', 'adl', 'full_liquidation', 'partial_liquidation', 'delivery', 'ddh', 'auto_conversion'] as const;
+
 export type PosMode = 'net_mode' | 'long_short_mode';
 export type CtType = 'linear' | 'inverse';
 export type InstState = 'live' | 'suspend' | 'preopen' | 'test';
@@ -158,6 +167,12 @@ export interface Order {
   slTriggerPx?: string;
   /** Why the exchange did not create the stop-loss attached to the order ('<failCode>: <failReason>'): the position has no stop. Absent when the stop exists or none was attached. Not persisted. */
   slFailReason?: string;
+  /**
+   * The exchange's category of the order: what tells a liquidation (see isLiquidationOrder) from a close of the
+   * trader's own. Absent until the exchange has reported the order (the row POST /api/orders answers with) and on
+   * a row read back from the database. Not persisted.
+   */
+  category?: OrderCategory;
   cTime: number;
   uTime: number;
 }
@@ -203,6 +218,11 @@ export interface AlgoOrderList {
 }
 
 export interface Fill {
+  /**
+   * The exchange's trade id, unique per instrument. A close made by the exchange itself (liquidation, ADL) is no
+   * trade of the market: its fill carries '0' when it comes from the order push and a negative id in the
+   * exchange's own list of fills, so a fill is identified by `ordId` together with `tradeId`.
+   */
   tradeId: string;
   ordId: string;
   clOrdId: string;
@@ -230,10 +250,19 @@ export interface Position {
   /** Unrealised PnL */
   upl: string;
   uplRatio: string;
+  /** Leverage SET for the position at the exchange. For an isolated position it only says what an add posts: the leverage the position really runs at is notionalUsd / margin */
   lever: string;
+  /** Estimated liquidation price; '' when the exchange reports none */
   liqPx: string;
   /** Posted margin (isolated) or initial margin requirement (cross); '' when the exchange reports neither */
   margin: string;
+  /**
+   * Margin level of the position as the exchange reports it, 1 being 100%: an isolated position is liquidated
+   * when it falls to 1. Absent when the exchange reports none.
+   */
+  mgnRatio?: string;
+  /** Maintenance margin requirement of the position, in its margin currency. Absent when the exchange reports none. */
+  mmr?: string;
   notionalUsd: string;
   cTime: number;
   uTime: number;

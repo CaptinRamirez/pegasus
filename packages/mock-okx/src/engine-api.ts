@@ -8,6 +8,7 @@ export type { WalkFill } from './engine/book.js';
 export type { CandlePush } from './engine/market.js';
 export type { AccountSnapshot, PositionRec } from './engine/account.js';
 export type { OrderRec, OrderStoreSnapshot, StopRec } from './engine/orders.js';
+export { bankruptcyPx, fallbackMmr, liquidationPx, marginLevel } from './engine/margin.js';
 export { startExchangeServer, type ExchangeServerHandle, type ExchangeServerOptions } from './server.js';
 export { D, ZERO, d, fmt, isDecimalString, type Dec } from './num.js';
 export type * from './wire.js';

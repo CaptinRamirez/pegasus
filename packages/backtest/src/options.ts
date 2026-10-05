@@ -2,7 +2,7 @@ import { parseArgs } from 'node:util';
 import { D, DEFAULT_SIZING, DEFAULT_TREND_PARAMS, isDecimalString, SIGNAL_PHASE_HOURS, type SignalPhase } from '@pegasus/shared';
 import type { EngineConfig, ExitMode, LongVenue, OiMode } from './types.js';
 
-/** The documented framework (docs/strategy.md): both cuts, the default trend parameters (shorts off), one unit split across the cuts. */
+/** The documented framework (docs/archive/strategy-breakout.md): both cuts, the default trend parameters (shorts off), one unit split across the cuts. */
 export const DEFAULT_CONFIG: EngineConfig = {
   phases: SIGNAL_PHASE_HOURS,
   params: DEFAULT_TREND_PARAMS,
@@ -22,7 +22,7 @@ export const DEFAULT_CONFIG: EngineConfig = {
 };
 
 export const DEFAULT_INSTRUMENTS = ['BTC-USDT-SWAP', 'ETH-USDT-SWAP'];
-/** docs/strategy.md 2.2 */
+/** docs/archive/strategy-breakout.md 2.2 */
 const DEFAULT_HEAT_CAP = '0.025';
 
 export const HELP = `pnpm backtest [flags]
@@ -86,24 +86,24 @@ export interface CliOptions {
   sweep: SweepGrid | null;
 }
 
-function fraction(name: string, value: string): string {
+export function fraction(name: string, value: string): string {
   if (!isDecimalString(value) || D(value).lt(0)) throw new UsageError(`--${name} takes a non-negative decimal, got "${value}"`);
   return value;
 }
 
-function positiveInt(name: string, value: string): number {
+export function positiveInt(name: string, value: string): number {
   const n = Number(value);
   if (!Number.isInteger(n) || n <= 0) throw new UsageError(`--${name} takes a positive whole number, got "${value}"`);
   return n;
 }
 
-function utcDate(name: string, value: string): number {
+export function utcDate(name: string, value: string): number {
   const ts = /^\d{4}-\d{2}-\d{2}$/.test(value) ? Date.parse(`${value}T00:00:00Z`) : Number.NaN;
   if (!Number.isFinite(ts)) throw new UsageError(`--${name} takes a date YYYY-MM-DD, got "${value}"`);
   return ts;
 }
 
-function oneOf<T extends string>(name: string, value: string, allowed: readonly T[]): T {
+export function oneOf<T extends string>(name: string, value: string, allowed: readonly T[]): T {
   if (!(allowed as readonly string[]).includes(value)) throw new UsageError(`--${name} takes ${allowed.join(' | ')}, got "${value}"`);
   return value as T;
 }

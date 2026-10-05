@@ -26,7 +26,7 @@ export const orders = pgTable(
   (t) => [index('orders_inst_ctime_idx').on(t.instId, t.cTime), index('orders_cl_ord_id_idx').on(t.clOrdId)],
 );
 
-/** OKX trade ids are only unique per instrument, so the key is (instId, tradeId). */
+/** OKX trade ids are only unique per instrument, and every liquidation's fill carries trade id 0: the key is (instId, tradeId, ordId). */
 export const fills = pgTable(
   'fills',
   {
@@ -43,7 +43,7 @@ export const fills = pgTable(
     execType: text('exec_type').notNull().default(''),
     ts: bigint('ts', { mode: 'number' }).notNull(),
   },
-  (t) => [primaryKey({ name: 'fills_pkey', columns: [t.instId, t.tradeId] }), index('fills_inst_ts_idx').on(t.instId, t.ts)],
+  (t) => [primaryKey({ name: 'fills_pkey', columns: [t.instId, t.tradeId, t.ordId] }), index('fills_inst_ts_idx').on(t.instId, t.ts)],
 );
 
 export const riskEvents = pgTable('risk_events', {

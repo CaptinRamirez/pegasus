@@ -2,15 +2,19 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { defaultEndpoints, type OkxCredentials, type OkxEndpoints } from '@pegasus/okx';
-import { D, SIGNAL_PHASE_HOURS, type RiskConfig, type SignalPhase, type TdMode } from '@pegasus/shared';
+import { CAMPAIGN_INSTRUMENTS, D, DEFAULT_CAMPAIGN_PARAMS, DEFAULT_POT_PARAMS, SIGNAL_PHASE_HOURS, type CampaignStructure, type RiskConfig, type SignalPhase, type TdMode } from '@pegasus/shared';
 
 /** The repository root, from where this module lives: the launcher, `pnpm dev:api` and tests run with different working directories. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 
 const decimal = z.string().regex(/^\d+(\.\d+)?$/, 'must be a non-negative decimal');
+const positive = decimal.refine((s) => D(s).gt(0), 'must be a positive decimal');
 // A percentage typed where a fraction is meant (5 for 5%) would switch the check off.
 const fraction = decimal.refine((s) => D(s).lt(1), 'must be a fraction below 1 (0.05 means 5%)');
 const endpoint = z.string().refine((s) => s === '' || URL.canParse(s), 'must be a URL').default('');
+
+/** A comma separated list of instrument ids: trimmed, upper case, without empty entries and repeats. */
+const instrumentList = (value: string): string[] => [...new Set(value.split(',').map((s) => s.trim().toUpperCase()).filter((s) => s.length > 0))];
 
 const ENDPOINT_OVERRIDES = ['OKX_REST_URL', 'OKX_WS_PUBLIC_URL', 'OKX_WS_PRIVATE_URL', 'OKX_WS_BUSINESS_URL'] as const;
 
@@ -57,7 +61,39 @@ const envSchema = z.object({
   RISK_MAX_OPEN_ORDERS: z.coerce.number().int().min(1).default(20),
   RISK_PRICE_BAND_PCT: fraction.default('0.05'),
   RISK_MAX_SLIPPAGE_PCT: fraction.default('0.005'),
+
+  /** '1' lets the API run campaigns (the rule of packages/shared/src/campaign.ts). Paper trading only in this stage, see loadConfig. */
+  CAMPAIGN_ENABLED: z.enum(['0', '1']).default('0'),
+  /** USDT swaps the campaigns run on, comma separated (the ten of CAMPAIGN_INSTRUMENTS in @pegasus/shared by default); tracked like INSTRUMENTS while the campaign is enabled. */
+  CAMPAIGN_INSTRUMENTS: z.string().default(CAMPAIGN_INSTRUMENTS.join(',')),
+  /** What the pot starts with, USDT. */
+  CAMPAIGN_POT_START: positive.default(DEFAULT_POT_PARAMS.start),
+  /** Smallest stake: with less free cash than this the pot opens no campaign. */
+  CAMPAIGN_MIN_STAKE: positive.default(DEFAULT_POT_PARAMS.minStake),
+  /** pyramid: a campaign that works adds to itself out of its open profit; noadd: it holds its entry quantity to the end. */
+  CAMPAIGN_STRUCTURE: z.enum(['pyramid', 'noadd']).default(DEFAULT_CAMPAIGN_PARAMS.structure),
+  /** The campaign's ledger (the pot, its campaigns, the decision log); relative paths are under the repository root. */
+  CAMPAIGN_STATE_FILE: z.string().min(1).default('data/campaign-ledger.json'),
 });
+
+export interface CampaignConfig {
+  enabled: boolean;
+  /** USDT swaps the campaigns run on */
+  instruments: string[];
+  /** What the pot starts with, USDT */
+  potStart: string;
+  /** Smallest stake */
+  minStake: string;
+  structure: CampaignStructure;
+  /** Leverage of a campaign: the most its isolated position's notional may be of its equity (DEFAULT_CAMPAIGN_PARAMS, not a setting) */
+  leverage: string;
+  /** Taker fee rate the campaign's sizing and margin moves leave room for (DEFAULT_CAMPAIGN_PARAMS, not a setting) */
+  feeRate: string;
+  /** Absolute path of the campaign's ledger file (CAMPAIGN_STATE_FILE), kept whichever store the API uses */
+  stateFile: string;
+  /** Where the replay beside the pot keeps the bars and the funding it reads from OKX: data/campaign-replay under the repository root (git-ignored) */
+  replayCacheDir: string;
+}
 
 export interface AppConfig {
   okx: {
@@ -77,7 +113,16 @@ export interface AppConfig {
     webOrigins: string[];
     logLevel: z.infer<typeof envSchema>['LOG_LEVEL'];
   };
+  /**
+   * What the server tracks (market data, `hello.instruments`, /api/instruments): INSTRUMENTS, and the campaign's
+   * instruments after them while the campaign is enabled, so that their markets are subscribed.
+   */
   instruments: string[];
+  /**
+   * INSTRUMENTS alone, as configured: what /api/signals reports on when no instrument is asked for, and with it the
+   * SIGNALS tab. The campaign's instruments are tracked, not signalled.
+   */
+  signalInstruments: string[];
   /** Daily cuts the signals are computed at, ascending. */
   signalPhases: SignalPhase[];
   defaultTdMode: TdMode;
@@ -89,6 +134,8 @@ export interface AppConfig {
   /** Short commit hash the stack was started from, or 'unknown'. */
   version: string;
   risk: RiskConfig;
+  /** The campaign rule; `enabled` only ever in paper trading. */
+  campaign: CampaignConfig;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -127,8 +174,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (e.OKX_WS_TRADING === '1') {
     throw new Error('invalid configuration: OKX_WS_TRADING=1 is not supported: OKX deprecated the instId parameter of its WebSocket order operations and Pegasus has not been migrated to instIdCode; leave OKX_WS_TRADING at 0 (orders go over REST)');
   }
-  const instruments = [...new Set(e.INSTRUMENTS.split(',').map((s) => s.trim().toUpperCase()).filter((s) => s.length > 0))];
-  if (instruments.length === 0) throw new Error('INSTRUMENTS must list at least one instrument');
+  const ownInstruments = instrumentList(e.INSTRUMENTS);
+  if (ownInstruments.length === 0) throw new Error('INSTRUMENTS must list at least one instrument');
+  const campaignEnabled = e.CAMPAIGN_ENABLED === '1';
+  const campaignInstruments = instrumentList(e.CAMPAIGN_INSTRUMENTS);
+  if (campaignEnabled) {
+    // The rule is proven on paper first. In paper mode no OKX key is used at all: whatever is signed carries the
+    // placeholder key above and goes to the paper exchange only, so no order of a campaign can reach an OKX account.
+    if (!paper) {
+      throw new Error('invalid configuration: CAMPAIGN_ENABLED=1 is refused: this stage of the campaign is paper only, it runs on the paper exchange and never on an OKX account. Start Pegasus with pnpm start --paper (or PAPER_TRADING=1 in .env), or set CAMPAIGN_ENABLED=0');
+    }
+    if (campaignInstruments.length === 0) throw new Error('invalid configuration: CAMPAIGN_INSTRUMENTS must list at least one instrument while CAMPAIGN_ENABLED=1');
+    const notUsdt = campaignInstruments.filter((id) => !/^[A-Z0-9]+-USDT-SWAP$/.test(id));
+    if (notUsdt.length > 0) throw new Error(`invalid configuration: CAMPAIGN_INSTRUMENTS must list USDT swaps (<coin>-USDT-SWAP), the campaign trades linear contracts only; got ${notUsdt.join(', ')}`);
+    if (D(e.CAMPAIGN_MIN_STAKE).gt(e.CAMPAIGN_POT_START)) {
+      throw new Error(`invalid configuration: CAMPAIGN_MIN_STAKE ${e.CAMPAIGN_MIN_STAKE} is more than CAMPAIGN_POT_START ${e.CAMPAIGN_POT_START}: the pot could never open a campaign`);
+    }
+  }
+  // The campaign's instruments are tracked like the terminal's own: market data, the instrument list, positions.
+  const instruments = campaignEnabled ? [...new Set([...ownInstruments, ...campaignInstruments])] : ownInstruments;
   const phaseNames = e.SIGNAL_PHASES.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
   const unknownPhases = phaseNames.filter((s) => !SIGNAL_PHASE_HOURS.some((h) => String(h) === s));
   if (phaseNames.length === 0 || unknownPhases.length > 0) {
@@ -153,6 +217,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     server: { host: e.API_HOST, port: e.API_PORT, token: e.API_TOKEN, webOrigins, logLevel: e.LOG_LEVEL },
     instruments,
+    signalInstruments: ownInstruments,
     signalPhases,
     defaultTdMode: e.DEFAULT_TD_MODE,
     databaseUrl: e.DATABASE_URL,
@@ -168,6 +233,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxOpenOrders: e.RISK_MAX_OPEN_ORDERS,
       priceBandPct: e.RISK_PRICE_BAND_PCT,
       maxSlippagePct: e.RISK_MAX_SLIPPAGE_PCT,
+    },
+    campaign: {
+      enabled: campaignEnabled,
+      instruments: campaignInstruments,
+      potStart: e.CAMPAIGN_POT_START,
+      minStake: e.CAMPAIGN_MIN_STAKE,
+      structure: e.CAMPAIGN_STRUCTURE,
+      leverage: DEFAULT_CAMPAIGN_PARAMS.leverage,
+      feeRate: DEFAULT_CAMPAIGN_PARAMS.feeRate,
+      stateFile: resolve(REPO_ROOT, e.CAMPAIGN_STATE_FILE),
+      replayCacheDir: resolve(REPO_ROOT, 'data', 'campaign-replay'),
     },
   };
 }

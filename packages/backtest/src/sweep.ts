@@ -7,7 +7,7 @@ import { rStats, seriesStats } from './stats.js';
 import type { EngineConfig, InstrumentData } from './types.js';
 
 /**
- * The parameter grid of docs/strategy.md section 5: the same run for every combination of entry
+ * The parameter grid of docs/archive/strategy-breakout.md section 5: the same run for every combination of entry
  * channel, exit channel and stop multiple. A good system earns over a region of the grid, not at a point.
  *
  * A run spends nearly all its time inside buildSignalReport, so the combinations are spread over

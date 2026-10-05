@@ -9,7 +9,7 @@ import { pino } from 'pino';
 import WebSocket from 'ws';
 import { startMockOkx, type MockOkxHandle } from '@pegasus/mock-okx';
 import { OkxTransportError, type OkxRestClient } from '@pegasus/okx';
-import { D, decodeServerMessage, type AlgoOrderList, type ApiResponse, type Order, type Position, type ServerMessage } from '@pegasus/shared';
+import { D, decodeServerMessage, type AlgoOrderList, type ApiResponse, type CampaignReplayView, type CampaignView, type Order, type Position, type ServerMessage } from '@pegasus/shared';
 import type { FastifyInstance, InjectOptions } from 'fastify';
 import { loadConfig, type AppConfig } from '../src/config.js';
 import { MemoryStore } from '../src/db/store.js';
@@ -187,6 +187,13 @@ describe('api e2e against mock OKX', () => {
     const zh = data(await api<{ reports: Array<{ signals?: { reasons: string[] } }> }>('GET', '/api/signals?instId=ETH-USDT-SWAP&phase=0&equity=100000&lang=zh'));
     expect(zh.reports[0]?.signals?.reasons[0]).toMatch(/^收盘价 /);
     expect((await api('GET', '/api/signals?lang=fr')).status).toBe(400);
+  });
+
+  it('answers the campaign routes while the campaign is disabled: no pot, nothing to replay', async () => {
+    expect(data(await api<CampaignView>('GET', '/api/campaign'))).toMatchObject({ status: 'disabled', replay: null });
+    const nothing = { status: 'unavailable', reason: { code: 'CAMPAIGN_DISABLED', message: expect.stringContaining('CAMPAIGN_ENABLED=1') as string }, computedAt: null, through: null, same: null, other: null, heldBtc: [], reconciliation: null };
+    expect(await api<CampaignReplayView>('GET', '/api/campaign/replay')).toEqual({ status: 200, body: { ok: true, data: nothing } });
+    expect(await api<CampaignReplayView>('POST', '/api/campaign/replay', {})).toEqual({ status: 200, body: { ok: true, data: nothing } });
   });
 
   it('previews a limit order with sizing in coin and risk ok', async () => {

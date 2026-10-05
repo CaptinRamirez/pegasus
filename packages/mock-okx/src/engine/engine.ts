@@ -1,13 +1,15 @@
-import { d, type Dec } from '../num.js';
+import { d, fmt, isDecimalString, ZERO, type Dec } from '../num.js';
 import { Prng } from '../prng.js';
 import type { MockState } from '../types.js';
-import type { OkxAccountConfig, OkxAlgoOrder, OkxBalance, OkxBookData, OkxCandleRow, OkxFill, OkxFundingRate, OkxInstrument, OkxLeverageInfo, OkxMarkPrice, OkxMgnMode, OkxOrder, OkxPosMode, OkxPosition, OkxTicker } from '../wire.js';
-import { Account } from './account.js';
+import type { OkxAccountConfig, OkxAlgoOrder, OkxBalance, OkxBookData, OkxCandleRow, OkxFill, OkxFundingRate, OkxInstrument, OkxLeverageInfo, OkxMarginAdjustment, OkxMarkPrice, OkxMgnMode, OkxOrder, OkxPosMode, OkxPosSide, OkxPosition, OkxResponse, OkxTicker } from '../wire.js';
+import { Account, type PositionRec } from './account.js';
 import type { Bar, CandleQuery } from './candles.js';
-import type { EngineContext, EngineEvents, EventName, Listener, Market } from './context.js';
+import { reject, type EngineContext, type EngineEvents, type EventName, type Listener, type Market, type Rejection } from './context.js';
+import { fallbackMmr } from './margin.js';
 import { MarketSim, type TickResult } from './market.js';
 import { Matcher } from './matching.js';
 import { OrderStore, orderToWire, stopToAlgoWire, stopToWire } from './orders.js';
+import { asRecord, str } from './validate.js';
 
 export interface EngineConfig {
   posMode: OkxPosMode;
@@ -28,6 +30,11 @@ export interface EngineConfig {
   markets?: Map<string, Market>;
   /** Leverage of an instrument until it is set; 10 when absent. */
   defaultLever?: string;
+  /**
+   * Tier-1 maintenance margin rate by instrument: what its isolated positions are liquidated by. An instrument
+   * without one gets half the initial margin rate of its highest leverage (fallbackMmr).
+   */
+  mmr?: Record<string, string>;
 }
 
 export const MOCK_UID = '1234567890';
@@ -45,6 +52,8 @@ export class Engine implements EngineContext {
   clockOverride: number | null = null;
   /** When positions and balance of an instrument were last pushed because its market moved. */
   private readonly lastMovePush = new Map<string, number>();
+  /** Tier-1 maintenance margin rate of every instrument. */
+  readonly mmr = new Map<string, Dec>();
   readonly account: Account;
   readonly orders = new OrderStore();
   readonly takerFee: Dec;
@@ -64,6 +73,8 @@ export class Engine implements EngineContext {
     const now = this.now();
     for (const inst of cfg.instruments) {
       this.instruments.set(inst.instId, inst);
+      const rate = cfg.mmr?.[inst.instId];
+      this.mmr.set(inst.instId, rate === undefined ? fallbackMmr(inst) : d(rate));
       const external = cfg.markets?.get(inst.instId);
       if (cfg.markets) {
         if (!external) throw new Error(`no market supplied for ${inst.instId}`);
@@ -75,7 +86,7 @@ export class Engine implements EngineContext {
       this.sims.set(inst.instId, sim);
       this.markets.set(inst.instId, sim);
     }
-    this.account = new Account(d(cfg.initialBalanceUsdt), cfg.posMode, this.instruments, cfg.defaultLever === undefined ? undefined : d(cfg.defaultLever));
+    this.account = new Account(d(cfg.initialBalanceUsdt), cfg.posMode, this.instruments, cfg.defaultLever === undefined ? undefined : d(cfg.defaultLever), { mmr: this.mmr, feeRate: this.takerFee });
     this.matcher = new Matcher(this);
   }
 
@@ -122,12 +133,13 @@ export class Engine implements EngineContext {
     this.afterMove(instId, market, market.step(now, d(px)), now);
   }
 
-  /** Pins the mark price apart from the mid (null: it follows the mid again) and checks the stops against it. */
+  /** Pins the mark price apart from the mid (null: it follows the mid again) and checks liquidations and the stops against it. */
   setMarkPrice(instId: string, px: string | null): void {
     const market = this.sims.get(instId);
     if (!market) throw new Error(`unknown instrument ${instId}`);
     market.pinMark(px === null ? null : d(px));
     this.account.markToMarket(instId, market.markPx);
+    this.matcher.checkLiquidations(instId);
     this.matcher.checkStops(instId);
     this.tickSeq += 1;
     // Publishes the new mark on the mark-price channel.
@@ -141,6 +153,8 @@ export class Engine implements EngineContext {
 
   private afterMove(instId: string, market: MarketSim, result: TickResult, now: number): void {
     this.account.markToMarket(instId, market.markPx);
+    // Before anything fills or stops: a mark that reached both a stop and the liquidation price liquidates.
+    this.matcher.checkLiquidations(instId);
     if (result.books) this.emit('books', { instId, push: result.books });
     this.emit('trades', { instId, trades: result.trades });
     this.emit('candles', { instId, candles: result.candles });
@@ -156,14 +170,15 @@ export class Engine implements EngineContext {
   }
 
   /**
-   * A market supplied from outside has new quotes: mark the positions, fill what the quotes now reach and
-   * trigger the stops. Positions and balance are pushed at most once per `pushEveryMs` for the mark alone;
-   * a fill or a triggered stop pushes them itself.
+   * A market supplied from outside has new quotes: mark the positions, liquidate the isolated ones the mark has
+   * reached, fill what the quotes now reach and trigger the stops. Positions and balance are pushed at most once
+   * per `pushEveryMs` for the mark alone; a fill, a triggered stop or a liquidation pushes them itself.
    */
   marketMoved(instId: string, pushEveryMs = 1_000): void {
     const market = this.markets.get(instId);
     if (!market) return;
     this.account.markToMarket(instId, market.markPx);
+    this.matcher.checkLiquidations(instId);
     this.matcher.matchResting(instId);
     this.matcher.checkStops(instId);
     const now = this.now();
@@ -259,6 +274,90 @@ export class Engine implements EngineContext {
 
   setLeverage(instId: string, mgnMode: OkxMgnMode, lever: Dec, posSide: 'long' | 'short' | undefined): OkxLeverageInfo[] {
     return this.account.setLeverage(instId, mgnMode, lever, posSide);
+  }
+
+  /**
+   * What a new isolated leverage of an instrument does before it is set: null when it can be set, the refusal
+   * otherwise (setting the leverage it already has is always possible, and changes nothing).
+   *
+   * - OKX refuses a change while isolated orders of the instrument rest (59101).
+   * - An open isolated position takes the new leverage with the margin it moves (Account.leverageMarginChange):
+   *   lowered, the difference comes from the available balance, and the change is refused when that is not there
+   *   (59108); raised, the difference goes back to the balance, and the change is refused when the position
+   *   would be left at or below its liquidation threshold (59102). OKX documents these two codes for a leverage
+   *   that is too low for the margin there is and one that is too high; that they are the ones it answers with
+   *   in exactly these two cases is an assumption.
+   */
+  changeIsolatedLeverage(instId: string, lever: Dec, posSide: 'long' | 'short' | undefined): Rejection | null {
+    const sides: OkxPosSide[] = this.posMode === 'long_short_mode' ? (posSide ? [posSide] : ['long', 'short']) : ['net'];
+    const moved: PositionRec[] = [];
+    let needed = ZERO;
+    for (const side of sides) {
+      const held = this.account.find(instId, 'isolated', side);
+      const position = held && !held.qty.isZero() ? held : undefined;
+      if ((position?.lever ?? this.account.leverFor(instId, 'isolated', side)).eq(lever)) continue;
+      if (this.orders.liveOrders(instId).some((o) => o.tdMode === 'isolated' && o.posSide === side)) {
+        return reject('59101', "Leverage can't be modified. Please cancel all pending isolated margin orders before adjusting the leverage.");
+      }
+      if (!position) continue;
+      const change = this.account.leverageMarginChange(position, lever);
+      if (change.lt(0) && !this.account.survivesWith(position, position.margin.add(change))) return reject('59102', 'Leverage exceeds the maximum limit. Please lower the leverage.');
+      if (change.gt(0)) needed = needed.add(change);
+      moved.push(position);
+    }
+    if (needed.gt(this.account.availEq(this.orders.ordFrozen(this.instruments)))) {
+      return reject('59108', 'Your account leverage is too low and has insufficient margins. Please increase the leverage.');
+    }
+    if (moved.length === 0) return null;
+    const now = this.now();
+    for (const position of moved) this.account.relever(position, lever, now);
+    this.emit('positions', { instId, positions: this.account.positionsWire(instId, now) });
+    this.matcher.pushAccount();
+    return null;
+  }
+
+  /**
+   * POST /api/v5/account/position/margin-balance: adds margin to an isolated position from the available balance,
+   * or takes out of it what it holds beyond its requirement (Account.maxReducible). OKX's refusals: 59300 when
+   * there is no such position, 59302 while an order that closes it rests, 59301 for an amount beyond the limit.
+   * Unverified: that 59301 is also the answer to an add beyond the available balance, and that 59302 holds for an
+   * add as it does for a reduction (its text names the adjustment, not its direction).
+   */
+  adjustMargin(body: unknown): OkxResponse<OkxMarginAdjustment> {
+    const refuse = (code: string, msg: string): OkxResponse<OkxMarginAdjustment> => ({ code, msg, data: [] });
+    const raw = asRecord(body);
+    if (!raw) return refuse('51000', 'Parameter error');
+    const instId = str(raw, 'instId') ?? '';
+    if (!this.instruments.has(instId)) return refuse('51001', 'Instrument ID does not exist.');
+    const type = raw['type'];
+    if (type !== 'add' && type !== 'reduce') return refuse('51000', 'Parameter type error');
+    const amtStr = str(raw, 'amt');
+    if (!amtStr || !isDecimalString(amtStr) || d(amtStr).lte(0)) return refuse('51000', 'Parameter amt error');
+    const posSideRaw = raw['posSide'];
+    let posSide: OkxPosSide;
+    if (this.posMode === 'long_short_mode') {
+      if (posSideRaw !== 'long' && posSideRaw !== 'short') return refuse('51000', 'Parameter posSide error');
+      posSide = posSideRaw;
+    } else {
+      if (posSideRaw !== undefined && posSideRaw !== '' && posSideRaw !== 'net') return refuse('51000', 'Parameter posSide error');
+      posSide = 'net';
+    }
+    const position = this.account.find(instId, 'isolated', posSide);
+    if (!position || position.qty.isZero()) return refuse('59300', 'Margin call failed. Position does not exist.');
+    const closing = position.dir > 0 ? 'sell' : 'buy';
+    if (this.orders.liveOrders(instId).some((o) => o.tdMode === 'isolated' && o.posSide === posSide && o.side === closing)) {
+      return refuse('59302', 'Margin adjustment failed due to pending close order. Please cancel any pending close orders.');
+    }
+    const amt = d(amtStr);
+    const limit = type === 'add' ? this.account.availEq(this.orders.ordFrozen(this.instruments)) : this.account.maxReducible(position);
+    if (amt.gt(limit)) return refuse('59301', 'Margin adjustment failed for exceeding the max limit.');
+    const now = this.now();
+    this.account.moveMargin(position, type === 'add' ? amt : amt.neg(), now);
+    const wire = this.account.positionWire(position, now);
+    this.emit('positions', { instId, positions: this.account.positionsWire(instId, now) });
+    this.matcher.pushAccount();
+    // "Real leverage after the margin adjustment": the position's value at the mark over the margin it now holds.
+    return { code: '0', msg: '', data: [{ instId, posSide, amt: amtStr, type, leverage: d(wire.margin).gt(0) ? fmt(d(wire.notionalUsd).div(wire.margin)) : '', ccy: 'USDT' }] };
   }
 
   // ---- order queries ----

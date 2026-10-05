@@ -17,6 +17,9 @@ importers:
       '@fastify/websocket':
         specifier: ^11.3.1
         version: 11.3.1
+      '@pegasus/backtest':
+        specifier: workspace:*
+        version: link:../../packages/backtest
       '@pegasus/okx':
         specifier: workspace:*
         version: link:../../packages/okx
@@ -196,6 +199,9 @@ importers:
       '@pegasus/okx':
         specifier: workspace:*
         version: link:../okx
+      '@pegasus/shared':
+        specifier: workspace:*
+        version: link:../shared
     devDependencies:
       '@types/node':
         specifier: ^22.20.5

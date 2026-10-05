@@ -18,7 +18,8 @@ const query = z.object({
 export async function registerSignalRoutes(app: FastifyInstance, deps: Deps): Promise<void> {
   app.get('/api/signals', async (req) => {
     const q = query.parse(req.query);
-    const instIds = q.instId ? [q.instId] : [...deps.market.instruments.keys()];
+    // By default the terminal's own instruments (INSTRUMENTS), not the campaign's that are tracked beside them; any tracked one can be asked for.
+    const instIds = q.instId ? [q.instId] : [...deps.config.signalInstruments];
     const opts: SignalsOptions = {};
     if (q.equity !== undefined) opts.equity = q.equity;
     if (q.riskPct !== undefined) opts.riskPct = q.riskPct;

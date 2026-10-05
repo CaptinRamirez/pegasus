@@ -18,6 +18,7 @@ import type {
   Ticker,
   Trade,
 } from './types.js';
+import type { CampaignView } from './campaign-api.js';
 import { candleBarSchema, instIdSchema } from './schemas.js';
 
 /**
@@ -75,9 +76,19 @@ export type ServerMessage =
   | { type: 'connection'; data: ConnectionStatus }
   | { type: 'subscribed'; data: { instId: string; bar: CandleBar } }
   | { type: 'error'; data: { code: string; message: string } }
+  | CampaignMessage
   | { type: 'pong'; data: { ts: number } };
 
 export type ServerMessageType = ServerMessage['type'];
+
+/**
+ * The campaign's state (GET /api/campaign), sent to every client right after `hello` and after every change of its
+ * ledger, while the campaign is enabled.
+ */
+export type CampaignMessage = { type: 'campaign'; data: CampaignView };
+
+/** Everything the server sends over /ws: the same union as ServerMessage, which carries the campaign message now. */
+export type ServerPush = ServerMessage;
 
 export function encodeServerMessage(msg: ServerMessage): string {
   return JSON.stringify(msg);

@@ -2,10 +2,12 @@ import type { WebSocket } from 'ws';
 import {
   clientMessageSchema,
   encodeServerMessage,
+  type CampaignView,
   type CandleBar,
   type ConnectionStatus,
   type HelloPayload,
   type ServerMessage,
+  type ServerPush,
 } from '@pegasus/shared';
 import type { AppConfig } from '../config.js';
 import type { Logger } from '../logger.js';
@@ -34,6 +36,8 @@ export class Hub {
   private readonly clients = new Set<ClientCtx>();
   private sweepTimer: NodeJS.Timeout | null = null;
   private statusTimer: NodeJS.Timeout | null = null;
+  /** The campaign's state for a terminal that connects; set while the campaign is enabled. */
+  private campaignView: (() => CampaignView) | null = null;
 
   constructor(
     private readonly config: AppConfig,
@@ -107,12 +111,18 @@ export class Hub {
     };
   }
 
+  /** While the campaign is enabled: its state goes to every terminal right after `hello` (the `campaign` message). */
+  setCampaignView(view: (() => CampaignView) | null): void {
+    this.campaignView = view;
+  }
+
   /** Attach an authenticated socket. */
   attach(socket: WebSocket): void {
     const ctx: ClientCtx = { socket, instId: null, bar: '1m', alive: true };
     this.clients.add(ctx);
     this.log.info({ clients: this.clients.size }, 'terminal client connected');
     this.send(ctx, { type: 'hello', data: this.hello() });
+    if (this.campaignView) this.send(ctx, { type: 'campaign', data: this.campaignView() });
     for (const instId of this.market.instruments.keys()) {
       const t = this.market.ticker(instId);
       if (t) this.send(ctx, { type: 'ticker', data: t });
@@ -132,7 +142,7 @@ export class Hub {
     socket.on('error', (err) => this.log.warn({ err: err.message }, 'terminal client socket error'));
   }
 
-  broadcast(msg: ServerMessage): void {
+  broadcast(msg: ServerPush): void {
     if (this.clients.size === 0) return;
     const text = encodeServerMessage(msg);
     for (const ctx of this.clients) this.sendText(ctx, text);
@@ -156,7 +166,7 @@ export class Hub {
     }
   }
 
-  private send(ctx: ClientCtx, msg: ServerMessage): void {
+  private send(ctx: ClientCtx, msg: ServerPush): void {
     this.sendText(ctx, encodeServerMessage(msg));
   }
 

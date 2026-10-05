@@ -1,4 +1,4 @@
-import { stopUnconfirmedAfterCancel, type AlgoOrderList, type Candle, type Fill, type HelloPayload, type Localized, type Order, type RiskState, type ServerMessage, type Trade } from '@pegasus/shared';
+import { stopUnconfirmedAfterCancel, type AlgoOrderList, type CampaignView, type Candle, type Fill, type HelloPayload, type Localized, type Order, type RiskState, type ServerMessage, type Trade } from '@pegasus/shared';
 import type { WsStatus } from '../lib/ws';
 import { LIMITS, emptyMarket, type MarketData, type TerminalState, type Toast, type ToastKind } from './types';
 
@@ -43,9 +43,21 @@ export function applyServerMessage(state: TerminalState, msg: ServerMessage): Pa
       return {};
     case 'error':
       return pushToast(state, 'error', `${msg.data.code}: ${msg.data.message}`);
+    case 'campaign':
+      return applyCampaign(state, msg.data);
     case 'pong':
       return {};
   }
+}
+
+/**
+ * The campaign's state, from the socket (the `campaign` message) or from the reply of GET /api/campaign: an older
+ * view never replaces a newer one (the reply of a slow request after a push), as the server's time tells. A hello
+ * keeps the view: the server sends its own right after it, and a server whose campaign was switched off is read
+ * again over HTTP.
+ */
+export function applyCampaign(state: TerminalState, view: CampaignView): Partial<TerminalState> {
+  return state.campaign !== null && state.campaign.serverTime > view.serverTime ? {} : { campaign: view };
 }
 
 /** Receive times kept next to the message's own changes: every message proves the server is alive. */

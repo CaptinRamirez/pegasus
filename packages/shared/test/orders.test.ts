@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { algoOrderClosesPosition, positionDirection, stopCoverage, stopsOfPosition, type AlgoOrder, type Position } from '../src/index.js';
+import { ORDER_CATEGORIES, algoOrderClosesPosition, isLiquidationOrder, positionDirection, stopCoverage, stopsOfPosition, type AlgoOrder, type Position } from '../src/index.js';
 
 const BTC = 'BTC-USDT-SWAP';
 
@@ -11,6 +11,14 @@ const position = (overrides: Partial<Position> = {}): Position => ({
 const stop = (overrides: Partial<AlgoOrder> = {}): AlgoOrder => ({
   algoId: 'a1', algoClOrdId: '', instId: BTC, side: 'sell', posSide: 'net', tdMode: 'cross', sz: '10', closeFraction: '', slTriggerPx: '59000', slTriggerPxType: 'mark', slOrdPx: '-1', tpTriggerPx: '', cTime: 1, uTime: 1,
   ...overrides,
+});
+
+describe('isLiquidationOrder', () => {
+  it('is true for the orders the exchange liquidates with, in full or in part, and for nothing else', () => {
+    expect(ORDER_CATEGORIES.filter((category) => isLiquidationOrder({ category }))).toEqual(['full_liquidation', 'partial_liquidation']);
+    // an order the exchange has not reported yet, or one read back from the journal, has no category
+    expect(isLiquidationOrder({})).toBe(false);
+  });
 });
 
 describe('positionDirection', () => {

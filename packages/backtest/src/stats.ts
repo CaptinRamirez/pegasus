@@ -46,7 +46,7 @@ export interface RStats {
   /** The two largest R, largest first */
   largest: number[];
   totalWithoutLargest: number;
-  /** Trades that lost more than 1.5R (docs/strategy.md section 5) */
+  /** Trades that lost more than 1.5R (docs/archive/strategy-breakout.md section 5) */
   lossesBeyond1_5R: number;
 }
 
@@ -178,7 +178,7 @@ export interface BootstrapResult {
   draws: number;
   /** Share of the bootstrap sums at or below the live sum, 0..100 */
   percentile: number;
-  /** 10th percentile of the bootstrap sums: below it the system may have stopped working (docs/strategy.md section 5) */
+  /** 10th percentile of the bootstrap sums: below it the system may have stopped working (docs/archive/strategy-breakout.md section 5) */
   p10: number;
   median: number;
 }

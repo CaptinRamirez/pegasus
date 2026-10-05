@@ -1,6 +1,7 @@
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { CAMPAIGN_INSTRUMENTS } from '@pegasus/shared';
 import { loadConfig } from '../src/config.js';
 
 describe('loadConfig OKX credentials', () => {
@@ -117,5 +118,73 @@ describe('loadConfig paper trading', () => {
     });
     expect(config.okx.endpoints).toEqual({ rest: 'https://eea.okx.com', wsPublic: 'wss://wseea.okx.com/ws/v5/public', wsBusiness: 'wss://wseea.okx.com/ws/v5/business', restPrivate: 'http://localhost:9300', wsPrivate: 'ws://localhost:9300/ws/v5/private' });
     expect(() => loadConfig({ PAPER_EXCHANGE_URL: 'paper' })).toThrow(/PAPER_EXCHANGE_URL: must be a URL/);
+  });
+});
+
+describe('loadConfig campaign', () => {
+  const PAPER = { PAPER_EXCHANGE_URL: 'http://127.0.0.1:9200' };
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+
+  it('keeps its ledger in its own file, under the repository root unless the path is absolute', () => {
+    expect(loadConfig({ ...PAPER, CAMPAIGN_ENABLED: '1', CAMPAIGN_STATE_FILE: 'data/campaign-paper2.json' }).campaign.stateFile).toBe(join(root, 'data', 'campaign-paper2.json'));
+    const abs = resolve(root, '..', 'ledger.json');
+    expect(loadConfig({ CAMPAIGN_STATE_FILE: abs }).campaign.stateFile).toBe(abs);
+  });
+
+  it('is off by default, with the ten USDT swaps, the pot of the rule and the pyramid structure', () => {
+    const config = loadConfig({});
+    expect(config.campaign).toEqual({
+      enabled: false,
+      instruments: ['BTC-USDT-SWAP', 'ETH-USDT-SWAP', 'LTC-USDT-SWAP', 'XRP-USDT-SWAP', 'BCH-USDT-SWAP', 'ETC-USDT-SWAP', 'LINK-USDT-SWAP', 'ADA-USDT-SWAP', 'DOT-USDT-SWAP', 'TRX-USDT-SWAP'],
+      potStart: '56',
+      minStake: '5.6',
+      structure: 'pyramid',
+      leverage: '10',
+      feeRate: '0.0005',
+      stateFile: join(root, 'data', 'campaign-ledger.json'),
+      // the replay beside the pot keeps what it reads from OKX under data/, which git ignores
+      replayCacheDir: join(root, 'data', 'campaign-replay'),
+    });
+    // while it is off its instruments are not tracked
+    expect(config.instruments).toEqual(['BTC-USDT-SWAP', 'ETH-USDT-SWAP']);
+  });
+
+  it('refuses to start enabled anywhere but on the paper exchange: this stage is paper only', () => {
+    const live = { OKX_API_KEY: 'k', OKX_API_SECRET: 's', OKX_API_PASSPHRASE: 'p', OKX_DEMO: '0' };
+    const mock = { OKX_REST_URL: 'http://127.0.0.1:9100', OKX_WS_PUBLIC_URL: 'ws://127.0.0.1:9100/ws/v5/public', OKX_WS_PRIVATE_URL: 'ws://127.0.0.1:9100/ws/v5/private', OKX_WS_BUSINESS_URL: 'ws://127.0.0.1:9100/ws/v5/business' };
+    for (const env of [{}, live, { ...live, OKX_DEMO: '1' }, { ...live, ...mock }]) {
+      expect(() => loadConfig({ ...env, CAMPAIGN_ENABLED: '1' })).toThrow(/^invalid configuration: CAMPAIGN_ENABLED=1 is refused: this stage of the campaign is paper only.*pnpm start --paper.*CAMPAIGN_ENABLED=0/);
+    }
+    expect(loadConfig({ ...live, CAMPAIGN_ENABLED: '0' }).campaign.enabled).toBe(false);
+  });
+
+  it('on the paper exchange it is enabled, signs with the placeholder key only, and its instruments are tracked after the terminal own', () => {
+    const config = loadConfig({ ...PAPER, OKX_API_KEY: 'live-key', OKX_API_SECRET: 'live-secret', OKX_API_PASSPHRASE: 'live-pass', CAMPAIGN_ENABLED: '1', INSTRUMENTS: 'SOL-USDT-SWAP,BTC-USDT-SWAP', CAMPAIGN_INSTRUMENTS: 'btc-usdt-swap, eth-usdt-swap,,ETH-USDT-SWAP', CAMPAIGN_POT_START: '100', CAMPAIGN_MIN_STAKE: '10', CAMPAIGN_STRUCTURE: 'noadd' });
+    expect(config.okx).toMatchObject({ paper: true, credentials: { apiKey: 'paper', apiSecret: 'paper', passphrase: 'paper' } });
+    expect(config.campaign).toMatchObject({ enabled: true, instruments: ['BTC-USDT-SWAP', 'ETH-USDT-SWAP'], potStart: '100', minStake: '10', structure: 'noadd' });
+    expect(config.instruments).toEqual(['SOL-USDT-SWAP', 'BTC-USDT-SWAP', 'ETH-USDT-SWAP']);
+    // the signals stay the terminal's own: INSTRUMENTS as configured, without the campaign's
+    expect(config.signalInstruments).toEqual(['SOL-USDT-SWAP', 'BTC-USDT-SWAP']);
+  });
+
+  it('runs on the ten swaps of the campaign list by default, and signals INSTRUMENTS alone whether it is enabled or not', () => {
+    const on = loadConfig({ ...PAPER, CAMPAIGN_ENABLED: '1', INSTRUMENTS: 'BTC-USDT-SWAP' });
+    expect(on.campaign.instruments).toEqual([...CAMPAIGN_INSTRUMENTS]);
+    expect(on.instruments).toEqual([...CAMPAIGN_INSTRUMENTS]);
+    expect(on.signalInstruments).toEqual(['BTC-USDT-SWAP']);
+    const off = loadConfig({ ...PAPER, INSTRUMENTS: 'ETH-USDT-SWAP,SOL-USDT-SWAP' });
+    expect(off.instruments).toEqual(['ETH-USDT-SWAP', 'SOL-USDT-SWAP']);
+    expect(off.signalInstruments).toEqual(off.instruments);
+  });
+
+  it('refuses settings that would break it silently', () => {
+    expect(() => loadConfig({ ...PAPER, CAMPAIGN_ENABLED: '1', CAMPAIGN_STRUCTURE: 'martingale' })).toThrow(/CAMPAIGN_STRUCTURE/);
+    expect(() => loadConfig({ CAMPAIGN_ENABLED: 'yes' })).toThrow(/CAMPAIGN_ENABLED/);
+    expect(() => loadConfig({ ...PAPER, CAMPAIGN_ENABLED: '1', CAMPAIGN_POT_START: '0' })).toThrow(/CAMPAIGN_POT_START: must be a positive decimal/);
+    expect(() => loadConfig({ ...PAPER, CAMPAIGN_ENABLED: '1', CAMPAIGN_MIN_STAKE: '60' })).toThrow(/CAMPAIGN_MIN_STAKE 60 is more than CAMPAIGN_POT_START 56: the pot could never open a campaign/);
+    expect(() => loadConfig({ ...PAPER, CAMPAIGN_ENABLED: '1', CAMPAIGN_INSTRUMENTS: 'BTC-USDT-SWAP,BTC-USD-SWAP' })).toThrow(/CAMPAIGN_INSTRUMENTS must list USDT swaps.*BTC-USD-SWAP/);
+    expect(() => loadConfig({ ...PAPER, CAMPAIGN_ENABLED: '1', CAMPAIGN_INSTRUMENTS: ' , ' })).toThrow(/CAMPAIGN_INSTRUMENTS must list at least one instrument/);
+    // while it is off its own settings are only parsed
+    expect(loadConfig({ CAMPAIGN_MIN_STAKE: '60', CAMPAIGN_INSTRUMENTS: 'BTC-USD-SWAP' }).campaign.enabled).toBe(false);
   });
 });

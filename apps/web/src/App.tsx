@@ -1,3 +1,4 @@
+import { useCampaignSeed } from './hooks/useCampaign';
 import { useHistorySeed, useSession } from './hooks/useSession';
 import { useStore } from './store/store';
 import { AccountPanel } from './components/AccountPanel';
@@ -15,6 +16,7 @@ import { Trades } from './components/Trades';
 
 function Terminal() {
   useHistorySeed();
+  useCampaignSeed();
   return (
     <div className="app">
       <Header />

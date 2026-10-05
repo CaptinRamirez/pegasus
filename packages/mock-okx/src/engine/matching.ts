@@ -9,6 +9,8 @@ import { asRecord, str, validateAmend, validateAmendAlgo, validatePlace, validat
 /** OKX `cancelSource` codes. */
 const CANCEL_USER = '1';
 const CANCEL_IOC_FOK = '32';
+/** "Risk cancellation was triggered. Pending order was canceled due to insufficient maintenance margin ratio and forced-liquidation risk." */
+const CANCEL_LIQUIDATION = '3';
 
 export interface ClosePositionResult extends OkxResponse<{ instId: string; posSide: string; clOrdId: string; tag: string }> {}
 
@@ -115,6 +117,7 @@ export class Matcher {
       ordId: o.ordId,
       clOrdId: o.clOrdId,
       billId: this.ctx.orders.newBillId(),
+      subType: this.subType(o),
       tag: o.tag,
       fillPx: f ? fmt(f.px) : '',
       fillSz: f ? fmt(f.sz) : '0',
@@ -133,6 +136,19 @@ export class Matcher {
       ts,
       fillTime: ts,
     };
+  }
+
+  /**
+   * OKX's transaction type of a fill: 1 buy and 2 sell in net mode; 3 open long, 4 open short, 5 close long and
+   * 6 close short in long/short mode. A liquidation is 106 (buy) or 107 (sell) in net mode, 104 (of a long) or
+   * 105 (of a short) in long/short mode.
+   */
+  private subType(o: OrderRec): string {
+    const liquidation = o.category === 'full_liquidation';
+    if (o.posSide === 'net') return liquidation ? (o.side === 'buy' ? '106' : '107') : o.side === 'buy' ? '1' : '2';
+    if (liquidation) return o.posSide === 'long' ? '104' : '105';
+    const opening = (o.side === 'buy') === (o.posSide === 'long');
+    return o.posSide === 'long' ? (opening ? '3' : '5') : opening ? '4' : '6';
   }
 
   private pushPositions(instId: string, affected: OkxPosition | null): void {
@@ -256,6 +272,86 @@ export class Matcher {
     for (const order of this.ctx.orders.liveOrders(instId)) {
       if (order.px && market.book.crosses(order.side, order.px)) this.execute(order, market, 'M');
     }
+  }
+
+  /**
+   * Liquidates the isolated positions of an instrument whose liquidation price the mark price has reached (a long
+   * at or below it, a short at or above it: OKX liquidates at a margin level of 100% or less). `range` is for the
+   * replay of a time the exchange did not see: the lowest and the highest mark of a bar instead of the mark of
+   * now. Returns how many positions were liquidated.
+   */
+  checkLiquidations(instId: string, range?: { low: Dec; high: Dec }): number {
+    const market = this.ctx.markets.get(instId);
+    if (!market) return 0;
+    const low = range?.low ?? market.markPx;
+    const high = range?.high ?? market.markPx;
+    // A market that has no price yet (zero) liquidates nothing.
+    if (low.lte(0)) return 0;
+    let liquidated = 0;
+    for (const p of this.ctx.account.all()) {
+      if (p.instId !== instId) continue;
+      const liqPx = this.ctx.account.liquidationPx(p);
+      if (liqPx === null || (p.dir > 0 ? low.gt(liqPx) : high.lt(liqPx))) continue;
+      // Of a replayed bar only the range is known: the mark that triggered it is taken to be the liquidation price.
+      this.liquidate(p, range ? liqPx : market.markPx);
+      liquidated++;
+    }
+    return liquidated;
+  }
+
+  /**
+   * The exchange closes an isolated position, in OKX's order: the resting orders of the position are cancelled
+   * (cancelSource 3), then all of it is taken over (see Account.liquidate), and its stops go with it. The account
+   * sees what a real one would: the cancelled orders, a filled order of category `full_liquidation`, the position
+   * at zero and the balance without the margin. The takeover is not a trade of the market: nothing is printed, the
+   * order carries trade id 0 and its fill a negative one, and neither is a taker or a maker fill.
+   *
+   * Unverified: the order type and the reduce-only flag OKX gives its liquidation order; a reduce-only market
+   * order is shown, like the closing order of a stop.
+   */
+  private liquidate(p: PositionRec, markPx: Dec): void {
+    const now = this.ctx.now();
+    for (const o of this.ctx.orders.liveOrders(p.instId)) {
+      if (o.tdMode === p.mgnMode && o.posSide === p.posSide) this.cancel(o, CANCEL_LIQUIDATION, 'Risk cancellation was triggered. Pending order was canceled due to insufficient maintenance margin ratio and forced-liquidation risk.');
+    }
+    const sz = p.qty;
+    const out = this.ctx.account.liquidate(p, markPx, now);
+    const order: OrderRec = {
+      ordId: this.ctx.orders.newOrdId(),
+      clOrdId: '',
+      tag: '',
+      instId: p.instId,
+      tdMode: p.mgnMode,
+      side: p.dir > 0 ? 'sell' : 'buy',
+      posSide: p.posSide,
+      ordType: 'market',
+      px: null,
+      sz,
+      accFillSz: sz,
+      avgPx: out.px,
+      state: 'filled',
+      lever: p.lever,
+      reduceOnly: true,
+      fee: out.fee,
+      pnl: out.pnl,
+      cTime: now,
+      uTime: now,
+      cancelSource: '',
+      cancelSourceReason: '',
+      lastFill: { px: out.px, sz, time: now, tradeId: '0', execType: '', fee: out.fee, pnl: out.pnl },
+      amendResult: '',
+      reqId: '',
+      attachSl: null,
+      category: 'full_liquidation',
+    };
+    const fill = this.fillWire(order, markPx, '');
+    fill.tradeId = `-${fill.billId}`;
+    this.ctx.orders.addFill(fill);
+    this.ctx.orders.finish(order);
+    this.ctx.emit('order', orderToWire(order, true));
+    this.pushPositions(p.instId, out.position);
+    this.pushAccount();
+    this.dropOrphanStops(p.instId);
   }
 
   /** The position a stop protects, while it is still open in the stop's direction. */

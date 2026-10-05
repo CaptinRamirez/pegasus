@@ -30,6 +30,13 @@ export interface Fetchers {
   funding(instId: string, startTime: number): Promise<FundingRecord[] | null>;
   /** Rows of a full funding page: a shorter page is the last one */
   fundingPageSize: number;
+  /**
+   * Where the settlements come from when it is not the proxy venue of the backtest (Binance): 'okx' for the
+   * exchange's own history. Each venue is cached apart.
+   */
+  fundingVenue?: string;
+  /** The newest bars, the forming one included: the open of the running bar (the replay beside a live pot, C14) */
+  latest?(instId: string, bar: HistoryBar): Promise<Candle[]>;
 }
 
 export interface LoadOptions {
@@ -75,16 +82,31 @@ async function pageBackwards<T>(page: (cursor: number | undefined) => Promise<T[
   return [...rows.values()].sort((a, b) => timeOf(a) - timeOf(b));
 }
 
-/** Confirmed candles of one bar, oldest first: the cached ones plus the bars that closed since. */
-export async function loadCandles(instId: string, bar: HistoryBar, fetchers: Fetchers, cache: CacheStore, refresh = false): Promise<Candle[]> {
+/** The key of the time a cached series was first filled from (`since`); absent or null: the whole history. */
+const startKey = (key: string): string => `${key}.from`;
+
+/** Whether the series cached under `key` reaches back to `since` (null: the whole history). */
+function reachesBack(cache: CacheStore, key: string, since: number | null): boolean {
+  const from = cache.read<number>(startKey(key));
+  return from === null || (since !== null && from <= since);
+}
+
+/**
+ * Confirmed candles of one bar, oldest first: the cached ones plus the bars that closed since. With `since` an
+ * empty cache is filled from that time on only (the span of a pot, not the whole history); a cache filled from a
+ * later time than the one asked for (or from a `since` when the whole history is asked for) is filled again.
+ */
+export async function loadCandles(instId: string, bar: HistoryBar, fetchers: Fetchers, cache: CacheStore, refresh = false, since: number | null = null): Promise<Candle[]> {
   const key = `${instId}.candles-${bar}`;
-  const cached = (refresh ? null : cache.read<Candle[]>(key)) ?? [];
+  let cached = (refresh ? null : cache.read<Candle[]>(key)) ?? [];
+  if (cached.length > 0 && !reachesBack(cache, key, since)) cached = [];
   const newest = cached[cached.length - 1]?.ts ?? null;
-  const fetched = await pageBackwards((after) => fetchers.candles(instId, bar, after), (c) => c.ts, newest);
+  const fetched = await pageBackwards((after) => fetchers.candles(instId, bar, after), (c) => c.ts, newest ?? since);
   const added = fetched.filter((c) => c.confirm && (newest === null || c.ts > newest));
   if (added.length === 0 && cached.length > 0) return cached;
   const merged = [...cached, ...added];
   cache.write(key, merged);
+  if (cached.length === 0) cache.write(startKey(key), since);
   return merged;
 }
 
@@ -114,24 +136,35 @@ export function openInterestLevels(daily: readonly OkxOpenInterestHistoryRow[], 
   return normalizeOpenInterestHistory(daily, halfDay, { now: asOf, extendBeforeHalfDayCoverage: true }).map((s) => ({ ts: s.ts, value: s.oiCcy }));
 }
 
-/** Funding settlements, oldest first, paged forwards from the newest cached one; null when the proxy venue has no history for the instrument. */
-export async function loadFunding(instId: string, fetchers: Fetchers, cache: CacheStore, refresh = false): Promise<FundingRecord[] | null> {
-  const key = `${instId}.funding`;
-  const cached = (refresh ? null : cache.read<FundingRecord[]>(key)) ?? [];
+/** The cache key of an instrument's funding settlements: each venue apart. */
+export const fundingKey = (instId: string, fetchers: Pick<Fetchers, 'fundingVenue'>): string => `${instId}.funding${fetchers.fundingVenue ? `-${fetchers.fundingVenue}` : ''}`;
+
+/**
+ * Funding settlements, oldest first, paged forwards from the newest cached one; null when the proxy venue has no
+ * history for the instrument. With `since` an empty cache is filled from that time on only; a cache filled from a
+ * later time than the one asked for is filled again (see loadCandles).
+ */
+export async function loadFunding(instId: string, fetchers: Fetchers, cache: CacheStore, refresh = false, since: number | null = null): Promise<FundingRecord[] | null> {
+  const key = fundingKey(instId, fetchers);
+  let cached = (refresh ? null : cache.read<FundingRecord[]>(key)) ?? [];
+  if (cached.length > 0 && !reachesBack(cache, key, since)) cached = [];
   const merged = [...cached];
   for (;;) {
     const last = merged[merged.length - 1];
-    const page = await fetchers.funding(instId, last ? last.fundingTime + 1 : FUNDING_HISTORY_START);
+    const page = await fetchers.funding(instId, last ? last.fundingTime + 1 : (since ?? FUNDING_HISTORY_START));
     if (page === null) return merged.length > 0 ? merged : null;
     const fresh = page.filter((r) => !last || r.fundingTime > last.fundingTime).sort((a, b) => a.fundingTime - b.fundingTime);
     merged.push(...fresh);
     if (page.length < fetchers.fundingPageSize || fresh.length === 0) break;
   }
-  if (merged.length > cached.length) cache.write(key, merged);
+  if (merged.length > cached.length) {
+    cache.write(key, merged);
+    if (cached.length === 0) cache.write(startKey(key), since);
+  }
   return merged.length > 0 ? merged : null;
 }
 
-async function loadInstrument(instId: string, fetchers: Fetchers, cache: CacheStore, refresh: boolean): Promise<Instrument> {
+export async function loadInstrument(instId: string, fetchers: Fetchers, cache: CacheStore, refresh: boolean): Promise<Instrument> {
   const key = `${instId}.instrument`;
   const cached = refresh ? null : cache.read<Instrument>(key);
   if (cached) return cached;
@@ -162,7 +195,7 @@ export async function loadData(opts: LoadOptions, fetchers: Fetchers, cache: Cac
         if (funding === null) notes.push(`${instId}: no funding history on the proxy venue; run without the funding filter and without funding charges`);
       } catch (err) {
         // A failed refresh still has what was downloaded before.
-        funding = cache.read<FundingRecord[]>(`${instId}.funding`);
+        funding = cache.read<FundingRecord[]>(fundingKey(instId, fetchers));
         notes.push(`${instId}: funding history not updated (${(err as Error).message}); ${funding ? 'using the cached records' : 'run without the funding filter and without funding charges'}`);
       }
       if (funding) log(`${instId}: ${funding.length} funding settlements`);

@@ -251,6 +251,17 @@ export interface OkxLeverageInfo {
   lever: string;
 }
 
+/** The answer of POST /api/v5/account/position/margin-balance. */
+export interface OkxMarginAdjustment {
+  instId: string;
+  posSide: OkxPosSide;
+  amt: string;
+  type: 'add' | 'reduce';
+  /** "Real leverage after the margin adjustment" */
+  leverage: string;
+  ccy: string;
+}
+
 export type OkxTriggerPxType = 'last' | 'index' | 'mark';
 
 /** A stop-loss attached to an order, as echoed in the order's `attachAlgoOrds` (take-profit is not simulated). */
@@ -391,6 +402,11 @@ export interface OkxFill {
   ordId: string;
   clOrdId: string;
   billId: string;
+  /**
+   * OKX's transaction type: 1 buy, 2 sell (net mode); 3 to 6 open long, open short, close long, close short
+   * (long/short mode); 104 to 107 liquidation long, short, buy, sell. Absent on a fill kept from before it was recorded.
+   */
+  subType?: string;
   tag: string;
   fillPx: string;
   fillSz: string;

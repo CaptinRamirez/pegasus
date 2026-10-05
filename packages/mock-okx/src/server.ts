@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Engine } from './engine/engine.js';
-import { DEFAULT_PRICES, resolveInstruments } from './instruments.js';
+import { DEFAULT_MMR, DEFAULT_PRICES, resolveInstruments } from './instruments.js';
 import { RestRouter } from './rest-routes.js';
 import type { MockCredentials, MockOkxHandle, MockOkxOptions } from './types.js';
 import { MockWsServer } from './ws-server.js';
@@ -124,6 +124,7 @@ export async function startMockOkx(opts: MockOkxOptions = {}): Promise<MockOkxHa
     initialBalanceUsdt: opts.initialBalanceUsdt ?? '100000',
     takerFeeRate: opts.takerFeeRate ?? '0.0005',
     makerFeeRate: opts.makerFeeRate ?? '0.0002',
+    mmr: { ...DEFAULT_MMR, ...(opts.mmr ?? {}) },
     log,
   });
   const serverOpts: ExchangeServerOptions = { log };

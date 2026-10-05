@@ -192,6 +192,70 @@ describe('RiskEngine.check', () => {
   });
 });
 
+describe('RiskEngine.check in a campaign context', () => {
+  const engine = (overrides: Partial<RiskConfig> = {}) => new RiskEngine({ ...config, ...overrides }, new MemoryStore(), log, () => Date.UTC(2026, 0, 1, 12));
+  /** A market buy of 2 contracts (0.02 BTC) at 50,000: notional 1,000. The leverage set is the instrument's highest. */
+  const entry = (margin: string, overrides: Partial<RiskCheckInput> = {}): RiskCheckInput =>
+    input({ ordType: 'market', px: '', lever: '100', campaign: { leverage: '10', margin }, ...overrides });
+  /** The campaign's isolated long: 2 contracts bought at 50,000 */
+  const isolatedLong = (overrides: Partial<Position> = {}): Position => ({ ...position('BTC-USDT-SWAP', '1000', 'net', '2'), mgnMode: 'isolated', lever: '100', margin: '100', ...overrides });
+
+  it('an entry is checked on its notional over the margin it will hold, not on the leverage set; 1% is left for rounding', () => {
+    expect(engine().check(entry('100')).ok).toBe(true);
+    expect(engine().check(entry('99.5')).ok).toBe(true);
+    const over = engine().check(entry('98'));
+    expect(over).toMatchObject({ ok: false, code: 'MAX_LEVERAGE', details: { lever: '10.2041', limit: '10.1', notional: '1000', equity: '98', setting: '100' } });
+    // manual orders are as before: the leverage set is the limit's
+    expect(engine().check(input({ ordType: 'market', px: '', lever: '100' })).code).toBe('MAX_LEVERAGE');
+    expect(engine().check(input({ ordType: 'market', px: '', lever: '10' })).ok).toBe(true);
+  });
+
+  it('never above RISK_MAX_LEVERAGE when that is lower than the campaign leverage', () => {
+    expect(engine({ maxLeverage: '5' }).check(entry('100'))).toMatchObject({ code: 'MAX_LEVERAGE', details: { limit: '5.05' } });
+    expect(engine({ maxLeverage: '5' }).check(entry('200')).ok).toBe(true);
+    // a higher one does not raise the campaign's
+    expect(engine({ maxLeverage: '20' }).check(entry('98')).code).toBe('MAX_LEVERAGE');
+  });
+
+  it('an add counts the open profit of the position, so a pyramid add carried by it passes; an open loss weighs against it', () => {
+    // at 55,000 the 0.02 BTC held are 1,100 with 100 of profit: equity 99.9 (the margin less the add's fee) + 100
+    const held = [isolatedLong()];
+    const add = (notional: string, refPrice: string) => entry('99.9', { refPrice, notional, positions: held });
+    expect(engine().check(add('900', '55000')).ok).toBe(true); // 2,000 / 199.9
+    expect(engine().check(add('1000', '55000'))).toMatchObject({ code: 'MAX_LEVERAGE', details: { notional: '2100', equity: '199.9' } });
+    // at 47,500: 950 held with 50 of loss on 99.9; even a small add is refused
+    expect(engine().check(add('50', '47500'))).toMatchObject({ code: 'MAX_LEVERAGE', details: { notional: '1000', equity: '49.9' } });
+    // a cross position of the instrument is not the campaign's
+    expect(engine().check(entry('100', { positions: [position('BTC-USDT-SWAP', '1000', 'net', '2')] })).ok).toBe(true);
+  });
+
+  it('fails closed when the leverage cannot be computed', () => {
+    // a buy against an isolated short, no equity left, no reference price, an inverse contract
+    expect(engine().check(entry('100', { positions: [isolatedLong({ pos: '-2' })] })).code).toBe('MAX_LEVERAGE');
+    expect(engine().check(entry('100', { refPrice: '30000', positions: [isolatedLong()] })).code).toBe('MAX_LEVERAGE');
+    expect(engine().check(entry('0'))).toMatchObject({ code: 'MAX_LEVERAGE', message: expect.stringMatching(/cannot be computed/) });
+    expect(engine().check(entry('100', { refPrice: '0' })).code).toBe('MAX_LEVERAGE');
+    expect(engine().check(entry('100', { inst: { ...BTC, ctType: 'inverse' } })).code).toBe('MAX_LEVERAGE');
+  });
+
+  it('keeps the kill switch and the other limits: an entry is halted, an exit is not', () => {
+    const e = engine();
+    expect(e.check(entry('1000', { notional: '6000' })).code).toBe('MAX_ORDER_NOTIONAL');
+    e.setKillSwitch(true, 'test');
+    expect(e.check(entry('100')).code).toBe('KILL_SWITCH');
+    expect(e.check(input({ ordType: 'market', px: '', side: 'sell', reduceOnly: true, positions: [isolatedLong()], campaign: { leverage: '10', margin: '100' } })).ok).toBe(true);
+  });
+
+  it('margin moved by hand: adding always passes, taking out is new risk and halted by the kill switch', () => {
+    const e = engine();
+    expect(e.checkMarginTransfer('add').ok).toBe(true);
+    expect(e.checkMarginTransfer('reduce').ok).toBe(true);
+    e.setKillSwitch(true, 'test');
+    expect(e.checkMarginTransfer('add').ok).toBe(true);
+    expect(e.checkMarginTransfer('reduce')).toMatchObject({ ok: false, code: 'KILL_SWITCH' });
+  });
+});
+
 describe('RiskEngine.updateExposure: positions that have outgrown the limits', () => {
   const engine = () => new RiskEngine(config, new MemoryStore(), log, () => Date.UTC(2026, 0, 1, 12));
   const instrumentOf = (id: string): Instrument | undefined => INSTRUMENTS.get(id);

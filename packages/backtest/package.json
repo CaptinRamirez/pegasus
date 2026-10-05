@@ -3,8 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "exports": {
+    "./campaign": {
+      "types": "./src/campaign/index.ts",
+      "default": "./src/campaign/index.ts"
+    }
+  },
   "scripts": {
     "start": "tsx src/cli.ts",
+    "campaign": "tsx src/campaign/cli.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "build": "echo 'run with tsx, nothing to build'"

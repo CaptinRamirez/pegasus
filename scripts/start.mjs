@@ -1,16 +1,17 @@
 // One-command launcher behind `pnpm start` and start.bat: builds the web terminal, then starts the mock exchange
-// (with --mock, or when .env points the API at it) or the paper exchange (with --paper, or PAPER_TRADING=1 in
-// .env), the API and the built terminal in order and opens the browser.
+// (with --mock, or when .env points the API at it) or the paper exchange (with --paper or --campaign, or
+// PAPER_TRADING=1 in .env), the API and the built terminal in order and opens the browser.
 // The page is built once and served as it was built, so a `git pull` while the stack runs changes neither half.
-// Flags: --paper (paper trading: OKX's live prices, a simulated account), --mock (local mock exchange instead of
-// OKX), --dev (Vite dev server with hot reload), --no-open.
+// Flags: --paper (paper trading: OKX's live prices, a simulated account), --campaign (paper trading on the campaign
+// pot's own paper account, data/paper-campaign.json, with the campaign enabled; start-campaign.bat), --mock (local
+// mock exchange instead of OKX), --dev (Vite dev server with hot reload), --no-open.
 import { exec, execFileSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
-import { mockEnv, paperEnv, parseFlags } from './launch-options.mjs';
+import { campaignEnv, mockEnv, paperEnv, paperExchangeEnv, parseFlags, potStartOf } from './launch-options.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const envFile = join(root, '.env');
@@ -156,14 +157,19 @@ async function main() {
   // Paper trading is chosen on the command line or, for double-clicking start.bat, by PAPER_TRADING=1 in .env.
   const paper = flags.paper || (!flags.mock && base.PAPER_TRADING === '1');
   const paperPort = paper ? Number(base.PAPER_PORT ?? 9200) : null;
-  // --mock and --paper only change what the children see; .env is read here, never written.
-  const overrides = flags.mock ? mockEnv(Number(process.env.MOCK_OKX_PORT ?? 9100)) : paper ? paperEnv(paperPort) : {};
+  // --mock, --paper and --campaign only change what the children see; .env is read here, never written.
+  const overrides = flags.mock ? mockEnv(Number(process.env.MOCK_OKX_PORT ?? 9100)) : flags.campaign ? campaignEnv(paperPort, potStartOf(base)) : paper ? paperEnv(paperPort) : {};
   const env = { ...base, ...overrides };
   const apiPort = Number(env.API_PORT ?? 8787);
   const mockPort = localPort(env.OKX_REST_URL);
   if (paper && mockPort !== null) throw new Error('纸面交易需要 OKX 的真实行情，但 .env 里的 OKX_REST_URL 指向了本机的模拟交易所；请删掉 .env 里的四个 OKX_*_URL 再启动');
   const version = gitVersion();
-  say(`版本：${version ?? '未知（不是 git 仓库或没有安装 git）'}${flags.mock ? '，模拟交易所模式（--mock）' : ''}${paper ? '，纸面交易模式（OKX 实盘行情，虚拟账户，不会向 OKX 下单）' : ''}${flags.dev ? '，开发模式（--dev）' : ''}`);
+  const mode = flags.campaign
+    ? '，滚仓模式（纸面交易：OKX 实盘行情，资金池专用的虚拟账户 data/paper-campaign.json，账本 data/campaign-ledger.json，不会向 OKX 下单）'
+    : paper
+      ? '，纸面交易模式（OKX 实盘行情，虚拟账户，不会向 OKX 下单）'
+      : '';
+  say(`版本：${version ?? '未知（不是 git 仓库或没有安装 git）'}${flags.mock ? '，模拟交易所模式（--mock）' : ''}${mode}${flags.dev ? '，开发模式（--dev）' : ''}`);
 
   const busy = [];
   if (mockPort !== null && (await portOpen(mockPort))) busy.push(mockPort);
@@ -188,8 +194,9 @@ async function main() {
 
   if (paperPort !== null) {
     say(`正在启动纸面交易所（端口 ${paperPort}）；它先补算上次关闭以来的行情，隔得久会多等一会儿`);
-    // The same .env as the API: INSTRUMENTS and the PAPER_* settings come from it.
-    start('纸面交易所', 'packages/paper', ['--env-file-if-exists=../../.env', '--import', 'tsx', 'src/cli.ts'], { env: { PAPER_PORT: String(paperPort) } });
+    // The same .env as the API: INSTRUMENTS, the campaign's settings and the PAPER_* settings come from it; --campaign
+    // gives it the pot's own account (paperExchangeEnv).
+    start('纸面交易所', 'packages/paper', ['--env-file-if-exists=../../.env', '--import', 'tsx', 'src/cli.ts'], { env: paperExchangeEnv(flags, overrides, paperPort) });
     await waitFor('纸面交易所', () => portOpen(paperPort), 300_000);
     if (stopping) return;
   }

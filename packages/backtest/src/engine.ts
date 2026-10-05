@@ -75,7 +75,7 @@ const HALF_DAY_MS = DAY_MS / 2;
 export const SIGNAL_WINDOW_BARS = 300;
 /** The live service passes the newest page of funding records. */
 const FUNDING_RECORDS = 100;
-/** Weight of a lot's risk when another instrument holds a lot on the same side (docs/strategy.md 2.2). */
+/** Weight of a lot's risk when another instrument holds a lot on the same side (docs/archive/strategy-breakout.md 2.2). */
 const CORRELATED_HEAT = '1.5';
 
 /** Sizing of one cut's lot: the unit split across the cuts, with the stop multiple of the trend parameters. */
@@ -178,7 +178,7 @@ function correlated(lots: readonly GateLot[], side: EntrySide): boolean {
 }
 
 /**
- * The portfolio rule that blocks `candidate`, or null when it may be opened (docs/strategy.md 3.4):
+ * The portfolio rule that blocks `candidate`, or null when it may be opened (docs/archive/strategy-breakout.md 3.4):
  * the number of instruments with open lots, the marked notional of all lots plus the new one against
  * equity, and, when a heat cap is set, the risk of all lots to their current stops plus the new lot's
  * (x1.5 for lots whose side is shared by another instrument) against equity.
@@ -200,7 +200,7 @@ export function blockingGate(open: readonly GateLot[], candidate: GateLot, equit
 }
 
 /**
- * Contracts a lot sells under the trim rule (docs/strategy.md 3.4): its share of the instrument's
+ * Contracts a lot sells under the trim rule (docs/archive/strategy-breakout.md 3.4): its share of the instrument's
  * excess over trimPct x equity, converted at `px` and rounded down to lotSz. 0 when there is no excess.
  */
 export function trimContracts(lotNotional: DecimalInput, instNotional: DecimalInput, equity: DecimalInput, trimPct: DecimalInput, px: DecimalInput, inst: Instrument): Decimal {

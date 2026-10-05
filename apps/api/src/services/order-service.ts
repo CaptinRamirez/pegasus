@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { OkxApiError, OkxTransportError, OkxWsError, type OkxCancelOrderParams, type OkxOrder, type OkxOrderAck, type OkxPlaceAlgoParams, type OkxPlaceOrderParams } from '@pegasus/okx';
+import { OkxApiError, OkxTransportError, OkxWsError, type OkxCancelOrderParams, type OkxLeverageInfo, type OkxMarginBalance, type OkxOrder, type OkxOrderAck, type OkxPlaceAlgoParams, type OkxPlaceOrderParams, type OkxSetLeverageParams } from '@pegasus/okx';
 import {
   ceilToStep,
   contractsToCoin,
@@ -35,7 +35,7 @@ import type { OkxClients } from '../okx/clients.js';
 import { mapOrder } from '../okx/mappers.js';
 import type { AccountService } from './account.js';
 import type { MarketDataService } from './market-data.js';
-import { isClosingOrder, type ExposureReservation, type RiskEngine } from './risk-engine.js';
+import { isClosingOrder, type CampaignRiskContext, type ExposureReservation, type RiskCheckInput, type RiskEngine } from './risk-engine.js';
 
 const CL_ORD_PREFIX = 'pg';
 /** Longest an accepted order is held against the limits while the account mirror has not shown its effect. */
@@ -59,9 +59,10 @@ interface Reservation extends ExposureReservation {
   partial: { at: number; remainder: string } | null;
 }
 
-export function generateClOrdId(now = Date.now()): string {
+/** `prefix` tells who placed the order: `pg` the server, the campaign its own (CAMPAIGN_CL_ORD_PREFIX). */
+export function generateClOrdId(now = Date.now(), prefix = CL_ORD_PREFIX): string {
   // 2 + 9 + 8 = 19 alphanumeric chars, well under OKX's 32 limit
-  return `${CL_ORD_PREFIX}${now.toString(36)}${randomBytes(5).toString('hex').slice(0, 8)}`;
+  return `${prefix}${now.toString(36)}${randomBytes(5).toString('hex').slice(0, 8)}`;
 }
 
 /** Client id of the stop attached to an order, inside OKX's limit of 32 alphanumeric characters. */
@@ -112,18 +113,21 @@ export class OrderService {
     this.account.on('positions', (positions) => this.onPositions(positions));
   }
 
-  preview(req: PlaceOrderRequest): Promise<OrderPreview> {
-    return this.evaluate(req);
+  /** `campaign` is for the campaign's own orders (CampaignOrders); a request of the terminal never carries one. */
+  preview(req: PlaceOrderRequest, campaign?: CampaignRiskContext): Promise<OrderPreview> {
+    return this.evaluate(req, undefined, campaign);
   }
 
   /**
    * Size, price and risk-check an order. With `placeAs` (the clOrdId it is about to be submitted under) the
    * leverage is read fresh and an accepted opening order is reserved against the limits in the same
    * synchronous step as its check, so two concurrent orders can never both pass on the same snapshot.
+   * With `campaign` the order is an isolated one of a campaign, checked on the leverage its position runs at.
    */
-  private async evaluate(req: PlaceOrderRequest, placeAs?: string): Promise<OrderPreview> {
+  private async evaluate(req: PlaceOrderRequest, placeAs?: string, campaign?: CampaignRiskContext): Promise<OrderPreview> {
     const inst = this.market.requireInstrument(req.instId);
     const tdMode = req.tdMode ?? this.opts.defaultTdMode;
+    if (campaign && tdMode !== 'isolated') throw new AppError('VALIDATION', 'an order of a campaign is an isolated one');
     // An unknown position mode is never assumed to be net mode: the order would be built for the wrong account.
     const longShort = this.account.requireConfig().posMode === 'long_short_mode';
     const posSide = this.resolvePosSide(req, longShort);
@@ -180,7 +184,7 @@ export class OrderService {
     if (markRef === undefined) throw new AppError('NO_PRICE', `no reference price available yet for ${req.instId}`, 503);
     const stop = req.slTriggerPx === undefined ? null : this.attachedStop(req.slTriggerPx, req, inst, posSide, closing, sized.sz, refPrice);
     // The stop is not an input of the risk check: it never relaxes a limit.
-    const risk = this.risk.check({
+    const input: RiskCheckInput = {
       inst,
       side: req.side,
       posSide,
@@ -197,7 +201,9 @@ export class OrderService {
       // A retry under the same clOrdId is the same order, not a second one.
       reservations: this.liveReservations(placeAs ?? req.clOrdId),
       instrumentOf: (id) => this.market.specOf(id),
-    });
+    };
+    if (campaign) input.campaign = campaign;
+    const risk = this.risk.check(input);
     // No await between the check above and this line.
     if (placeAs !== undefined && risk.ok && !closing) {
       this.reservations.set(placeAs, { clOrdId: placeAs, instId: req.instId, side: req.side, posSide, notional, full: notional, expiresAt: Infinity, closedAt: null, partial: null });
@@ -286,7 +292,8 @@ export class OrderService {
     }
   }
 
-  async place(req: PlaceOrderRequest): Promise<{ order: Order; preview: OrderPreview }> {
+  /** `campaign` is for the campaign's own orders (CampaignOrders); a request of the terminal never carries one. */
+  async place(req: PlaceOrderRequest, campaign?: CampaignRiskContext): Promise<{ order: Order; preview: OrderPreview }> {
     const config = this.account.requireTrading();
     const clOrdId = req.clOrdId ?? generateClOrdId();
     // The page marks its retries as well: this memory does not survive a restart, and a restart in mid-request
@@ -299,7 +306,7 @@ export class OrderService {
         return { order: earlier, preview: this.previewOfExisting(earlier, inst) };
       }
     }
-    const preview = await this.evaluate(req, clOrdId);
+    const preview = await this.evaluate(req, clOrdId, campaign);
     if (!preview.risk.ok) {
       this.log.warn({ req, risk: preview.risk }, 'order rejected by risk engine');
       void this.store.addRiskEvent('ORDER_REJECTED', { req, risk: preview.risk });
@@ -669,6 +676,62 @@ export class OrderService {
     void this.store.addRiskEvent('CLOSE_POSITION', { instId: req.instId, posSide: posSide ?? 'net' });
     this.log.info({ instId: req.instId, posSide }, 'close-position submitted');
     return { instId: req.instId, posSide: posSide ?? 'net' };
+  }
+
+  // ---- isolated margin (the campaign's) ----
+
+  /**
+   * Sets the leverage of an instrument's isolated positions; in long/short mode that of one side, `posSide`, which OKX
+   * requires there. Not limited by RISK_MAX_LEVERAGE: that is the limit of the leverage the terminal sets (POST
+   * /api/account/leverage), and the caller is the campaign, whose orders are checked on the leverage their position
+   * runs at (CampaignRiskContext). On an open isolated position the exchange moves the difference of its initial margin
+   * between the position and the balance; while isolated orders of the instrument rest it refuses (59101).
+   */
+  async setIsolatedLeverage(instId: string, lever: string, posSide: PosSide): Promise<OkxLeverageInfo[]> {
+    const longShort = this.account.requireRestTrading().posMode === 'long_short_mode';
+    const params: OkxSetLeverageParams = { instId, lever, mgnMode: 'isolated' };
+    if (longShort) {
+      if (posSide === 'net') throw new AppError('VALIDATION', 'posSide (long|short) is required to set the isolated leverage in long/short mode');
+      params.posSide = posSide;
+    }
+    try {
+      const info = await this.account.setLeverage(params);
+      this.log.info({ ...params }, 'isolated leverage set');
+      return info;
+    } catch (err) {
+      this.log.warn({ ...params, err: (err as Error).message }, 'isolated leverage change failed');
+      throw exchangeError(err);
+    }
+  }
+
+  /**
+   * Adds margin to an isolated position, or takes margin out of it (POST /api/v5/account/position/margin-balance).
+   * `posSide` is `net` in net mode and the position's side in long/short mode; OKX takes it in both. Adding only
+   * takes risk away and is allowed at any time; taking out raises the leverage the position runs at and is refused
+   * while the kill switch is on (RiskEngine.checkMarginTransfer). The exchange's refusals come back as EXCHANGE with
+   * `details.okxCode`: 59300 no such position, 59301 more than it can spare (or than the balance has), 59302 an
+   * order that closes the position rests.
+   */
+  async adjustIsolatedMargin(req: { instId: string; posSide: PosSide; type: 'add' | 'reduce'; amt: string }): Promise<OkxMarginBalance> {
+    const longShort = this.account.requireRestTrading().posMode === 'long_short_mode';
+    if (longShort === (req.posSide === 'net')) throw new AppError('VALIDATION', `posSide ${req.posSide} does not name an isolated position in ${longShort ? 'long/short' : 'net'} mode`);
+    if (!D(req.amt).gt(0)) throw new AppError('VALIDATION', 'the amount of margin to move must be positive', 400, { amt: req.amt });
+    const risk = this.risk.checkMarginTransfer(req.type);
+    if (!risk.ok) {
+      this.log.warn({ req, risk }, 'margin transfer rejected by risk engine');
+      void this.store.addRiskEvent('MARGIN_REJECTED', { req, risk });
+      throw new RiskRejectedError(risk);
+    }
+    let result: OkxMarginBalance;
+    try {
+      result = await this.clients.rest.adjustMargin({ instId: req.instId, posSide: req.posSide, type: req.type, amt: req.amt });
+    } catch (err) {
+      this.log.warn({ req, err: (err as Error).message }, 'margin transfer failed');
+      throw exchangeError(err);
+    }
+    this.log.info({ ...req, leverage: result.leverage }, 'isolated margin moved');
+    void this.store.addRiskEvent('MARGIN_MOVED', { ...req, leverage: result.leverage });
+    return result;
   }
 
   private resolvePosSide(req: PlaceOrderRequest, longShort: boolean): PosSide {

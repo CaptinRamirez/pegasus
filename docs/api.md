@@ -49,8 +49,12 @@ Request bodies are validated with the zod schemas in `packages/shared/src/schema
 | GET | `/api/book` | `?instId` | `OrderBook` (top 50 each side) |
 | GET | `/api/ticker` | `?instId` | `Ticker` |
 | GET | `/api/risk` | – | `{ config: RiskConfig, state: RiskState }` |
-| GET | `/api/signals` | `?instId&phase&equity&riskPct&maxNotionalPct&lang` (all optional; `phase` is `0` or `12`, `lang` is `en` or `zh`) | `SignalsResponse`: `{ generatedAt, equity, phases, sizingParams, reports: SignalReportRow[] }` — daily trend-framework signals, one row per instrument and daily cut; see below and `packages/shared/src/signals.ts` |
+| GET | `/api/signals` | `?instId&phase&equity&riskPct&maxNotionalPct&lang` (all optional; `phase` is `0` or `12`, `lang` is `en` or `zh`) | `SignalsResponse`: `{ generatedAt, equity, phases, sizingParams, reports: SignalReportRow[] }` — daily trend-framework signals, one row per instrument and daily cut; without `instId` the instruments of `INSTRUMENTS` (not the campaign's, which are tracked beside them; any tracked instrument can be asked for by `instId`); see below and `packages/shared/src/signals.ts` |
 | POST | `/api/risk/kill-switch` | `KillSwitchRequest` (`{ enabled, reason?, rebase? }`) | `RiskState` (`cancelSweep` already reflects the new switch position); `409 DAILY_LOSS_ACTIVE` for a release without `rebase` while the daily loss limit is breached |
+| GET | `/api/campaign` | – | `CampaignView`: the campaign's status, pot, campaigns, bankings, samples and execution errors (see "Campaign"); `status: 'disabled'` while it is not enabled |
+| GET | `/api/campaign/log` | `?before&limit` (both optional; `limit` 1 to 100, default 20) | `CampaignLogPage`: `{ steps, total, next }`, the campaign's decision log newest first (see "Campaign") |
+| GET | `/api/campaign/replay` | – | `CampaignReplayView`: the replay beside the pot, its other structure, the pot's start value held in BTC and the reconciliation of the ledger with the replay, as last computed (see "The replay beside the pot"); `status: 'unavailable'` while there is no pot |
+| POST | `/api/campaign/replay` | – (a body, if any, is ignored) | `202` `CampaignReplayView` as it is now: a computation was started in the background (or one runs and another follows it); `200` with `status: 'unavailable'` when there is nothing to replay. The `campaign` message says when the new result is there |
 
 Daily PnL, its baseline and what survives a restart. `RiskState.dailyPnl` is `currentEquity - dayStartEquity`.
 `dayStartEquity` is the first total equity observed in the current UTC day and `baselineTs` when that was (epoch ms,
@@ -441,7 +445,25 @@ made after the page was reloaded is a new order under a new id and is not protec
 Open orders first.
 
 `Position.margin` is the posted margin of an isolated position and the initial margin requirement (`imr`) of a
-cross position; `""` when OKX reports neither.
+cross position; `""` when OKX reports neither. `Position.lever` is the leverage set for the position: an isolated
+position runs at `notionalUsd / margin`, which a margin added or taken out by hand changes (a campaign's position is set
+to the instrument's highest leverage and runs at 10x, see "Campaign"). `liqPx` is the exchange's estimated liquidation
+price (`""` when it reports none). `mgnRatio`, the margin level (`"1"` is 100%: an isolated position is liquidated at 1
+or below), and `mmr`, the maintenance margin requirement in the margin currency, are optional: absent when OKX reports
+none, never `"0"`.
+
+Liquidations. The exchange closes a liquidated isolated position with an order of its own. It reaches the terminal as
+an `order` message (and a row of `/api/orders/history`) with `category: 'full_liquidation'` (`'partial_liquidation'`
+for a partial one; `isLiquidationOrder` in `@pegasus/shared`), `clOrdId: ''` and `state: 'filled'`; its `pnl` and
+`fee` together are the lost margin. Its `fill` message carries `tradeId: '0'` (OKX's own list of fills, `/api/fills`,
+gives it a negative id), so a fill is identified by `ordId` together with `tradeId`: two liquidations of one
+instrument are two fills, in the terminal and in the journal (whose key is `(instId, tradeId, ordId)`). A `positions`
+message without the position and a `balance` without its margin follow. `Order.category` is optional: OKX's category
+of the order (`normal` for an order of the trader; also `adl`, `twap`, `delivery`, `ddh`, `auto_conversion`), absent
+until the exchange has reported the order (the row `POST /api/orders` answers with), for a category the server does
+not know, and on rows read back from the database. A liquidation is not an order of the server: no rule can stop it.
+The daily loss limit sees it through the equity like any other loss (the open loss while the mark falls, the rest when
+the margin is taken), and a position cannot lose more than its margin.
 
 Paper trading. With `PAPER_EXCHANGE_URL` set (the launcher's `--paper`, or `PAPER_TRADING=1` in `.env`) the API
 keeps reading market data from OKX's live hosts (`OKX_DEMO` is ignored, `demo` is `false`) and sends every signed
@@ -454,12 +476,251 @@ OKX protocol. The contract of this document does not change: routes, messages an
   exchange checks no signature), so one or two of the three being set is not an error in this mode.
 - The account is the paper account in `PAPER_STATE_FILE` (default `data/paper-account.json`): balance, positions,
   orders, stops and a funding ledger. Matching, the replay of the time it was not running, funding and what is
-  not simulated (liquidation, queue position, take-profit) are described in the README ("纸面交易") and in the
-  headers of `packages/paper/src/replay.ts`, `funding.ts` and `live-market.ts`.
+  not simulated (queue position, take-profit) are described in the README ("纸面交易") and in the headers of
+  `packages/paper/src/replay.ts`, `funding.ts` and `live-market.ts`. Isolated margin is simulated, the liquidation of
+  isolated positions on the mark price included (tier 1 only, in full); cross positions are not liquidated. Its rules
+  are in the header of `packages/mock-okx/src/engine/margin.ts`.
 - The launcher gives the API its own `STATE_FILE` (`data/pegasus-state.paper.json`) and no `DATABASE_URL`, so the
-  kill switch, the day baseline and the journal of the paper account are not mixed with a real account's.
+  kill switch, the day baseline and the journal of the paper account are not mixed with a real account's. With
+  `--campaign` the paper account is the campaign pot's own (`data/paper-campaign.json`) and the API's state file
+  `data/pegasus-state.campaign.json` (see "Campaign").
+- While `CAMPAIGN_ENABLED=1` the paper exchange trades the campaign's instruments (`CAMPAIGN_INSTRUMENTS`) besides its
+  own (`PAPER_INSTRUMENTS`, the ten of the campaign by default) and `INSTRUMENTS`.
 - Order and fill times of events that were replayed are the times they happened at (the end of their candle),
   not the time the program was started again.
+
+Campaign (paper trading only). The API can run the campaign rule of `packages/shared/src/campaign.ts`: isolated longs
+at 10x on a hard-capped pot. Settings (`.env`):
+
+| variable | default | |
+| --- | --- | --- |
+| `CAMPAIGN_ENABLED` | `0` | `1` enables it. The API refuses to start with it (`invalid configuration: CAMPAIGN_ENABLED=1 is refused: this stage of the campaign is paper only …`) unless it runs against the paper exchange (`PAPER_EXCHANGE_URL`, which `pnpm start --paper`, `pnpm start --campaign` and `PAPER_TRADING=1` set): in that mode no OKX key is used at all |
+| `CAMPAIGN_INSTRUMENTS` | `BTC`, `ETH`, `LTC`, `XRP`, `BCH`, `ETC`, `LINK`, `ADA`, `DOT`, `TRX` `-USDT-SWAP` (`CAMPAIGN_INSTRUMENTS` of `@pegasus/shared`, also the paper exchange's and the backtest's default list) | USDT swaps only. While the campaign is enabled they are tracked after `INSTRUMENTS` so that their markets are subscribed: market data, `hello.instruments`, `/api/instruments`; the paper exchange trades them too. The SIGNALS tab and the default list of `/api/signals` stay `INSTRUMENTS` |
+| `CAMPAIGN_POT_START` | `56` | what the pot starts with, USDT |
+| `CAMPAIGN_MIN_STAKE` | `5.6` | the smallest stake; one above `CAMPAIGN_POT_START` is refused |
+| `CAMPAIGN_STRUCTURE` | `pyramid` | `pyramid` (a campaign that works adds to itself) or `noadd` |
+| `CAMPAIGN_STATE_FILE` | `data/campaign-ledger.json` | the campaign's ledger (below), under the repository root unless the path is absolute; kept in this file whichever store the API uses. It belongs to the paper account the pot runs on: a new paper account wants a new ledger |
+
+The campaign's leverage (10) and the fee rate it sizes with are the rule's (`DEFAULT_CAMPAIGN_PARAMS`), not settings.
+A pot runs the structure, start and minimum stake it was started with; a later change of the settings applies to a
+new pot only.
+
+`pnpm start --campaign` (or `start-campaign.bat`) is paper trading on the pot's own paper account: the paper exchange
+keeps it in `data/paper-campaign.json` (a new account opens with `CAMPAIGN_POT_START` USDT, 56 unless `.env` says
+otherwise; an existing one keeps its balance) and trades the campaign's instruments, the API runs with
+`CAMPAIGN_ENABLED=1`, the ledger in `data/campaign-ledger.json` and its kill switch and day baseline in
+`data/pegasus-state.campaign.json`. Those win over `.env` for that run; the owner's paper account
+(`data/paper-account.json`) and the plain paper mode's state file are not touched. It cannot be combined with `--mock`.
+
+The campaign service (`apps/api/src/services/campaign.ts`; its header gives the live counterparts of the replay's
+timing rules C1-C13, the decisions are `campaign-step.ts`'s) runs the rule by itself:
+
+- The pot needs a paper account of its own. With a new ledger it starts only on an account whose total equity is
+  within 1% of `CAMPAIGN_POT_START` and that holds no position and no open order. Otherwise the status is `blocked`
+  (`ACCOUNT_NOT_DEDICATED`) and the message says to start the paper exchange on a new `PAPER_STATE_FILE` with
+  `PAPER_BALANCE` equal to the pot; the account is looked at again every 15 s and the API keeps running either way.
+  At the start the ledger records the time, the account's total equity and the mark price of `BTC-USDT-SWAP`.
+- At every 00:00 and 12:00 UTC close it polls the instruments' UTC bars (OKX `12Hutc`, and `1Dutc` at 00:00) every
+  5 s until the bar that closed is confirmed, for up to 10 minutes; an instrument still unconfirmed then gives no
+  signal at that close. Then, in this order: the liquidations, the ladder on the pot, the harvest sales, the exits,
+  the adds, the entries in `sameCloseOrder`. Entries and exits are read at 00:00 only, adds and the ladder at both
+  closes. The quantities are computed when an order is sent, at the open of the 12-hour bar after the close, with the
+  free cash left then; a stake below the minimum stake or the minimum order is a skip.
+- The pot's free cash is the account's available USDT less the ledger's banked amount; its value is the free cash
+  plus the equity of the open campaigns at the mark. Banking is a ledger entry: nothing is transferred on the paper
+  exchange. What an open, a sale and an exit took or returned is measured from the available balance before and after.
+- A liquidation ends its campaign as soon as the account service reports the order of category `full_liquidation`.
+  Every step also ends a campaign whose position is gone, as the exchange's order history explains it: a liquidation;
+  a close by an order that is not the campaign's (its client order id does not start with `pc`), which ends the
+  campaign `external`; or unknown, an execution error. A position on a campaign instrument that the ledger does not
+  know is reported (`foreign`), never touched, and no entry is made on that instrument.
+- Exits and harvest sales are retried while the failure is transient (`NOT_CONNECTED`, the exchange unreachable or
+  busy, an answer that was lost: the position is read before a retry, so an order that went through is not sent
+  again) for up to 30 minutes; an exit still not carried out is attempted again at every later step. Entries and adds
+  are retried on a transient failure within the 10 minutes after the close. Under the kill switch entries and adds
+  are skipped, logged; exits and sales go on.
+- A close the service could not process within 10 minutes (it was not running, the account could not be read) is
+  missed. At the next start or step an exit signal at a missed close is carried out then, late (`end.delayMs`); adds
+  and entries that were due are only logged (outcome `missed`), and the add reference moves as if the add had been
+  made; the ladder is looked at on the pot as it is then. `missedCloses` counts them.
+- Execution errors are counted exactly (`errorCount`): an action the rule decided that was not carried out as decided
+  (`RISK_REJECTED`, `EXCHANGE`, the order operations' `CAMPAIGN_…` codes; an exit that still fails after its retries
+  counts once at every step it fails at), one that left a position in a state the rule does not have
+  (`CAMPAIGN_OPEN_UNCONFIRMED`, whose position becomes the campaign's; `CAMPAIGN_MARGIN_FAILED`;
+  `CAMPAIGN_MARGIN_UNRESTORED`), an order the book filled only in part (`CAMPAIGN_PARTIAL_FILL`: the entry, add or sale
+  is kept as filled; an exit instead sells the rest again, up to three orders at a step, and only one that still leaves
+  part of the position is an error, `CAMPAIGN_EXIT_INCOMPLETE`, carried on at the next step with what it returned so
+  far), and a position gone without explanation (`CAMPAIGN_POSITION_UNEXPLAINED`, or `CAMPAIGN_CLOSE_UNRECORDED` for a
+  close of the campaign's own that the ledger did not record). Skips the rule foresees (`cash`, `min-size`, `add-cap`,
+  `kill-switch`, `foreign-position`, and `position-gone` for an add whose position is gone already, which the next
+  step's reconcile explains), retries that succeeded, liquidations and `external` ends are not errors.
+- After a step that leaves no campaign open and less free cash than the minimum stake the pot is `finished`
+  (`POT_FINISHED`) for good; no other pot is started.
+
+The ledger (`CAMPAIGN_STATE_FILE`) is JSON with a schema version (`version: 1`), written whole after every change
+through a temporary file and a rename, and read at start. A file that cannot be read or is not valid is never written
+over: the status is `blocked` (`LEDGER_UNREADABLE`), nothing is traded, and a copy is kept as `<file>.corrupt`. It
+holds the pot, every campaign, the bankings, one sample per close processed, the decision log of the last 1,000 steps,
+the execution errors (the last 500 with their details, all of them in the count), the closes missed and the last close
+processed. Its types and the ones of the routes are in `packages/shared/src/campaign-api.ts`.
+
+`GET /api/campaign` answers a `CampaignView` (also the `campaign` WebSocket message):
+
+```ts
+interface CampaignView {
+  status: 'disabled' | 'blocked' | 'running' | 'finished';
+  reason: { code: string; message: string } | null; // CAMPAIGN_DISABLED, LEDGER_UNREADABLE, ACCOUNT_NOT_DEDICATED, ACCOUNT_UNAVAILABLE, POT_FINISHED; null while running
+  params: CampaignParamsView;      // instruments, potStart, minStake, structure, leverage, feeRate, addStep, entryChannel, exitChannel, stakeFraction, rungFactor, bankFraction
+  pot: CampaignPotView | null;     // null until it started: startedAt, startValue, btcMarkAtStart, structure, start, minStake, banked, rungs,
+                                   // peak { ts, value }, finishedAt; from the account now: freeCash, openEquity, value (null while unknown); nextRung
+  campaigns: CampaignRecordView[]; // newest first: the ledger's record, its position now (position, null once ended) and valueMultiple
+  bankings: CampaignBankingRecord[]; // oldest first: { closeTs, rungs, value, target, fromCash, fraction, fromSales, amount }
+  samples: CampaignSampleRecord[];   // one per close processed, oldest first: { ts, freeCash, openEquity, banked, value, open }
+  errorCount: number;
+  errors: CampaignErrorRecord[];     // the last 50, newest first: { ts, closeTs, campaignId, instId, action, code, message, details }
+  missedCloses: number;
+  foreign: string[];                 // '<instId> <mgnMode> <posSide> <pos>' as the last step found them
+  lastStep: { seq: number; kind: 'close' | 'catch-up'; closeTs: number; startedAt: number; endedAt: number | null; errors: number } | null;
+  nextStep: { closeTs: number; daily: boolean } | null; // null unless running
+  replay: { status: 'unavailable' | 'running' | 'ready' | 'failed'; computedAt: number | null; mismatches: number | null } | null;
+                                   // the replay beside the pot (below): enough to know when to fetch GET /api/campaign/replay again; null while disabled
+  serverTime: number;
+}
+```
+
+A campaign record (`CampaignRecord`): `id` (`<instId>@<close of the entry>`), `instId`, `signalTs`, `entry` (its order,
+the `stake` measured from the balance, the position's `margin`, the `price` it was sized at), `adds`, `sales` (each
+with its order; a sale also with the contracts `held` before it and the `proceeds` banked), `addRef`, `addUnit` (base
+coin), `stake`, `basis`, `harvested`, `peak`, `pendingExit`, `end` and `multiple`. `end.kind` is `exit`, `liquidated`,
+`harvest` (a harvest sold all of it), `external` or `unknown`; `end.proceeds` is `''` when it was not measured
+(`external`, `unknown`), and an exit carries the `closeTs` of its signal and `delayMs`. `multiple` is
+(harvested + end.proceeds) / stake, null while open or not measured. Fees are positive when paid; the times of orders
+are the exchange's, the closes and the steps the service's.
+
+`GET /api/campaign/log` answers `{ steps, total, next }`: `limit` steps, newest first, older than the step `before`
+(its `seq`); `next` is the `before` of the next page, null at the end; `total` is the number of steps kept. A step:
+`{ seq, kind, closeTs, closes, startedAt, endedAt, before, inputs, actions, errors, notes }`, where `before` is the
+pot as the step found it, `inputs` what each instrument's bars said at each close (the 12-hour bar, the price, the
+daily close with the channel levels and the signals) and an action is `{ kind, closeTs, instId, campaignId, plan,
+outcome, reason, result, attempts, error, ts }`: `kind` `bank`, `sell`, `exit`, `add`, `enter`, or what a step found,
+`liquidated`, `gone`, `foreign`; `outcome` `done`, `skipped`, `missed`, `failed` (an execution error, `error` true) or
+`noted`.
+
+While the campaign is disabled the routes answer: `status: 'disabled'` with the settings (`replay: null`), an empty
+log, and a replay `unavailable` (`CAMPAIGN_DISABLED`), to a POST too.
+
+The replay beside the pot (`apps/api/src/services/campaign-replay.ts`, the library `@pegasus/backtest/campaign`,
+`packages/backtest/src/campaign/pot.ts`). The campaign replay of the backtest is run on OKX's bars from the pot's
+start with the pot's own rule (its structure, start and minimum stake, the service's other parameters), its free cash
+starting at the pot's `startValue`, within the exchange's limits (adds cut to `maxLever` x margin, liquidation at the
+first maintenance tier plus the fee, the modelled slippage) and with OKX's own funding history (what the paper
+exchange charged). It starts at the first 12-hour close after the pot's start (`startedAt`), the first one the service
+looks at, and ends (`through`) at the last 12-hour close every instrument's confirmed bars have, never after now (an
+instrument whose bars end more than a day earlier does not hold the others back). What the last close decided is
+filled at the open of the bar running after it, as the live service trades right after a close (rule C14 of
+`packages/backtest/src/campaign/engine.ts`). The same pot is replayed with the other structure (`noadd` beside
+`pyramid`, and the reverse), and the pot's start value is held in BTC: `startValue` x the `BTC-USDT-SWAP` 12-hour
+close over the price at the start (`btcMarkAtStart`, or when that is empty the close of the last 12-hour bar before
+the start).
+
+It is computed in the background, never in a step's way: after every step that processed a 00:00 UTC close, once at
+start when a pot exists, when the pot starts, and on `POST /api/campaign/replay`. One computation at a time (one asked
+for while another runs follows it, once); one that takes more than 5 minutes is given up (`REPLAY_TIMEOUT`) and the
+next one waits for it to end. What it reads from OKX's public endpoints (history candles, the newest candles for the
+running bar's open, the funding rate history) is kept in `data/campaign-replay/` under the repository root
+(git-ignored), so after the first computation only the newest rows are read. A failure (`REPLAY_FAILED`, with OKX's
+message) or a timeout leaves the last result in place with `status: 'failed'` and the `reason`; the next computation
+that succeeds clears it. When the summary changes (`status`, `computedAt`, `mismatches`) the `campaign` message is sent.
+
+```ts
+interface CampaignReplayView {
+  status: 'unavailable' | 'running' | 'ready' | 'failed';
+  // unavailable: CAMPAIGN_DISABLED, POT_NOT_STARTED, LEDGER_UNREADABLE; failed: REPLAY_FAILED, REPLAY_TIMEOUT; null otherwise
+  reason: { code: string; message: string } | null;
+  computedAt: number | null;        // when the result given was computed (server time)
+  through: number | null;           // the last 12-hour close it covers
+  same: CampaignReplayRun | null;   // the pot's own structure
+  other: CampaignReplayRun | null;  // the other structure, same start, same pot
+  heldBtc: Array<{ ts: number; value: string }>; // one per 12-hour close from the first after the start to `through`
+  reconciliation: CampaignReconciliation | null; // the ledger against `same`
+}
+interface CampaignReplayRun {
+  structure: 'pyramid' | 'noadd';
+  samples: Array<{ ts: number; value: string; banked: string }>; // one per 12-hour close, after its fills: free cash + open equity, and what was banked so far
+  campaigns: CampaignReplayCampaign[]; // oldest entry first
+  bankings: Array<{ closeTs: number; amount: string }>;
+  value: string; banked: string;    // at `through` (at the close it finished at, when `finished`)
+  finished: boolean;
+}
+interface CampaignReplayCampaign {
+  instId: string;
+  signalTs: number;                 // open time of the daily bar whose close gave the entry signal, as CampaignRecord.signalTs
+  entryTs: number;                  // the open it was filled at: the close after the signal
+  entryPx: string;                  // the fill: that open x (1 + slippage)
+  stake: string; adds: number;
+  end: 'exit' | 'liquidated' | 'open'; // a campaign the sale of a harvest closed is listed as 'exit' (its multiple holds what the harvests banked)
+  endTs: number | null;             // open time of the 12-hour bar it ended in (an exit: the open it was filled at, the close of its signal)
+  multiple: string | null;          // all it returned over its stake; null while open
+}
+```
+
+The reconciliation compares the ledger's campaigns with `same`'s, keyed by instrument and `signalTs`, which means the
+same on both sides and in the rows: the open time of the daily bar whose close gave the entry signal (the signal close
+is `signalTs` + 1 day, the ledger's `entry.closeTs`). Only what both
+sides can have by `through` counts: a ledger campaign entered at a later close is left out, and its adds, harvest
+sales and end after `through` count as not made yet (an exit or a harvest belongs to the close it was decided at; a
+liquidation, or a close by another order, to the 12-hour bar it happened in, and one in the bar running after
+`through` is not seen yet). A row is `match`, `differs`, `live-only` (the ledger has a campaign the replay has not:
+`campaignId` is the ledger's) or `replay-only` (`campaignId` null). Rows are oldest signal first; `matched`,
+`differing`, `liveOnly` and `replayOnly` count them, and `mismatches` in the `campaign` view is the last three
+together. `differences` lists `{ field, live, replay }` (empty for a match and for a one-sided row):
+
+| field | live | replay | compared |
+| --- | --- | --- | --- |
+| `entryClose` | `entry.closeTs` | the open the entry was filled at | exactly (epoch ms as a string) |
+| `entryPx` | `entry.avgPx`, the fill | open x (1 + slippage) | within `tolerances.entryPx` of the replay's, relative; null when the ledger has no fill price |
+| `adds` | adds made by `through` | adds made | exactly (a count) |
+| `sales` | harvest sales by `through` | harvest sales | exactly (a count) |
+| `end` | `exit`, `liquidated`, `harvest`, `external`, `unknown`, or `open` | `exit`, `liquidated`, `harvest`, or `open` | exactly |
+| `endClose` | an exit's signal close (`end.closeTs`), a harvest's close, else the open of the 12-hour bar of `end.ts` | `endTs` | exactly (epoch ms as a string), when both ended |
+| `multiple` | `multiple` | `multiple` | within `tolerances.multiple` x the larger of 1 and the replay's multiple, when both ended (the ledger has none while open) |
+
+`tolerances` is `{ entryPx: '0.01', multiple: '0.1' }` (fractions; `DEFAULT_RECONCILE_TOLERANCES`). Why: the replay fills
+at the open of the bar after the close times 1 + slippage (0.05% on BTC and ETH, 0.10% on the others), while the live
+service buys seconds to minutes after that close at the book's prices, walking the real book, and may fill later
+still within the close's 10-minute window: 1% covers that drift and still catches a fill at the wrong bar or price.
+At 10x every 0.1% between the live and the replayed fills of an entry and an exit moves a multiple by about 0.01 of
+the stake, and partial fills (a campaign that holds less than the rule's quantity, its adds and sales sized on what
+the book left), the live funding and a late exit after a missed close add to it: 0.1 of the stake (of the replay's
+multiple above 1). A liquidation is the exchange's, on its mark price and its own tiers, where the replay liquidates on
+the bar's traded low at the first tier: it can come a bar apart or not at all, which `end` and `endClose` show.
+
+`pnpm backtest:campaign --reconcile <ledger file>` prints the same from the command line (`--json` prints the view);
+see `pnpm backtest:campaign --help`.
+
+What the rest of the API shows of the campaign's orders (`apps/api/src/services/campaign-orders.ts`, whose header
+gives their steps: open, margin-neutral add, reduce, close):
+
+- A campaign's position is an isolated long whose leverage set is the instrument's highest (so that an add posts as
+  little margin as possible) while its margin keeps it at 10x: `Position.lever` shows the setting (`100` for BTC), the
+  margin is moved with OKX's `POST /api/v5/account/position/margin-balance`. An isolated order of the terminal on
+  that instrument would go into the same position; it is checked against the setting as always, so it is refused with
+  `MAX_LEVERAGE` while `RISK_MAX_LEVERAGE` is below it. Cross orders are a position of their own and not affected.
+- The campaign's orders pass the risk engine like any other, with one difference for the opening ones: `MAX_LEVERAGE`
+  measures the leverage the isolated position will run at, its notional over its margin plus open P&L at the
+  reference price, against the campaign's leverage (`RISK_MAX_LEVERAGE` when that is lower) plus 1% for rounding;
+  the leverage set is not looked at (`details`: `lever`, `limit`, `notional`, `equity`, `setting`). Every other rule,
+  the kill switch included, applies unchanged, and exits pass as always. A request of the terminal never carries
+  this context.
+- Taking margin out of an isolated position (the first step of a margin-neutral add) is refused while the kill
+  switch is on; adding margin never is.
+- The client order ids of its orders start with `pc`; the margin moves are recorded as `MARGIN_MOVED` risk events.
+- Their error codes (no route returns them; the service records them as execution errors): `CAMPAIGN_PAPER_ONLY` (403); `CAMPAIGN_BUSY`,
+  `CAMPAIGN_POSITION_EXISTS`, `CAMPAIGN_NO_POSITION`, `CAMPAIGN_POSITION_CONFLICT`, `CAMPAIGN_RESTING_ORDERS`,
+  `CAMPAIGN_LEVERAGE`, `CAMPAIGN_INSUFFICIENT_BALANCE`, `CAMPAIGN_ADD_CAP`, `CAMPAIGN_NOT_FILLED`,
+  `CAMPAIGN_POSITION_GONE` (409); `CAMPAIGN_MARGIN_FAILED` (`details.closed`), `CAMPAIGN_MARGIN_UNRESTORED`,
+  `CAMPAIGN_BALANCE_UNKNOWN` (502); `CAMPAIGN_OPEN_UNCONFIRMED`, `CAMPAIGN_ORDER_UNKNOWN` (504); besides
+  `RISK_REJECTED`, `EXCHANGE`, `SIZING`, `NO_BOOK` and `LEVERAGE_UNAVAILABLE`.
 
 Error codes returned by the API:
 
@@ -482,6 +743,7 @@ Error codes returned by the API:
 | `NO_BOOK` | opening market order refused because the order book is not synced or is stale, so slippage cannot be estimated (503) |
 | `NO_DATA` | `/api/ticker` or `/api/book` has nothing yet for the instrument, or the book is stale (503) |
 | `LEVERAGE_UNAVAILABLE` | the leverage lookup failed or returned nothing; an opening order is refused rather than checked against an unknown leverage (503) |
+| `CAMPAIGN_…` | the campaign's order operations and the execution errors of its ledger; no route returns them, they are in `GET /api/campaign` `errors` (see "Campaign") |
 | `ORDER_STATUS_UNKNOWN` | the exchange did not acknowledge the order (no answer, or OKX's own timeout codes `50004` / `51149`) and it could not be found by `clOrdId`, or a retry under an already used `clOrdId` could not be looked up and was not sent; the order may have filled or still be live, check positions, fills and open orders before retrying (504) |
 | `NOT_FOUND` | unknown route (404) |
 | `INTERNAL` | anything else (500) |
@@ -511,6 +773,11 @@ Protocol types are in `packages/shared/src/ws-protocol.ts`. The upgrade request 
    data "as of HH:MM:SS" once `account.lastSyncAt` is older than 90 s and disables order entry, Close and Cancel
    while `hello.account` is null or `canTrade` is false. Empty positions, orders and balance read as a flat account
    only when the last `hello` or a later `connection` carried a non-null `account.lastSyncAt`.
-5. The client may send `{ type: 'ping' }` (the terminal does every 15 s); the server answers `pong`.
+5. While the campaign is enabled: `{ type: 'campaign', data: CampaignView }` (see "Campaign") right after `hello` and
+   after every change of its ledger or of the summary of its replay (`replay`: its `status`, `computedAt` or
+   `mismatches`), to every authenticated client. It is a member of `ServerMessage` (`CampaignMessage`, exported next to
+   it); `ServerPush`, everything the server sends, is an alias of `ServerMessage`. A client that does not know the type
+   ignores it.
+6. The client may send `{ type: 'ping' }` (the terminal does every 15 s); the server answers `pong`.
    Liveness is checked with WebSocket protocol pings: the server pings every client every 15 s and
    terminates one that did not answer the previous ping. Browsers answer those on their own, also for a hidden tab.

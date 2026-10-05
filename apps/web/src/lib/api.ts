@@ -6,6 +6,9 @@ import type {
   Candle,
   CancelAlgoOrderRequest,
   CancelAllRequest,
+  CampaignLogPage,
+  CampaignReplayView,
+  CampaignView,
   CancelOrderRequest,
   CandlesQuery,
   ClosePositionRequest,
@@ -78,6 +81,12 @@ export type SignalsQuery = {
   lang?: Lang;
 };
 
+/** GET /api/campaign/log: `before` is the `next` of the page before (a step's seq); the server's limit is 1 to 100. */
+export type CampaignLogQuery = {
+  before?: number;
+  limit?: number;
+};
+
 export const api = {
   health: () => http<HealthResponse>('/api/health'),
   instruments: (token?: string) =>
@@ -110,4 +119,9 @@ export const api = {
   risk: () => http<RiskResponse>('/api/risk'),
   setKillSwitch: (body: KillSwitchRequest) => http<RiskState>('/api/risk/kill-switch', { body }),
   signals: (query: SignalsQuery = {}) => http<SignalsResponse>('/api/signals', { query }),
+  /** The campaign's state; also pushed as the `campaign` message while the campaign is enabled. */
+  campaign: () => http<CampaignView>('/api/campaign'),
+  campaignLog: (query: CampaignLogQuery = {}) => http<CampaignLogPage>('/api/campaign/log', { query }),
+  /** The replay beside the pot; an API without the route answers NOT_FOUND (404). */
+  campaignReplay: () => http<CampaignReplayView>('/api/campaign/replay'),
 };

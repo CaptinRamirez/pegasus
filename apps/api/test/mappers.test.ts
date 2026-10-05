@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { OkxAlgoOrder, OkxInstrument, OkxOrder, OkxPosition } from '@pegasus/okx';
-import { CANDLE_BARS } from '@pegasus/shared';
-import { failedAttachedStop, fillFromOrderPush, fromOkxBar, mapAlgoOrder, mapInstrument, mapOrder, mapPosition, toOkxBar } from '../src/okx/mappers.js';
+import { CANDLE_BARS, isLiquidationOrder } from '@pegasus/shared';
+import { failedAttachedStop, fillFromOrderPush, fillKey, fromOkxBar, mapAlgoOrder, mapInstrument, mapOrder, mapPosition, toOkxBar } from '../src/okx/mappers.js';
 
 const rawInst: OkxInstrument = {
   instType: 'SWAP', instId: 'BTC-USDT-SWAP', uly: 'BTC-USDT', instFamily: 'BTC-USDT', baseCcy: '', quoteCcy: '', settleCcy: 'USDT',
@@ -84,7 +84,7 @@ describe('algo orders', () => {
 describe('position margin', () => {
   const raw: OkxPosition = {
     instType: 'SWAP', instId: 'BTC-USDT-SWAP', mgnMode: 'cross', posId: '1', posSide: 'long', pos: '3', availPos: '3', avgPx: '60000', markPx: '61000',
-    upl: '30', uplRatio: '0.05', lever: '3', liqPx: '', margin: '', imr: '610', notionalUsd: '1830', ccy: 'USDT', cTime: '1700000000000', uTime: '1700000000123',
+    upl: '30', uplRatio: '0.05', lever: '3', liqPx: '', margin: '', imr: '610', mgnRatio: '', mmr: '7.32', notionalUsd: '1830', ccy: 'USDT', cTime: '1700000000000', uTime: '1700000000123',
   };
   it('takes the requirement (imr) for a cross position, which OKX reports without a margin', () => {
     expect(mapPosition(raw).margin).toBe('610');
@@ -94,6 +94,47 @@ describe('position margin', () => {
   });
   it('leaves the margin empty when OKX reports neither, instead of claiming 0', () => {
     expect(mapPosition({ ...raw, imr: '' }).margin).toBe('');
+  });
+  it('carries what an isolated position is liquidated by: its liquidation price, margin level and maintenance requirement', () => {
+    // a 10x isolated long of the mock's BTC swap (0.004 maintenance rate, 0.0005 taker fee)
+    const isolated: OkxPosition = { ...raw, mgnMode: 'isolated', posSide: 'net', pos: '1', avgPx: '60000.1', markPx: '60000', upl: '-0.001', lever: '100', liqPx: '54249.48', margin: '60.0001', imr: '', mgnRatio: '22.72', mmr: '2.4', notionalUsd: '600' };
+    expect(mapPosition(isolated)).toMatchObject({ mgnMode: 'isolated', posSide: 'net', pos: '1', lever: '100', liqPx: '54249.48', margin: '60.0001', mgnRatio: '22.72', mmr: '2.4', notionalUsd: '600' });
+    // not reported is left out, never 0: a margin level of 0 would read as a position about to be liquidated
+    expect(mapPosition(raw)).not.toHaveProperty('mgnRatio');
+    expect(mapPosition({ ...raw, mmr: '' })).not.toHaveProperty('mmr');
+    expect(mapPosition({ ...raw, mmr: '' })).not.toHaveProperty('mgnRatio');
+  });
+});
+
+describe('orders and fills of a liquidation', () => {
+  // the order OKX closes a liquidated isolated position with, as the orders channel pushes it
+  const liquidation: OkxOrder = {
+    ...rawOrder, ordId: '901', clOrdId: '', tdMode: 'isolated', side: 'sell', ordType: 'market', px: '', sz: '1', accFillSz: '1', fillPx: '54030.2', fillSz: '1', tradeId: '0',
+    avgPx: '54030.2', state: 'filled', lever: '100', reduceOnly: 'true', fee: '-0.27', pnl: '-59.73', category: 'full_liquidation', execType: '', fillFee: '-0.27',
+  };
+
+  it('maps the category, so that a liquidation can be told from a close of the trader', () => {
+    expect(mapOrder(liquidation)).toMatchObject({ ordId: '901', state: 'filled', tdMode: 'isolated', category: 'full_liquidation' });
+    expect(isLiquidationOrder(mapOrder(liquidation))).toBe(true);
+    expect(mapOrder(rawOrder).category).toBe('normal');
+    expect(isLiquidationOrder(mapOrder(rawOrder))).toBe(false);
+    expect(mapOrder({ ...liquidation, category: 'partial_liquidation' }).category).toBe('partial_liquidation');
+    // one this code does not know is left out rather than guessed
+    expect(mapOrder({ ...rawOrder, category: 'something_new' })).not.toHaveProperty('category');
+    expect(mapOrder({ ...rawOrder, category: '' })).not.toHaveProperty('category');
+  });
+
+  it('keys the fills of two liquidations of one instrument apart: both carry trade id 0', () => {
+    const first = fillFromOrderPush(liquidation);
+    const second = fillFromOrderPush({ ...liquidation, ordId: '902', fillSz: '2' });
+    expect(first).toMatchObject({ tradeId: '0', ordId: '901', fillSz: '1', fee: '-0.27', execType: '' });
+    expect(second).toMatchObject({ tradeId: '0', ordId: '902', fillSz: '2' });
+    if (!first || !second) throw new Error('no fill');
+    expect(fillKey(first)).not.toBe(fillKey(second));
+    // the same fill pushed twice has one key
+    expect(fillKey(first)).toBe(fillKey({ ...first }));
+    // trade ids are unique per instrument only
+    expect(fillKey({ ...first, instId: 'ETH-USDT-SWAP' })).not.toBe(fillKey(first));
   });
 });
 

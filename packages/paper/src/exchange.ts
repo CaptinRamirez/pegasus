@@ -2,7 +2,7 @@ import { Engine, type OkxInstrument, type OkxPosMode } from '@pegasus/mock-okx/e
 import type { BarSource } from './bars.js';
 import { FundingSettler, emptyFundingState, type FundingSource } from './funding.js';
 import { LiveMarket } from './live-market.js';
-import { replayInstrument } from './replay.js';
+import { replayInstrument, type ReplayResult } from './replay.js';
 import { backupState, loadState, saveState, type PaperState } from './state.js';
 
 export interface PaperConfig {
@@ -22,6 +22,12 @@ export interface PaperDeps {
   instruments: OkxInstrument[];
   bars: BarSource;
   funding: FundingSource;
+  /**
+   * Tier-1 maintenance margin rate by instrument, from the real exchange's position tiers: what an isolated
+   * position is liquidated by. An instrument without one gets the engine's fallback, half the initial margin
+   * rate of its highest leverage, which liquidates no later than OKX's own rate.
+   */
+  mmr?: Record<string, string>;
   log: (msg: string) => void;
   now?: () => number;
 }
@@ -87,6 +93,7 @@ export class PaperExchange {
       log: deps.log,
       markets: this.markets,
       defaultLever: config.defaultLever,
+      ...(deps.mmr === undefined ? {} : { mmr: deps.mmr }),
     });
     this.engine.clockOverride = null;
     this.restored = state !== null;
@@ -132,16 +139,31 @@ export class PaperExchange {
    */
   async catchUp(): Promise<void> {
     const now = this.now();
+    const replayed = new Map<string, ReplayResult>();
     for (const instId of this.markets.keys()) {
       const from = this.lastSeen[instId];
       if (from !== undefined) {
         const r = await replayInstrument(this.engine, this.deps.bars, instId, from, now);
-        if (r.bars > 0) this.deps.log(`${instId}: replayed ${new Date(from).toISOString()} to ${new Date(now).toISOString()} (${r.bars} bars): ${r.filled} resting order(s) filled, ${r.stopped} stop(s) triggered`);
+        if (r.bars > 0) this.deps.log(`${instId}: replayed ${new Date(from).toISOString()} to ${new Date(now).toISOString()} (${r.bars} bars): ${r.filled} resting order(s) filled, ${r.stopped} stop(s) triggered, ${r.liquidated} position(s) liquidated`);
+        replayed.set(instId, r);
       }
       this.lastSeen[instId] = now;
     }
     await this.settleFunding(now);
+    for (const [instId, r] of replayed) this.retest(instId, r);
     this.save();
+  }
+
+  /**
+   * The funding of a replayed span is settled after it, and for an isolated position that changes the margin:
+   * the liquidation price it leaves is held against the marks of the span once more. A payment made late in the
+   * span is so applied to prices from before it, which can only liquidate a position the exchange would have
+   * kept, never the reverse.
+   */
+  private retest(instId: string, replay: ReplayResult): void {
+    if (!replay.markRange) return;
+    const liquidated = this.engine.matcher.checkLiquidations(instId, replay.markRange);
+    if (liquidated > 0) this.deps.log(`${instId}: ${liquidated} position(s) liquidated: with the funding of the replayed time taken from the margin, a mark price of that time reached the liquidation price`);
   }
 
   private async settleFunding(now: number): Promise<void> {
@@ -195,8 +217,9 @@ export class PaperExchange {
       const now = this.now();
       if (from !== undefined && now - from > REPLAY_GAP_MS) {
         const r = await replayInstrument(this.engine, this.deps.bars, instId, from, now);
-        this.deps.log(`${instId}: quotes were missing since ${new Date(from).toISOString()}; replayed ${r.bars} bars: ${r.filled} resting order(s) filled, ${r.stopped} stop(s) triggered`);
+        this.deps.log(`${instId}: quotes were missing since ${new Date(from).toISOString()}; replayed ${r.bars} bars: ${r.filled} resting order(s) filled, ${r.stopped} stop(s) triggered, ${r.liquidated} position(s) liquidated`);
         await this.settleFunding(now);
+        this.retest(instId, r);
       }
       if (this.closed || !market.quoted) return;
       this.lastSeen[instId] = this.now();

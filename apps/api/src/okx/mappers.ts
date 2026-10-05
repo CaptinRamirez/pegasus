@@ -12,7 +12,7 @@ import type {
   OkxTicker,
   OkxTrade,
 } from '@pegasus/okx';
-import { CANDLE_BARS, type AlgoOrder, type Balance, type Candle, type CandleBar, type Fill, type FundingRate, type Instrument, type MarkPrice, type Order, type OrdType, type PosSide, type Position, type Ticker, type Trade } from '@pegasus/shared';
+import { CANDLE_BARS, ORDER_CATEGORIES, type AlgoOrder, type Balance, type Candle, type CandleBar, type Fill, type FundingRate, type Instrument, type MarkPrice, type Order, type OrdType, type PosSide, type Position, type Ticker, type Trade } from '@pegasus/shared';
 
 const num = (s: string | undefined): number => (s === undefined || s === '' ? 0 : Number(s));
 
@@ -161,6 +161,9 @@ export function mapOrder(o: OkxOrder): Order {
   // The trader must hear about the missing stop, so the reason travels with the order.
   const lost = attached.find(stopFailed);
   if (lost !== undefined) order.slFailReason = `${lost.failCode ?? ''}: ${lost.failReason ?? ''}`;
+  // What tells the exchange's own close of a position (a liquidation) from the trader's. A category this code does not know is left out.
+  const category = ORDER_CATEGORIES.find((c) => c === o.category);
+  if (category !== undefined) order.category = category;
   return order;
 }
 
@@ -186,7 +189,10 @@ export function mapAlgoOrder(a: OkxAlgoOrder): AlgoOrder {
   };
 }
 
-/** Builds a Fill from an `orders` channel push that carries a fill; returns null when the push has no fill. */
+/**
+ * Builds a Fill from an `orders` channel push that carries a fill; returns null when the push has no fill.
+ * The order of a liquidation carries trade id `0`: its fill keeps that id and is told apart by its order (fillKey).
+ */
 export function fillFromOrderPush(o: OkxOrder): Fill | null {
   if (!o.tradeId || o.tradeId === '' || !o.fillSz || o.fillSz === '0' || o.fillSz === '') return null;
   return {
@@ -223,7 +229,7 @@ export function mapFill(f: OkxFill): Fill {
 }
 
 export function mapPosition(p: OkxPosition): Position {
-  return {
+  const position: Position = {
     instId: p.instId,
     posSide: mapPosSide(p.posSide),
     mgnMode: p.mgnMode === 'isolated' ? 'isolated' : 'cross',
@@ -240,6 +246,10 @@ export function mapPosition(p: OkxPosition): Position {
     cTime: num(p.cTime),
     uTime: num(p.uTime),
   };
+  // Not reported is not zero: a margin level of 0 would read as a position about to be liquidated.
+  if (p.mgnRatio) position.mgnRatio = p.mgnRatio;
+  if (p.mmr) position.mmr = p.mmr;
+  return position;
 }
 
 export function mapBalance(b: OkxBalance): Balance {
@@ -252,3 +262,11 @@ export function mapBalance(b: OkxBalance): Balance {
 
 /** OKX keeps separate positions per instrument, margin mode and side; the key must carry all three. */
 export const positionKey = (p: { instId: string; mgnMode: string; posSide: PosSide }): string => `${p.instId}:${p.mgnMode}:${p.posSide}`;
+
+/**
+ * What makes a fill one fill: the trade and the order it filled. OKX trade ids are unique per instrument only,
+ * and a close made by the exchange itself is no trade at all: the order of every liquidation carries trade id 0,
+ * so two liquidations of one instrument differ in their order alone. (A liquidation is taken to be one fill per
+ * order; a self-trade, one trade id on two orders of this account, is two fills.)
+ */
+export const fillKey = (f: Pick<Fill, 'instId' | 'tradeId' | 'ordId'>): string => `${f.instId}:${f.tradeId}:${f.ordId}`;

@@ -17,7 +17,7 @@ describe.skipIf(!url)('PgStore', () => {
     await store.migrate();
     await store.migrate(); // idempotent
     const pk = await raw.unsafe(`SELECT array_length(conkey, 1) AS n FROM pg_constraint WHERE conname = 'fills_pkey' AND conrelid = 'fills'::regclass`);
-    expect(Number(pk[0]?.['n'])).toBe(2);
+    expect(Number(pk[0]?.['n'])).toBe(3);
     await raw.end();
     const order: Order = {
       ordId: `o-${Date.now()}`, clOrdId: 'pgtest', instId: 'BTC-USDT-SWAP', side: 'buy', posSide: 'net', tdMode: 'cross', ordType: 'limit', px: '50000.5', sz: '2.5',
@@ -39,6 +39,13 @@ describe.skipIf(!url)('PgStore', () => {
     await store.upsertFill({ ...fill, instId: 'ETH-USDT-SWAP', fillSz: '7' });
     expect((await store.listFills({ instId: 'ETH-USDT-SWAP', limit: 5 })).find((f) => f.tradeId === fill.tradeId)?.fillSz).toBe('7');
     expect((await store.listFills({ instId: 'BTC-USDT-SWAP', limit: 5 })).find((f) => f.tradeId === fill.tradeId)?.fillSz).toBe('2.5');
+    // two liquidations of one instrument: both fills carry trade id 0, their orders tell them apart
+    const run = String(Date.now());
+    const liquidation: Fill = { ...fill, tradeId: '0', ordId: `liqa${run}`, clOrdId: '', instId: 'LTC-USDT-SWAP', execType: '' };
+    await store.upsertFill(liquidation);
+    await store.upsertFill({ ...liquidation, ordId: `liqb${run}`, fillSz: '4' });
+    await store.upsertFill(liquidation);
+    expect((await store.listFills({ instId: 'LTC-USDT-SWAP', limit: 10 })).filter((f) => f.tradeId === '0' && f.ordId.endsWith(run)).map((f) => f.fillSz).sort()).toEqual(['2.5', '4']);
     await store.setSetting('risk.state', { killSwitch: true, killSwitchReason: 'x', dayStartTs: 1, dayStartEquity: '10' });
     expect(await store.getSetting<{ killSwitch: boolean }>('risk.state')).toMatchObject({ killSwitch: true });
     await store.addRiskEvent('TEST', { a: 1 });

@@ -16,6 +16,7 @@
     "dev:mock": "pnpm --filter @pegasus/mock-okx dev",
     "dev:paper": "pnpm --filter @pegasus/paper dev",
     "backtest": "pnpm --filter @pegasus/backtest start",
+    "backtest:campaign": "pnpm --filter @pegasus/backtest campaign",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",

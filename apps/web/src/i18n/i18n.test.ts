@@ -62,3 +62,20 @@ describe('texts of the server in the language of the page', () => {
     expect(inEveryLang((t) => t.ticket.errDuplicate)).toEqual({ en: en.ticket.errDuplicate, zh: zh.ticket.errDuplicate });
   });
 });
+
+describe('the campaign tab in both languages', () => {
+  /** Dotted paths of every entry: the leaves are texts and functions. */
+  const paths = (o: object, prefix = ''): string[] =>
+    Object.entries(o).flatMap(([k, v]) => (typeof v === 'object' && v !== null ? paths(v as object, `${prefix}${k}.`) : [`${prefix}${k}`]));
+
+  it('has the same entries in Chinese as in English', () => {
+    expect(paths(zh.campaign).sort()).toEqual(paths(en.campaign).sort());
+    expect(paths(zh.tabs).sort()).toEqual(paths(en.tabs).sort());
+  });
+
+  it('explains every status reason the API documents', () => {
+    const codes = ['CAMPAIGN_DISABLED', 'LEDGER_UNREADABLE', 'ACCOUNT_NOT_DEDICATED', 'ACCOUNT_UNAVAILABLE', 'POT_FINISHED'];
+    expect(Object.keys(en.campaign.reasons)).toEqual(codes);
+    expect(Object.keys(zh.campaign.reasons)).toEqual(codes);
+  });
+});

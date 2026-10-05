@@ -14,8 +14,9 @@ import type {
   Ticker,
   Trade,
 } from '@pegasus/shared';
+import { blockedView, disabledView, runningView } from '../test/campaign-fixtures';
 import { STOPS_STALE_MS, accountAsOf, accountUnknown, activeAlerts, isStreamStale, killSwitchSweepNotice, overLimitNotice, stopsAsOf, trimAdvice, trimShares } from './alerts';
-import { LOST_STOP_RECENT_MS, applyAlgoOrders, applyOrderHistorySeed, applyServerMessage, applyWsStatus, pushToast, stampMessage } from './reducers';
+import { LOST_STOP_RECENT_MS, applyAlgoOrders, applyCampaign, applyOrderHistorySeed, applyServerMessage, applyWsStatus, pushToast, stampMessage } from './reducers';
 import { ACCOUNT_NOT_LOADED_BLOCK, READ_ONLY_KEY_BLOCK, getTradingBlock } from './store';
 import { LIMITS, initialState, type TerminalState } from './types';
 
@@ -440,6 +441,37 @@ describe('applyServerMessage', () => {
     expect(next.toasts?.[0]?.message).toContain('BAD');
     expect(applyServerMessage(s, { type: 'pong', data: { ts: 1 } })).toEqual({});
     expect(applyServerMessage(s, { type: 'subscribed', data: { instId: 'BTC-USDT-SWAP', bar: '5m' } })).toEqual({});
+  });
+});
+
+describe('the campaign view', () => {
+  it('the campaign message replaces the view and counts as a message from the server', () => {
+    let s = stateAfterHello();
+    expect(s.campaign).toBeNull();
+    s = { ...s, ...applyServerMessage(s, { type: 'campaign', data: runningView }) };
+    expect(s.campaign).toBe(runningView);
+    expect(stampMessage(s, { type: 'campaign', data: runningView }, 77)).toEqual({ lastMessageAt: 77 });
+    // every change of the ledger sends the whole view again
+    const next = { ...runningView, errorCount: 3, serverTime: runningView.serverTime + 1_000 };
+    s = { ...s, ...applyServerMessage(s, { type: 'campaign', data: next }) };
+    expect(s.campaign).toBe(next);
+  });
+
+  it('an older view never replaces a newer one: the reply of a slow GET /api/campaign after a push', () => {
+    const s: TerminalState = { ...initialState('tok'), campaign: runningView };
+    const older = { ...blockedView, serverTime: runningView.serverTime - 1 };
+    expect(applyCampaign(s, older)).toEqual({});
+    expect(applyServerMessage(s, { type: 'campaign', data: older })).toEqual({});
+    // the same time or later replaces it: a view read over HTTP after the server switched the campaign off
+    const disabled = { ...disabledView, serverTime: runningView.serverTime };
+    expect(applyCampaign(s, disabled)).toEqual({ campaign: disabled });
+  });
+
+  it('a hello keeps the view (the server sends its own right after it); signing out drops it', () => {
+    let s: TerminalState = { ...stateAfterHello(), campaign: runningView };
+    s = { ...s, ...applyServerMessage(s, { type: 'hello', data: hello }) };
+    expect(s.campaign).toBe(runningView);
+    expect(initialState('tok').campaign).toBeNull();
   });
 });
 

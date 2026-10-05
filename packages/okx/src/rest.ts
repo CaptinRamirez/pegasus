@@ -18,6 +18,8 @@ import type {
   OkxInstType,
   OkxInstrument,
   OkxLeverageInfo,
+  OkxMarginBalance,
+  OkxMarginBalanceParams,
   OkxMarkPrice,
   OkxMarkPriceCandleRow,
   OkxOpenInterest,
@@ -265,6 +267,17 @@ export class OkxRestClient {
 
   getLeverageInfo(instId: string, mgnMode: 'cross' | 'isolated'): Promise<OkxLeverageInfo[]> {
     return this.getData<OkxLeverageInfo>('/api/v5/account/leverage-info', { instId, mgnMode }, true);
+  }
+
+  /**
+   * Adds margin to an isolated position from the available balance, or takes margin out of it. Taking margin out
+   * raises the real leverage of the position; OKX refuses an amount beyond what the position can spare (59301),
+   * a position that does not exist (59300) and an adjustment while an order that closes the position rests (59302).
+   */
+  async adjustMargin(params: OkxMarginBalanceParams): Promise<OkxMarginBalance> {
+    const [r] = await this.postData<OkxMarginBalance>('/api/v5/account/position/margin-balance', params);
+    if (!r) throw new OkxApiError('EMPTY', 'no margin adjustment returned', '/api/v5/account/position/margin-balance');
+    return r;
   }
 
   // ---- trade ----

@@ -20,7 +20,8 @@
   },
   "dependencies": {
     "@pegasus/mock-okx": "workspace:*",
-    "@pegasus/okx": "workspace:*"
+    "@pegasus/okx": "workspace:*",
+    "@pegasus/shared": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

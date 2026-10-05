@@ -19,6 +19,14 @@ export function stopUnconfirmedAfterCancel(order: Order): boolean {
   return order.slTriggerPx !== undefined && order.state === 'canceled' && D(order.accFillSz || '0').gt(0);
 }
 
+/**
+ * The exchange closed the position itself: the order is the one of a liquidation, in full or in part. Such an
+ * order was never placed by the trader (it has no clOrdId), and what it lost is the margin of the position.
+ */
+export function isLiquidationOrder(order: Pick<Order, 'category'>): boolean {
+  return order.category === 'full_liquidation' || order.category === 'partial_liquidation';
+}
+
 /** Whether the position is long or short; null for a flat one. In net mode the sign of `pos` decides. */
 export function positionDirection(p: Pick<Position, 'posSide' | 'pos'>): 'long' | 'short' | null {
   const pos = D(p.pos || '0');

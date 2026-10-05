@@ -1,8 +1,8 @@
 import { create } from 'zustand';
-import type { AlgoOrderList, CandleBar, Fill, InstId, Instrument, Localized, Order, RiskState, ServerMessage } from '@pegasus/shared';
+import type { AlgoOrderList, CampaignView, CandleBar, Fill, InstId, Instrument, Localized, Order, RiskState, ServerMessage } from '@pegasus/shared';
 import { readStoredToken, writeStoredToken } from '../lib/http';
 import type { WsStatus } from '../lib/ws';
-import { applyAlgoOrders, applyOrderHistorySeed, applyRiskReply, applyServerMessage, applyWsStatus, mergeFills, pushToast, stampMessage } from './reducers';
+import { applyAlgoOrders, applyCampaign, applyOrderHistorySeed, applyRiskReply, applyServerMessage, applyWsStatus, mergeFills, pushToast, stampMessage } from './reducers';
 import { emptyMarket, initialState, type MarketData, type TerminalState, type TicketPrefillInput, type ToastKind } from './types';
 
 export interface TerminalActions {
@@ -12,6 +12,8 @@ export interface TerminalActions {
   applyRiskReply: (risk: RiskState) => void;
   /** Applies the algo order list returned by an HTTP call (the Refresh of the Stops tab). */
   applyAlgoOrders: (list: AlgoOrderList) => void;
+  /** Applies the campaign view returned by GET /api/campaign (an HTTP reply: it does not move lastMessageAt). */
+  applyCampaignView: (view: CampaignView) => void;
   setWsStatus: (status: WsStatus) => void;
   selectInstrument: (instId: InstId) => void;
   setBar: (bar: CandleBar) => void;
@@ -38,6 +40,7 @@ export const useStore = create<TerminalStore>()((set, get) => ({
   applyMessage: (msg) => set((s) => ({ ...applyServerMessage(s, msg), ...stampMessage(s, msg, Date.now()) })),
   applyRiskReply: (risk) => set(applyRiskReply(risk)),
   applyAlgoOrders: (list) => set((s) => applyAlgoOrders(s, list)),
+  applyCampaignView: (view) => set((s) => applyCampaign(s, view)),
   setWsStatus: (wsStatus) => set((s) => applyWsStatus(s, wsStatus, Date.now())),
   selectInstrument: (instId) => {
     if (get().selectedInstId === instId) return;

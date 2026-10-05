@@ -19,6 +19,14 @@ describe('MemoryStore', () => {
     expect((await s.listFills({ limit: 10 })).map((f) => f.instId).sort()).toEqual(['BTC-USDT-SWAP', 'ETH-USDT-SWAP']);
     expect((await s.listFills({ instId: 'ETH-USDT-SWAP', limit: 10 }))[0]?.fillSz).toBe('7');
   });
+  it('keeps the fills of two liquidations of one instrument apart: both carry trade id 0', async () => {
+    const s = new MemoryStore();
+    const liquidation: Fill = { ...fill, tradeId: '0', ordId: 'liq1', execType: '' };
+    await s.upsertFill(liquidation);
+    await s.upsertFill({ ...liquidation, ordId: 'liq2', fillSz: '3' });
+    await s.upsertFill(liquidation);
+    expect((await s.listFills({ limit: 10 })).map((f) => `${f.ordId}:${f.fillSz}`).sort()).toEqual(['liq1:1', 'liq2:3']);
+  });
   it('never regresses an order to an older snapshot', async () => {
     const s = new MemoryStore();
     await s.upsertOrder({ ...order, state: 'filled', accFillSz: '1', uTime: 20 });

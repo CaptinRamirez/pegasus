@@ -3,6 +3,8 @@ import type { Store } from './db/store.js';
 import type { Logger } from './logger.js';
 import type { OkxClients } from './okx/clients.js';
 import type { AccountService } from './services/account.js';
+import type { CampaignService } from './services/campaign.js';
+import type { CampaignOrders } from './services/campaign-orders.js';
 import type { MarketDataService } from './services/market-data.js';
 import type { OrderService } from './services/order-service.js';
 import type { RiskEngine } from './services/risk-engine.js';
@@ -20,4 +22,8 @@ export interface Deps {
   orders: OrderService;
   signals: SignalsService;
   hub: Hub;
+  /** The campaign's order operations; only while the campaign is enabled (CAMPAIGN_ENABLED=1, paper trading only). */
+  campaignOrders?: CampaignOrders;
+  /** The service that runs the campaigns and keeps the pot's ledger; only while the campaign is enabled. */
+  campaign?: CampaignService;
 }

@@ -4,7 +4,7 @@ import { utcDayStart } from './time.js';
 import type { Candle, Instrument, Lang } from './types.js';
 
 /**
- * Daily signal arithmetic for the low-frequency trend framework (docs/strategy.md).
+ * Daily signal arithmetic for the low-frequency trend framework (docs/archive/strategy-breakout.md).
  *
  * Everything here is a pure function of CONFIRMED daily candles sorted oldest
  * first. The forming bar must be excluded by the caller: every rule in the
@@ -63,7 +63,7 @@ export interface TrendParams {
   crowdedOiChange: string;
   /**
    * Allow short entries. Off by default: short breakouts showed no expectancy in the backtest
-   * (docs/strategy.md 3.1). Short exits and the short sizing plan are computed either way.
+   * (docs/archive/strategy-breakout.md 3.1). Short exits and the short sizing plan are computed either way.
    */
   allowShort: boolean;
   /** Size multiplier for every short entry (the cost of the positive drift) */

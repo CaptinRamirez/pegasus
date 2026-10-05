@@ -187,6 +187,10 @@ export interface OkxPosition {
   margin: string;
   /** Initial margin requirement; the figure a cross position reports instead of margin */
   imr: string;
+  /** Margin level of the position, 1 being 100%: an isolated position is liquidated at 1 or less; '' when not reported */
+  mgnRatio: string;
+  /** Maintenance margin requirement of the position, in its margin currency; '' when not reported */
+  mmr: string;
   notionalUsd: string;
   ccy: string;
   cTime: string;
@@ -199,6 +203,27 @@ export interface OkxLeverageInfo {
   mgnMode: 'cross' | 'isolated';
   posSide: OkxPosSide;
   lever: string;
+}
+
+/** POST /api/v5/account/position/margin-balance: add margin to an isolated position, or take margin out of it. */
+export interface OkxMarginBalanceParams {
+  instId: string;
+  /** OKX requires it here in both position modes: `net` in net mode, the side of the position in long/short mode */
+  posSide: OkxPosSide;
+  type: 'add' | 'reduce';
+  /** Amount to add or to take out, in the margin currency */
+  amt: string;
+  ccy?: string;
+}
+
+export interface OkxMarginBalance {
+  instId: string;
+  posSide: OkxPosSide;
+  amt: string;
+  type: 'add' | 'reduce';
+  /** Real leverage of the position after the adjustment */
+  leverage: string;
+  ccy: string;
 }
 
 export interface OkxOrder {
@@ -225,6 +250,10 @@ export interface OkxOrder {
   fee: string;
   feeCcy: string;
   pnl: string;
+  /**
+   * `normal` for an order of the user; `full_liquidation` / `partial_liquidation` and `adl` for the order the
+   * exchange closes a position with (its `tradeId` is then `0` and `clOrdId` empty); also `twap`, `delivery`, `ddh`, `auto_conversion`
+   */
   category: string;
   /** Legacy single stop-loss trigger of the order itself; '' when none */
   slTriggerPx?: string;

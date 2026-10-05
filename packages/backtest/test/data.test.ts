@@ -2,7 +2,7 @@ import type { OkxOpenInterestHistoryRow } from '@pegasus/okx';
 import type { Candle, FundingRecord } from '@pegasus/shared';
 import { describe, expect, it } from 'vitest';
 import { MemoryCache } from '../src/data/cache.js';
-import { FUNDING_HISTORY_START, loadCandles, loadData, loadFunding, loadOpenInterestRows, openInterestLevels, type Fetchers } from '../src/data/load.js';
+import { FUNDING_HISTORY_START, fundingKey, loadCandles, loadData, loadFunding, loadOpenInterestRows, openInterestLevels, type Fetchers } from '../src/data/load.js';
 import { binanceSymbol } from '../src/data/sources.js';
 import { bar, DAY, HALF_DAY, HOUR, instrument, T0 } from './helpers.js';
 
@@ -109,6 +109,33 @@ describe('candle cache', () => {
     expect(await loadCandles('AAA-USDT-SWAP', '1Dutc', exchange.fetchers(), cache, true)).toHaveLength(403);
     expect(exchange.calls.candles).toBe(6);
   });
+
+  it('with `since` reads that span only, and fills the cache again for an earlier time or the whole history', async () => {
+    const exchange = new FakeExchange(251);
+    const cache = new MemoryCache();
+    // The newest page reaches back to day 151, past day 200: one call.
+    const span = await loadCandles('AAA-USDT-SWAP', '1Dutc', exchange.fetchers(), cache, false, T0 + 200 * DAY);
+    expect(exchange.calls.candles).toBe(1);
+    expect(span[0]?.ts).toBe(T0 + 151 * DAY);
+    expect(span).toHaveLength(99);
+    // A later time is covered by what is cached: only the newest page is read.
+    exchange.calls.candles = 0;
+    expect(await loadCandles('AAA-USDT-SWAP', '1Dutc', exchange.fetchers(), cache, false, T0 + 220 * DAY)).toEqual(span);
+    expect(exchange.calls.candles).toBe(1);
+    // An earlier time is not: filled again from there.
+    exchange.calls.candles = 0;
+    const earlier = await loadCandles('AAA-USDT-SWAP', '1Dutc', exchange.fetchers(), cache, false, T0 + 100 * DAY);
+    expect(exchange.calls.candles).toBe(2);
+    expect(earlier[0]?.ts).toBe(T0 + 51 * DAY);
+    // Nor is the whole history the backtest wants.
+    exchange.calls.candles = 0;
+    expect(await loadCandles('AAA-USDT-SWAP', '1Dutc', exchange.fetchers(), cache)).toHaveLength(250);
+    expect(exchange.calls.candles).toBe(4);
+    // A cache that holds the whole history serves any span with the newest page.
+    exchange.calls.candles = 0;
+    expect(await loadCandles('AAA-USDT-SWAP', '1Dutc', exchange.fetchers(), cache, false, T0 + 10 * DAY)).toHaveLength(250);
+    expect(exchange.calls.candles).toBe(1);
+  });
 });
 
 describe('funding cache', () => {
@@ -130,6 +157,27 @@ describe('funding cache', () => {
     const exchange = new FakeExchange(80);
     exchange.hasFunding = false;
     expect(await loadFunding('AAA-USDT-SWAP', exchange.fetchers(), new MemoryCache())).toBeNull();
+  });
+
+  it('with `since` starts there, fills the cache again for an earlier time, and keeps each venue apart', async () => {
+    const exchange = new FakeExchange(80);
+    const cache = new MemoryCache();
+    const first = await loadFunding('AAA-USDT-SWAP', exchange.fetchers(), cache, false, T0 + 70 * DAY);
+    expect(exchange.fundingStarts).toEqual([T0 + 70 * DAY]);
+    expect(first).toHaveLength(30);
+    exchange.fundingStarts = [];
+    expect(await loadFunding('AAA-USDT-SWAP', exchange.fetchers(), cache, false, T0 + 75 * DAY)).toHaveLength(30);
+    expect(exchange.fundingStarts).toEqual([T0 + 79 * DAY + 16 * HOUR + 1]);
+    exchange.fundingStarts = [];
+    expect(await loadFunding('AAA-USDT-SWAP', exchange.fetchers(), cache, false, T0 + 60 * DAY)).toHaveLength(60);
+    expect(exchange.fundingStarts).toEqual([T0 + 60 * DAY]);
+    // another venue's settlements are cached under their own key
+    const okx: Fetchers = { ...exchange.fetchers(), fundingVenue: 'okx' };
+    expect(fundingKey('AAA-USDT-SWAP', okx)).toBe('AAA-USDT-SWAP.funding-okx');
+    expect(fundingKey('AAA-USDT-SWAP', exchange.fetchers())).toBe('AAA-USDT-SWAP.funding');
+    await loadFunding('AAA-USDT-SWAP', okx, cache, false, T0 + 78 * DAY);
+    expect(cache.read<FundingRecord[]>('AAA-USDT-SWAP.funding-okx')).toHaveLength(6);
+    expect(cache.read<FundingRecord[]>('AAA-USDT-SWAP.funding')).toHaveLength(60);
   });
 });
 

@@ -415,6 +415,55 @@ describe('AccountService mirror', () => {
   });
 });
 
+describe('AccountService liquidations', () => {
+  const NOW = 1_700_000_000_000;
+  const LTC = 'LTC-USDT-SWAP';
+
+  beforeEach(() => {
+    vi.useFakeTimers({ now: NOW });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** The order OKX closes a liquidated isolated long with, as the orders channel pushes it: trade id 0, no client id. */
+  const liquidationPush = (ordId: string, fillSz: string) => ({
+    arg: { channel: 'orders', instType: 'SWAP' },
+    data: [{
+      ordId, clOrdId: '', instId: LTC, side: 'sell', posSide: 'net', tdMode: 'isolated', ordType: 'market', px: '', sz: fillSz, accFillSz: fillSz, fillPx: '80.1', fillSz, fillTime: String(NOW),
+      tradeId: '0', avgPx: '80.1', state: 'filled', lever: '50', reduceOnly: 'true', fee: '-0.04', feeCcy: 'USDT', pnl: '-5.56', category: 'full_liquidation', execType: '', fillFee: '-0.04', cTime: String(NOW), uTime: String(NOW),
+    }],
+  });
+
+  it('two liquidations of one instrument are two fills, both journaled; a push repeated is not counted again', async () => {
+    const rest = {
+      getAccountConfig: async () => ({ uid: '1', acctLv: '2', posMode: 'net_mode', autoLoan: false, level: 'Lv1', perm: 'read_only,trade' }),
+      getBalance: async () => ({ totalEq: '1000', uTime: String(Date.now()), details: [] }),
+      getPositions: async () => [],
+      getOrdersPending: async () => [],
+      getAlgoOrdersPending: async () => [],
+    };
+    const ws = new FakePrivateSocket();
+    const store = new MemoryStore();
+    const account = new AccountService({ rest, wsPrivate: ws, clock: { offsetMs: 0 }, demo: false } as unknown as OkxClients, store, log);
+    const fills: string[] = [];
+    const categories: Array<string | undefined> = [];
+    account.on('fill', (f) => fills.push(`${f.ordId}:${f.tradeId}:${f.fillSz}`));
+    account.on('order', (o) => categories.push(o.category));
+    await account.start();
+
+    ws.emit('data', liquidationPush('901', '1'));
+    ws.emit('data', liquidationPush('902', '2'));
+    ws.emit('data', liquidationPush('901', '1'));
+    expect(fills).toEqual(['901:0:1', '902:0:2']);
+    expect(categories).toEqual(['full_liquidation', 'full_liquidation', 'full_liquidation']);
+    await vi.advanceTimersByTimeAsync(0);
+    expect((await store.listFills({ instId: LTC, limit: 10 })).map((f) => `${f.ordId}:${f.tradeId}`).sort()).toEqual(['901:0', '902:0']);
+    await account.stop();
+  });
+});
+
 describe('AccountService algo orders (stops)', () => {
   const NOW = 1_700_000_000_000;
   const BTC = 'BTC-USDT-SWAP';

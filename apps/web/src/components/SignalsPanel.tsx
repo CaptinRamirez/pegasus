@@ -123,6 +123,9 @@ export function SignalsPanel() {
     pushToast('info', t.signals.ticketFilled(side, plan.contracts, r.instId, px, phases.length > 1 ? cutLabel(r.phase) : null, !withStop));
   };
 
+  // The framework this tab implements is retired: said once, above everything else on the tab.
+  const archived = <div className="signals-archived">{t.signals.archived}</div>;
+
   const toolbar = (
     <div className="signals-toolbar">
       <button className="btn btn-sm" onClick={() => void q.refetch()} disabled={q.isFetching}>
@@ -172,6 +175,7 @@ export function SignalsPanel() {
   if (q.data === undefined) {
     return (
       <div className="signals">
+        {archived}
         {toolbar}
         <div className="empty">{q.isError ? t.signals.unavailable : t.signals.loading}</div>
       </div>
@@ -180,6 +184,7 @@ export function SignalsPanel() {
   if (q.data.reports.length === 0) {
     return (
       <div className="signals">
+        {archived}
         {toolbar}
         <div className="empty">{t.signals.noInstruments}</div>
       </div>
@@ -188,6 +193,7 @@ export function SignalsPanel() {
 
   return (
     <div className={`signals${outdated ? ' signals-stale' : ''}`}>
+      {archived}
       {toolbar}
       {outdated && <div className="notice notice-warn signals-outdated">{t.signals.outdated(fmtDateTime(q.dataUpdatedAt))}</div>}
       <table className="table signals-table">

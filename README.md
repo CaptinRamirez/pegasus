@@ -6,13 +6,14 @@
 pegasus/
 ├── apps/
 │   ├── api/          Fastify 后端：OKX 行情/账户接入、风控、下单、WebSocket 推送、持久化
-│   └── web/          React + Vite 交易终端（K 线、盘口、成交、下单面板、持仓、风控面板、信号面板）
+│   └── web/          React + Vite 交易终端（滚仓记分牌、K 线、盘口、成交、下单面板、持仓、风控面板、信号面板）
 ├── packages/
 │   ├── shared/       前后端共享的领域类型、zod 校验、WS 协议、合约张数/价格换算
 │   ├── okx/          OKX v5 REST + WebSocket 客户端（签名、登录、心跳、重连、重订阅、按 seqId 校验盘口连续性）
 │   ├── mock-okx/     本地模拟的 OKX 交易所（REST + WS + 撮合），离线开发和端到端测试用
 │   ├── paper/        纸面交易所：OKX 实盘行情 + 本地虚拟账户（订单、持仓、止损、资金费），`pnpm start --paper`
-│   └── backtest/     回测工具，和 SIGNALS 面板用同一份信号代码
+│   └── backtest/     回测工具：滚仓回放（pnpm backtest:campaign），以及存档的 55 日突破框架（和 SIGNALS 面板用同一份信号代码）
+├── docs/strategy.md  现行交易框架：滚仓（第 0 关，纸面阶段）
 ├── docs/api.md       前后端接口契约
 ├── docker-compose.yml  Postgres（可选）
 └── .env.example
@@ -81,7 +82,8 @@ pnpm start --paper     # Windows 上也可以直接双击 start-paper.bat
   - 期间到期的资金费，按当时的持仓补结。
   - 50 小时以内用 1 分钟 K 线；更久的用 5 分钟、15 分钟或 1 小时 K 线，精度相应变粗。
   - 运行中行情连接断开超过 1 分钟，恢复时同样先补算。断开期间不成交、不触发止损。
-- **没有模拟的**：强平（爆仓）、排队和部分成交、止盈单、币本位合约（只支持 USDT 本位永续）、现货。
+- **强平只模拟逐仓**：标记价到达逐仓仓位的强平价时，交易所整仓强平，保证金全部损失。公式照 OKX 帮助中心，维持保证金率一律取第一档。关机期间补算时，每根标记价 K 线先检查强平。全仓仓位不会被强平。
+- **没有模拟的**：全仓强平、自动减仓（ADL）、高档位的分级强平、排队和部分成交、止盈单、币本位合约（只支持 USDT 本位永续）、现货。
 - **初始资金**默认 100,000 USDT，只在新建账户时生效；默认杠杆 3 倍（可以在下单面板里改）。想重新开始，关掉程序后删除 `data/paper-account.json`。每次启动时上一次的文件会另存一份 `data/paper-account.json.bak`。
 - 熔断状态单独存在 `data/pegasus-state.paper.json`，不会和真实账户的混在一起。
 
@@ -93,7 +95,56 @@ pnpm start --paper     # Windows 上也可以直接双击 start-paper.bat
 | `PAPER_TAKER_FEE` / `PAPER_MAKER_FEE` | 吃单、挂单手续费率，默认 `0.0005` / `0.0002` |
 | `PAPER_POS_MODE` | `net_mode`（默认，单向持仓）或 `long_short_mode`；账户建好后不能改 |
 | `PAPER_STATE_FILE` | 账户文件，默认 `data/paper-account.json`（相对项目目录） |
+| `PAPER_INSTRUMENTS` | 纸面交易所撮合的合约，逗号分隔。默认十个 USDT 永续：BTC、ETH、XRP、LTC、BCH、LINK、TRX、ETC、ADA、DOT。`INSTRUMENTS` 里的合约会自动加入 |
 | `PAPER_PORT` | 纸面交易所的端口，默认 `9200` |
+
+### 滚仓：第 0 关，纸面阶段
+
+规则见 [`docs/strategy.md`](docs/strategy.md)。程序自己运行这套规则：10 倍逐仓做多、用浮盈加仓、按阶梯取回。目前只在纸面交易上运行，不会向 OKX 下单。
+
+```bash
+pnpm start --campaign     # Windows 上也可以直接双击 start-campaign.bat
+```
+
+**资金池有自己的纸面账户和文件**，和 `--paper` 的账户（`data/paper-account.json`）互不影响：
+
+| 文件 | 内容 |
+| --- | --- |
+| `data/paper-campaign.json` | 资金池专用的纸面账户。新建时有 56 USDT（`CAMPAIGN_POT_START`） |
+| `data/campaign-ledger.json` | 账本：资金池、每次战役、取回记录、决策日志、执行错误 |
+| `data/pegasus-state.campaign.json` | 这个账户的熔断状态 |
+| `data/campaign-replay/` | 回放用的 OKX 历史数据缓存 |
+
+**页面默认打开"滚仓"标签页**，上面有：
+
+- 资金池、已取回、每次战役；
+- 同一笔钱一直持有 BTC 的结果；
+- 不加仓版本的结果；
+- 与回放的逐笔对账；
+- 决策日志；
+- 执行错误。
+
+**程序要一直开着。** 每天 UTC 0 点和 12 点收盘后各决策一次，即巴黎夏令时 2 点和 14 点、冬令时 1 点和 13 点。如果收盘时程序没开：
+
+- 错过的离场，重启后马上补做；
+- 错过的入场和加仓不补，在决策日志里记为错过。
+
+**验收标准：** 程序完整做完 20 次战役，执行错误为零。十个品种大约需要三到四个月。
+
+**从头再来：** 关掉程序，删除 `data/paper-campaign.json` 和 `data/campaign-ledger.json`。规则是一张票打到底，所以只在测试出错、需要重来时才这样做。
+
+**在命令行里对账：** `pnpm backtest:campaign --reconcile data/campaign-ledger.json`。它从资金池的起点开始，用同样的 K 线回放规则，再和账本逐笔对照。
+
+| 变量（写在 `.env` 里，都可以不设） | 说明 |
+| --- | --- |
+| `CAMPAIGN_ENABLED` | `1`：手动开启滚仓。只能和纸面交易一起用，否则后端拒绝启动。`--campaign` 会自动设置这个变量和上表的文件 |
+| `CAMPAIGN_INSTRUMENTS` | 滚仓的品种，默认十个：BTC、ETH、LTC、XRP、BCH、ETC、LINK、ADA、DOT、TRX 的 USDT 永续 |
+| `CAMPAIGN_POT_START` | 资金池本金，默认 `56`（USDT，约 50 欧元） |
+| `CAMPAIGN_MIN_STAKE` | 最小投入，默认 `5.6` |
+| `CAMPAIGN_STRUCTURE` | `pyramid`（默认，用浮盈加仓）或 `noadd`（不加仓） |
+| `CAMPAIGN_STATE_FILE` | 账本文件，默认 `data/campaign-ledger.json` |
+
+资金池开始之后，它的本金、最小投入和加仓方式就固定了，之后改 `.env` 只对新的资金池生效。
 
 ### 方式一：离线，用本地 mock 交易所
 
@@ -174,7 +225,10 @@ pnpm db:migrate
 pnpm typecheck   # 所有包类型检查
 pnpm test        # 所有包单元测试 / 端到端测试（端到端用 mock 交易所）
 pnpm build       # 前端构建
-pnpm backtest    # 用实盘同一份信号代码回测 BTC、ETH（约两分钟；--help 看全部参数）
+pnpm backtest:campaign                  # 滚仓规则的回放（--help 看全部参数）
+pnpm backtest:campaign --check packages/backtest/reference/campaigns-okx.json   # 复现研究阶段记录的 497 次战役
+pnpm backtest:campaign --reconcile data/campaign-ledger.json                     # 账本与回放逐笔对账
+pnpm backtest    # 存档的 55 日突破框架：用 SIGNALS 面板同一份信号代码回测 BTC、ETH（约两分钟；--help 看全部参数）
 pnpm dev:paper   # 单独运行纸面交易所（调试用；平时用 pnpm start --paper）
 ```
 
@@ -185,7 +239,7 @@ pnpm dev:paper   # 单独运行纸面交易所（调试用；平时用 pnpm star
 ## 已知限制 / 下一步
 
 - 只支持 SWAP（永续）；交割、期权、现货未接。
-- 纸面交易不模拟强平、排队和止盈单。
+- 纸面交易只模拟逐仓强平（按第一档），不模拟全仓强平、排队和止盈单。
 - 止损单只能改触发价，不能改数量（撤掉后在持仓表里用 add stop 按需要的数量重新挂）；还没成交的进场单所附带的止损不能单独改（撤单重下）。
-- 自动策略引擎未实现（第二期）。
+- 滚仓只在纸面交易上运行。实盘下单、子账户和真钱，要等纸面阶段通过、董事会再次批准之后才做。
 - 前端为桌面宽度设计。

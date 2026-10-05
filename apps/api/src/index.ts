@@ -1,3 +1,4 @@
+import { createFetchers, FileCache } from '@pegasus/backtest/campaign';
 import { loadConfig } from './config.js';
 import { PgStore } from './db/pg-store.js';
 import { MemoryStore, type Store } from './db/store.js';
@@ -6,6 +7,8 @@ import { createLogger } from './logger.js';
 import { createOkxClients, OkxUnreachableAtStartError, reachOkxAtStart, scheduleClockSync, syncClock } from './okx/clients.js';
 import { buildServer } from './server.js';
 import { AccountService } from './services/account.js';
+import { CampaignService } from './services/campaign.js';
+import { CampaignOrders } from './services/campaign-orders.js';
 import { KillSwitchSweeper } from './services/kill-switch-sweeper.js';
 import { MarketDataService } from './services/market-data.js';
 import { OrderService } from './services/order-service.js';
@@ -22,7 +25,7 @@ async function main(): Promise<void> {
     log.fatal({ err }, 'uncaught exception; exiting');
     process.exit(1);
   });
-  log.info({ version: config.version, demo: config.okx.demo, paper: config.okx.paper, rest: config.okx.endpoints.rest, wsTrading: config.okx.wsTrading, logDir: config.logDir, instruments: config.instruments, host: config.server.host, port: config.server.port }, 'pegasus api starting');
+  log.info({ version: config.version, demo: config.okx.demo, paper: config.okx.paper, rest: config.okx.endpoints.rest, wsTrading: config.okx.wsTrading, logDir: config.logDir, instruments: config.instruments, campaign: config.campaign.enabled, host: config.server.host, port: config.server.port }, 'pegasus api starting');
   if (config.server.token === 'change-me') log.warn('API_TOKEN is the default value; set a real secret in .env before exposing this server');
   if (!config.okx.credentials) log.warn('no OKX credentials configured: running in market-data-only mode (no trading)');
   if (config.okx.paper) log.info({ paperExchange: config.okx.endpoints.restPrivate }, 'PAPER TRADING MODE: orders, positions and balance are simulated by the paper exchange; market data is OKX live data; nothing is sent to an OKX account');
@@ -59,6 +62,21 @@ async function main(): Promise<void> {
   const signals = new SignalsService(clients, market, account, log, undefined, config.signalPhases);
   const hub = new Hub(config, market, account, risk, log);
   const deps: Deps = { config, log, clients, store, market, account, risk, orders, signals, hub };
+  // Paper only: loadConfig refuses CAMPAIGN_ENABLED=1 without the paper exchange.
+  let campaign: CampaignService | null = null;
+  if (config.campaign.enabled) {
+    const campaignOrders = new CampaignOrders(clients, market, account, orders, risk, store, log, { leverage: config.campaign.leverage, feeRate: config.campaign.feeRate, paper: config.okx.paper });
+    deps.campaignOrders = campaignOrders;
+    // The replay beside the pot reads OKX's public history (the market data hosts) and its funding, what the paper exchange charged.
+    const replay = { fetchers: createFetchers({ okxBaseUrl: config.okx.endpoints.rest, funding: 'okx' }), cache: new FileCache(config.campaign.replayCacheDir), log: (message: string) => log.debug({ component: 'campaign-replay' }, message) };
+    const service = new CampaignService(config.campaign, { clients, market, account, risk, orders: campaignOrders, log }, { ledgerFile: config.campaign.stateFile, replay: { sources: replay } });
+    // Every change of the ledger reaches the terminals; a terminal that connects gets the state after hello.
+    service.on('change', (view) => hub.broadcast({ type: 'campaign', data: view }));
+    hub.setCampaignView(() => service.view());
+    deps.campaign = service;
+    campaign = service;
+    log.info({ instruments: config.campaign.instruments, potStart: config.campaign.potStart, minStake: config.campaign.minStake, structure: config.campaign.structure, ledger: config.campaign.stateFile }, 'CAMPAIGN ENABLED on the paper exchange');
+  }
 
   // Risk wiring: equity feeds the daily PnL / loss limit; exposure feeds the state shown in the UI.
   account.on('balance', (b) => risk.updateEquity(b.totalEq));
@@ -74,10 +92,13 @@ async function main(): Promise<void> {
   void account.startWithRetry();
   await app.listen({ host: config.server.host, port: config.server.port });
   log.info({ url: `http://${config.server.host}:${config.server.port}` }, 'pegasus api listening');
+  // The ledger, the pot's start or the closes missed while the API was down; it waits for the account by itself.
+  if (campaign) void campaign.start().catch((err: unknown) => log.error({ err }, 'the campaign service could not start'));
 
   const shutdown = async (signal: string) => {
     log.info({ signal }, 'shutting down');
     try {
+      await campaign?.stop();
       await hub.close();
       await app.close();
       await Promise.all([market.stop(), account.stop()]);

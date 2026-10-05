@@ -7,6 +7,7 @@ import { ZodError } from 'zod';
 import type { Deps } from './deps.js';
 import { AppError, ExchangeUnreachableError } from './errors.js';
 import { registerAccountRoutes } from './routes/account.js';
+import { registerCampaignRoutes } from './routes/campaign.js';
 import { registerMarketRoutes } from './routes/market.js';
 import { registerSignalRoutes } from './routes/signals.js';
 import { registerTradingRoutes } from './routes/trading.js';
@@ -112,6 +113,7 @@ export async function buildServer(deps: Deps): Promise<FastifyInstance> {
   await registerTradingRoutes(app, deps);
   await registerAccountRoutes(app, deps);
   await registerSignalRoutes(app, deps);
+  await registerCampaignRoutes(app, deps);
 
   return app;
 }

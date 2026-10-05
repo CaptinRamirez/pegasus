@@ -178,6 +178,12 @@ export function fmtUtcMinute(ts: number): string {
   return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())} UTC`;
 }
 
+/** UTC wall-clock time to the second: "2026-10-03 00:02:15 UTC". */
+export function fmtUtcSecond(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())} UTC`;
+}
+
 /** Coarse age for things that are hours or days old: "12 min", "5 h", "3 d". */
 export function fmtAgeCoarse(ms: number): string {
   if (ms < 3_600_000) return `${Math.max(0, Math.floor(ms / 60_000))} min`;

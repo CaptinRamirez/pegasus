@@ -1,6 +1,6 @@
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { startPaperExchange, type PaperOptions } from './server.js';
+import { paperInstruments, startPaperExchange, type PaperOptions } from './server.js';
 
 /** The repository root: the account file is kept under it whatever directory the process was started from. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -16,8 +16,8 @@ const isLocal = (url: string): boolean => URL.canParse(url) && ['127.0.0.1', 'lo
 
 async function main(): Promise<void> {
   const env = process.env;
-  const instruments = [...new Set((env['INSTRUMENTS'] ?? 'BTC-USDT-SWAP,ETH-USDT-SWAP').split(',').map((s) => s.trim().toUpperCase()).filter((s) => s.length > 0))];
-  if (instruments.length === 0) throw new Error('INSTRUMENTS must list at least one instrument');
+  const instruments = paperInstruments(env);
+  if (instruments.length === 0) throw new Error('PAPER_INSTRUMENTS and INSTRUMENTS must list at least one instrument between them');
   const port = Number(env['PAPER_PORT'] ?? 9200);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`PAPER_PORT must be a port number, got '${env['PAPER_PORT']}'`);
   const posMode = env['PAPER_POS_MODE'] ?? 'net_mode';

@@ -1,6 +1,6 @@
 # Edge research: what the evidence says about "confirming" a daily-close Donchian trend system on BTC/ETH perps
 
-Consolidation of five evidence reviews (order book / order flow; derivatives positioning; options and volatility; on-chain, flow, attention, macro and calendar; systematic trend-following literature) for the system defined in `docs/strategy.md` sections 2.3 and 3.1:
+Consolidation of five evidence reviews (order book / order flow; derivatives positioning; options and volatility; on-chain, flow, attention, macro and calendar; systematic trend-following literature) for the system defined in `docs/archive/strategy-breakout.md` sections 2.3 and 3.1:
 
 - 55-day close breakout entry, gated by the 100-day MA (shorts at half size), funding-rate crowding filter (long only if 3-day 8h-equivalent funding <= 0.05%; short only if >= -0.03%), regime filter (no new entries in the "range" state).
 - 2.5 x ATR(20) initial stop on the exchange; exit on 20-day channel close; 0.75% of equity risk per trade (0.5% first three months), notional capped at 10% of equity.
@@ -170,7 +170,7 @@ Trend-system design
 
 ## 4. What the evidence actually supports: a size-tilt score, not a confirmation score
 
-No review found evidence for an additive score of "analyst" signals that raises the hit rate of a 55-day breakout. What the evidence supports is a short, tiered set of rules. Tier 1 contains at most three testable changes; each must be backtested alone (section 5 of strategy.md: one variable at a time) and must beat the baseline on the pre-registered metric or be dropped.
+No review found evidence for an additive score of "analyst" signals that raises the hit rate of a 55-day breakout. What the evidence supports is a short, tiered set of rules. Tier 1 contains at most three testable changes; each must be backtested alone (section 5 of archive/strategy-breakout.md: one variable at a time) and must beat the baseline on the pre-registered metric or be dropped.
 
 ### Tier 0 — keep unchanged (Grade A/B, already in the rules)
 
@@ -232,7 +232,7 @@ The arithmetic, using the strategy document's own numbers (per-trade R standard 
 
 - Standard error of the system's mean R at 300 trades: 2.5 / sqrt(300) = **~0.14R**. The whole system's expectancy of 0.3-0.6R is therefore only 2-4 standard errors from zero. There is very little statistical room left to subdivide.
 - A *filter* is a comparison between the trades it removes and the trades it keeps. If a filter removes 30% of trades (90 removed, 210 kept), the standard error of the difference in mean R is 2.5 x sqrt(1/90 + 1/210) = **~0.32R**. To be significant at 2 sigma for a single pre-registered filter, the removed trades must average **~0.6R worse** than the kept ones — e.g. kept +0.5R, removed -0.1R or worse. Filters that remove only 10% of trades (30 trades) need a ~1R gap. Only coarse, high-impact filters are detectable; subtle "confirmation" effects of 0.1-0.2R are invisible at this sample size and will look real or fake at random.
-- With k candidate filters tested on the same trades, the Bonferroni-corrected bar rises (k = 3 -> ~2.4 sigma -> ~0.75R gap; k = 5 -> ~2.6 sigma -> ~0.8R; k = 10 -> ~2.8 sigma -> ~0.9R). The parameter sweeps in section 5 of strategy.md (55 -> 40-80, 20 -> 10-30, ATR 2-4, efficiency ratio 0.1-0.4) are robustness scans and are fine as long as nothing is selected from them; the moment the best cell is picked, each cell counts as a test.
+- With k candidate filters tested on the same trades, the Bonferroni-corrected bar rises (k = 3 -> ~2.4 sigma -> ~0.75R gap; k = 5 -> ~2.6 sigma -> ~0.8R; k = 10 -> ~2.8 sigma -> ~0.9R). The parameter sweeps in section 5 of archive/strategy-breakout.md (55 -> 40-80, 20 -> 10-30, ATR 2-4, efficiency ratio 0.1-0.4) are robustness scans and are fine as long as nothing is selected from them; the moment the best cell is picked, each cell counts as a test.
 - The 300 trades are not independent: BTC and ETH are ~1.2 independent markets by the document's own estimate, and the alts share the same crypto beta, so the effective sample is closer to 150-200 and every error above is understated.
 - *Size tilts* (F2, F3) do not change trade count, so they are judged on drawdown/MAR, which has even less power (max drawdown is one number per path). Use the bootstrap of the R sequence and ask whether the tilt shifts the drawdown *distribution*, not whether one MDD figure improved.
 - The literature cited in the reviews is the warning in practice: in the 14,919-rule (Hudson & Urquhart 2021), 75,360-rule (Deprez & Frömmel 2024) and 7,846-rule (Bajgrowicz & Scaillet 2012) universes, the best in-sample rule does not persist out of sample, and Bollinger/squeeze rules vanish after data-snooping correction (Fang, Jacobsen & Qin). Hudson & Urquhart's best in-sample BTC rule — a channel breakout — went to Sharpe -0.05 in the first OOS half-year.

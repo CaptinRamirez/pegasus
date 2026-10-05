@@ -68,7 +68,11 @@ export interface OrderRec {
   amendResult: string;
   reqId: string;
   attachSl: AttachedSl | null;
+  /** OKX's order category: `normal` for an order of the user, `full_liquidation` for the one the exchange closes a liquidated position with */
+  category: OrderCategory;
 }
+
+export type OrderCategory = 'normal' | 'full_liquidation';
 
 type Plain<T> = { [K in keyof T]: T[K] extends Dec ? string : T[K] extends Dec | null ? string | null : T[K] };
 
@@ -83,7 +87,12 @@ export interface OrderStoreSnapshot {
   algoSeq: number;
 }
 
-export type OrderJson = Omit<Plain<OrderRec>, 'lastFill' | 'attachSl'> & { lastFill: Plain<LastFill> | null; attachSl: Plain<AttachedSl> | null };
+export type OrderJson = Omit<Plain<OrderRec>, 'lastFill' | 'attachSl' | 'category'> & {
+  lastFill: Plain<LastFill> | null;
+  attachSl: Plain<AttachedSl> | null;
+  /** Absent in a file written before liquidations were simulated: every order in it is a normal one */
+  category?: OrderCategory;
+};
 
 function orderToJson(o: OrderRec): OrderJson {
   const f = o.lastFill;
@@ -116,6 +125,7 @@ function orderFromJson(o: OrderJson): OrderRec {
     pnl: d(o.pnl),
     lastFill: f ? { ...f, px: d(f.px), sz: d(f.sz), fee: d(f.fee), pnl: d(f.pnl) } : null,
     attachSl: sl ? { ...sl, slTriggerPx: d(sl.slTriggerPx) } : null,
+    category: o.category ?? 'normal',
   };
 }
 
@@ -379,7 +389,7 @@ export function orderToWire(o: OrderRec, fillEvent: boolean): OkxOrder {
     rebate: '0',
     rebateCcy: 'USDT',
     pnl: fmt(o.pnl),
-    category: 'normal',
+    category: o.category,
     source: '',
     cancelSource: o.cancelSource,
     cancelSourceReason: o.cancelSourceReason,

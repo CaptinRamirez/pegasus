@@ -1,6 +1,7 @@
 import { copyFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Fill, Order } from '@pegasus/shared';
+import { fillKey } from '../okx/mappers.js';
 
 export interface ListOrdersOptions {
   instId?: string;
@@ -86,8 +87,8 @@ export class MemoryStore implements Store {
   }
 
   async upsertFill(fill: Fill): Promise<void> {
-    // OKX trade ids are only unique per instrument
-    this.fills.set(`${fill.instId}:${fill.tradeId}`, fill);
+    // OKX trade ids are only unique per instrument, and the fills of liquidations share trade id 0: the order is part of the key
+    this.fills.set(fillKey(fill), fill);
   }
 
   async listOrders(opts: ListOrdersOptions): Promise<Order[]> {

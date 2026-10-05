@@ -113,3 +113,47 @@ describe('OkxRestClient with a separate private base URL (paper trading)', () =>
     expect(seen.map((s) => [s.server, s.signed])).toEqual([['okx', true], ['okx', false]]);
   });
 });
+
+describe('OkxRestClient margin of an isolated position', () => {
+  let server: Server | null = null;
+  const seen: Array<{ method: string; url: string; signed: boolean; body: unknown }> = [];
+
+  async function listen(reply: unknown): Promise<OkxRestClient> {
+    server = createServer((req, res) => {
+      let text = '';
+      req.on('data', (chunk: Buffer) => (text += chunk.toString('utf8')));
+      req.on('end', () => {
+        seen.push({ method: req.method ?? '', url: req.url ?? '', signed: req.headers['ok-access-sign'] !== undefined, body: JSON.parse(text) as unknown });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(reply));
+      });
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    return new OkxRestClient({ baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, credentials: { apiKey: 'k', apiSecret: 's', passphrase: 'p' } });
+  }
+
+  afterEach(async () => {
+    seen.length = 0;
+    const s = server;
+    server = null;
+    if (s) await new Promise<void>((resolve) => s.close(() => resolve()));
+  });
+
+  it('posts the adjustment signed, with the position side, and returns the row OKX answers with', async () => {
+    const row = { instId: 'BTC-USDT-SWAP', posSide: 'net', amt: '22.5', type: 'add', leverage: '10', ccy: 'USDT' };
+    const rest = await listen({ code: '0', msg: '', data: [row] });
+    expect(await rest.adjustMargin({ instId: 'BTC-USDT-SWAP', posSide: 'net', type: 'add', amt: '22.5' })).toEqual(row);
+    expect(seen).toEqual([{ method: 'POST', url: '/api/v5/account/position/margin-balance', signed: true, body: { instId: 'BTC-USDT-SWAP', posSide: 'net', type: 'add', amt: '22.5' } }]);
+  });
+
+  it('a refusal is an OkxApiError with the code of the exchange; an answer without a row is one too', async () => {
+    const refused = await listen({ code: '59301', msg: 'Margin adjustment failed for exceeding the max limit.', data: [] });
+    const err = await refused.adjustMargin({ instId: 'BTC-USDT-SWAP', posSide: 'long', type: 'reduce', amt: '5' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(OkxApiError);
+    expect(err).toMatchObject({ code: '59301', okxMessage: 'Margin adjustment failed for exceeding the max limit.', isOutcomeUnknown: false });
+    await new Promise<void>((resolve) => server?.close(() => resolve()));
+    const empty = await listen({ code: '0', msg: '', data: [] });
+    await expect(empty.adjustMargin({ instId: 'BTC-USDT-SWAP', posSide: 'net', type: 'add', amt: '1' })).rejects.toMatchObject({ code: 'EMPTY' });
+  });
+});

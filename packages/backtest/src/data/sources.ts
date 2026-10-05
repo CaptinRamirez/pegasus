@@ -1,10 +1,10 @@
 import { OKX_REST_URL, OkxApiError, OkxHttpError, OkxRestClient, OkxTransportError, type OkxCandleRow, type OkxInstrument } from '@pegasus/okx';
 import type { Candle, FundingRecord, Instrument } from '@pegasus/shared';
-import type { Fetchers } from './load.js';
+import type { Fetchers, HistoryBar } from './load.js';
 
 /**
  * The real history sources: OKX public endpoints through the OkxRestClient (no key needed) and, for
- * funding, Binance. OKX keeps about three months of funding settlements, so docs/strategy.md section 5
+ * funding, Binance. OKX keeps about three months of funding settlements, so docs/archive/strategy-breakout.md section 5
  * names another venue's full history of the same pair as the proxy for a multi-year backtest.
  */
 
@@ -97,7 +97,20 @@ interface BinanceFundingRow {
 export interface SourceOptions {
   okxBaseUrl?: string;
   fetchImpl?: typeof fetch;
+  /**
+   * Where the funding settlements come from: 'binance' (default), the proxy venue's full history the backtest
+   * needs; 'okx', the exchange's own, with the rate it actually charged, of which it keeps about three months: what
+   * the paper exchange settles, for the replay beside a live pot.
+   */
+  funding?: 'binance' | 'okx';
 }
+
+/** Rows of OKX's funding rate history per call */
+const OKX_FUNDING_PAGE = 100;
+/** The funding rate history allows 10 requests per 2 seconds per IP; the API's signals use it too. */
+const OKX_FUNDING_GAP_MS = 500;
+/** Pages of OKX's funding history read at most: three months of hourly settlements and then some */
+const OKX_FUNDING_PAGES = 30;
 
 export function createFetchers(opts: SourceOptions = {}): Fetchers {
   const fetchImpl = opts.fetchImpl ?? fetch;
@@ -105,7 +118,39 @@ export function createFetchers(opts: SourceOptions = {}): Fetchers {
   const candleQueue = throttled(CANDLE_GAP_MS);
   const oiQueue = throttled(OI_GAP_MS);
   const fundingQueue = throttled(FUNDING_GAP_MS);
+  const okxFundingQueue = throttled(OKX_FUNDING_GAP_MS);
+  const latest = async (instId: string, bar: HistoryBar): Promise<Candle[]> => {
+    const rows = await candleQueue(() => withRetry(() => rest.getCandles(instId, bar, { limit: 3 })));
+    return rows.map(toCandle).sort((a, b) => a.ts - b.ts);
+  };
+  if (opts.funding === 'okx') {
+    return {
+      ...createFetchers({ ...opts, funding: 'binance' }),
+      latest,
+      fundingVenue: 'okx',
+      // One call returns every settlement from startTime on: there is no second page to ask for.
+      fundingPageSize: Number.POSITIVE_INFINITY,
+      async funding(instId, startTime) {
+        const rows = new Map<number, FundingRecord>();
+        let cursor: number | undefined;
+        for (let page = 0; page < OKX_FUNDING_PAGES; page++) {
+          const after = cursor;
+          const batch = await okxFundingQueue(() => withRetry(() => rest.getFundingRateHistory(instId, after === undefined ? { limit: OKX_FUNDING_PAGE } : { after, limit: OKX_FUNDING_PAGE })));
+          let oldest = Number.POSITIVE_INFINITY;
+          for (const r of batch) {
+            const fundingTime = Number(r.fundingTime);
+            oldest = Math.min(oldest, fundingTime);
+            if (fundingTime >= startTime) rows.set(fundingTime, { fundingTime, fundingRate: r.realizedRate || r.fundingRate });
+          }
+          if (batch.length < OKX_FUNDING_PAGE || oldest <= startTime || (cursor !== undefined && oldest >= cursor)) break;
+          cursor = oldest;
+        }
+        return [...rows.values()].sort((a, b) => a.fundingTime - b.fundingTime);
+      },
+    };
+  }
   return {
+    latest,
     async instrument(instId) {
       const [inst] = await withRetry(() => rest.getInstruments('SWAP', instId));
       if (!inst) throw new Error(`OKX lists no swap ${instId}`);

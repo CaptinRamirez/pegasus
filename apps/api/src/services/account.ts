@@ -5,7 +5,7 @@ import type { Store } from '../db/store.js';
 import { NotConnectedError, ReadOnlyKeyError } from '../errors.js';
 import type { Logger } from '../logger.js';
 import type { OkxClients } from '../okx/clients.js';
-import { failedAttachedStop, fillFromOrderPush, mapAlgoOrder, mapBalance, mapFill, mapOrder, mapPosition, positionKey } from '../okx/mappers.js';
+import { failedAttachedStop, fillFromOrderPush, fillKey, mapAlgoOrder, mapBalance, mapFill, mapOrder, mapPosition, positionKey } from '../okx/mappers.js';
 
 export interface AccountEvents {
   order: [Order];
@@ -557,9 +557,10 @@ export class AccountService extends EventEmitter<AccountEvents> {
     this.emit('order', order);
     void this.store.upsertOrder(order).catch((err: Error) => this.log.warn({ err: err.message }, 'store.upsertOrder failed'));
     const fill = fillFromOrderPush(raw);
-    const fillKey = fill ? `${fill.instId}:${fill.tradeId}` : '';
-    if (fill && !this.seenFills.has(fillKey)) {
-      this.seenFills.add(fillKey);
+    // By trade and order: the fills of two liquidations of one instrument both carry trade id 0.
+    const key = fill ? fillKey(fill) : '';
+    if (fill && !this.seenFills.has(key)) {
+      this.seenFills.add(key);
       if (this.seenFills.size > 10_000) this.seenFills.delete(this.seenFills.values().next().value as string);
       this.emit('fill', fill);
       void this.store.upsertFill(fill).catch((err: Error) => this.log.warn({ err: err.message }, 'store.upsertFill failed'));

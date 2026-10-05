@@ -2,6 +2,7 @@ import type {
   AccountConfig,
   AlgoOrderList,
   Balance,
+  CampaignView,
   Candle,
   CandleBar,
   ConnectionStatus,
@@ -114,6 +115,8 @@ export interface TerminalState {
   lostStopNotified: string[];
   ticketPrice: TicketPrice | null;
   ticketPrefill: TicketPrefill | null;
+  /** The campaign's state, from the `campaign` message or GET /api/campaign, the newer of the two; null until either came */
+  campaign: CampaignView | null;
 }
 
 export const LIMITS = {
@@ -163,5 +166,6 @@ export function initialState(token: string | null): TerminalState {
     lostStopNotified: [],
     ticketPrice: null,
     ticketPrefill: null,
+    campaign: null,
   };
 }

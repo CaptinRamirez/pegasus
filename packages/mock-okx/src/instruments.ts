@@ -48,6 +48,16 @@ export const DEFAULT_PRICES: Readonly<Record<string, string>> = {
   'ETH-USDT-SWAP': '3000',
 };
 
+/**
+ * Tier-1 maintenance margin rates, as OKX's position tiers gave them on 2026-10-05
+ * (GET /api/v5/public/position-tiers?instType=SWAP&tdMode=isolated&tier=1): what an isolated position of the
+ * instrument is liquidated by. An instrument that is not listed here gets the engine's fallback.
+ */
+export const DEFAULT_MMR: Readonly<Record<string, string>> = {
+  'BTC-USDT-SWAP': '0.004',
+  'ETH-USDT-SWAP': '0.004',
+};
+
 /** Merges user overrides onto the defaults; unknown instIds become new linear swaps. */
 export function resolveInstruments(overrides: Record<string, Partial<OkxInstrument>> | undefined): OkxInstrument[] {
   const out = new Map<string, OkxInstrument>();

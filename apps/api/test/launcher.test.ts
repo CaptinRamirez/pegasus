@@ -10,26 +10,36 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { paperInstruments } from '@pegasus/paper';
+import { CAMPAIGN_INSTRUMENTS } from '@pegasus/shared';
 import { loadConfig } from '../src/config.js';
 
-const scripts = resolve(dirname(fileURLToPath(import.meta.url)), '../../../scripts');
+const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+const scripts = join(repo, 'scripts');
 
 interface LaunchOptions {
-  parseFlags(argv: string[]): { mock: boolean; paper: boolean; dev: boolean; open: boolean };
+  parseFlags(argv: string[]): { mock: boolean; paper: boolean; campaign: boolean; dev: boolean; open: boolean };
   mockEnv(port?: number): Record<string, string>;
   paperEnv(port?: number): Record<string, string>;
+  campaignEnv(port?: number, potStart?: string): Record<string, string>;
+  paperExchangeEnv(flags: { campaign: boolean }, overrides: Record<string, string>, port?: number): Record<string, string>;
+  potStartOf(env: Record<string, string | undefined>): string;
 }
 const options = (await import(pathToFileURL(join(scripts, 'launch-options.mjs')).href)) as LaunchOptions;
 
 describe('launcher options', () => {
-  it('understands --mock, --paper, --dev and --no-open and refuses anything else', () => {
-    expect(options.parseFlags([])).toEqual({ mock: false, paper: false, dev: false, open: true });
-    expect(options.parseFlags(['--mock', '--no-open'])).toEqual({ mock: true, paper: false, dev: false, open: false });
-    expect(options.parseFlags(['--paper'])).toEqual({ mock: false, paper: true, dev: false, open: true });
-    expect(options.parseFlags(['--dev'])).toEqual({ mock: false, paper: false, dev: true, open: true });
+  it('understands --mock, --paper, --campaign, --dev and --no-open and refuses anything else', () => {
+    expect(options.parseFlags([])).toEqual({ mock: false, paper: false, campaign: false, dev: false, open: true });
+    expect(options.parseFlags(['--mock', '--no-open'])).toEqual({ mock: true, paper: false, campaign: false, dev: false, open: false });
+    expect(options.parseFlags(['--paper'])).toEqual({ mock: false, paper: true, campaign: false, dev: false, open: true });
+    expect(options.parseFlags(['--dev'])).toEqual({ mock: false, paper: false, campaign: false, dev: true, open: true });
+    // the campaign is paper trading
+    expect(options.parseFlags(['--campaign'])).toEqual({ mock: false, paper: true, campaign: true, dev: false, open: true });
+    expect(options.parseFlags(['--campaign', '--paper', '--dev'])).toEqual({ mock: false, paper: true, campaign: true, dev: true, open: true });
     expect(() => options.parseFlags(['--mcok'])).toThrow('--mcok');
     // made-up prices and real prices are two different things
     expect(() => options.parseFlags(['--mock', '--paper'])).toThrow('不能同时使用');
+    expect(() => options.parseFlags(['--campaign', '--mock'])).toThrow('--mock 和 --campaign 不能同时使用');
   });
 
   it('--paper keeps the market data on OKX live, sends the account side to the paper exchange and never uses the key in .env', () => {
@@ -64,6 +74,43 @@ describe('launcher options', () => {
     expect(config.stateFile).toMatch(/pegasus-state\.mock\.json$/);
     expect(config.databaseUrl).toBeFalsy();
     expect(options.mockEnv(9200).OKX_WS_PRIVATE_URL).toBe('ws://127.0.0.1:9200/ws/v5/private');
+  });
+
+  it('CAMPAIGN_ENABLED=1 in .env starts with --paper only: --mock and a plain start are refused', () => {
+    const env = { OKX_API_KEY: 'live-key', OKX_API_SECRET: 'live-secret', OKX_API_PASSPHRASE: 'live-pass', OKX_DEMO: '0', CAMPAIGN_ENABLED: '1' };
+    expect(loadConfig({ ...env, ...options.paperEnv() }).campaign.enabled).toBe(true);
+    expect(() => loadConfig({ ...env, ...options.mockEnv() })).toThrow(/paper only/);
+    expect(() => loadConfig(env)).toThrow(/paper only/);
+  });
+
+  it("--campaign is paper trading on the pot's own account, with the campaign enabled, whatever .env says", () => {
+    const dotenv = { OKX_API_KEY: 'live-key', OKX_API_SECRET: 'live-secret', OKX_API_PASSPHRASE: 'live-pass', OKX_DEMO: '1', DATABASE_URL: 'postgres://live', CAMPAIGN_ENABLED: '0', CAMPAIGN_STATE_FILE: 'data/other-ledger.json', STATE_FILE: 'data/pegasus-state.json', INSTRUMENTS: 'SOL-USDT-SWAP' };
+    const env = options.campaignEnv();
+    expect(env).toMatchObject({ ...options.paperEnv(), STATE_FILE: 'data/pegasus-state.campaign.json', CAMPAIGN_ENABLED: '1', CAMPAIGN_STATE_FILE: 'data/campaign-ledger.json', PAPER_STATE_FILE: 'data/paper-campaign.json', PAPER_BALANCE: '56' });
+    const config = loadConfig({ ...dotenv, ...env });
+    expect(config.okx).toMatchObject({ paper: true, demo: false, credentials: { apiKey: 'paper', apiSecret: 'paper', passphrase: 'paper' }, endpoints: { restPrivate: 'http://127.0.0.1:9200' } });
+    expect(config.campaign).toMatchObject({ enabled: true, potStart: '56', instruments: [...CAMPAIGN_INSTRUMENTS] });
+    expect(config.campaign.stateFile).toBe(join(repo, 'data', 'campaign-ledger.json'));
+    // the kill switch and the day baseline of its own: neither the live account's nor the owner's paper account's
+    expect(config.stateFile).toBe(join(repo, 'data', 'pegasus-state.campaign.json'));
+    expect(options.paperEnv().STATE_FILE).toBe('data/pegasus-state.paper.json');
+    expect(config.databaseUrl).toBeFalsy();
+    // the signals stay the terminal's own instruments
+    expect(config.signalInstruments).toEqual(['SOL-USDT-SWAP']);
+
+    // the paper exchange: the pot's own account, never the owner's data/paper-account.json, trading the campaign's instruments
+    const exchange = options.paperExchangeEnv(options.parseFlags(['--campaign']), env, 9300);
+    expect(exchange).toMatchObject({ PAPER_PORT: '9300', PAPER_STATE_FILE: 'data/paper-campaign.json', PAPER_BALANCE: '56', CAMPAIGN_ENABLED: '1' });
+    expect(paperInstruments({ ...dotenv, ...exchange, PAPER_INSTRUMENTS: 'DOGE-USDT-SWAP' })).toEqual(['DOGE-USDT-SWAP', 'SOL-USDT-SWAP', ...CAMPAIGN_INSTRUMENTS]);
+    // plain --paper leaves the paper exchange its own settings: the owner's account
+    expect(options.paperExchangeEnv(options.parseFlags(['--paper']), options.paperEnv(), 9200)).toEqual({ PAPER_PORT: '9200' });
+
+    // a new account opens with the pot's start: the one .env gives, when it is one the API accepts
+    expect(options.potStartOf({})).toBe('56');
+    expect(options.potStartOf({ CAMPAIGN_POT_START: '100' })).toBe('100');
+    expect(options.potStartOf({ CAMPAIGN_POT_START: 'lots' })).toBe('56');
+    expect(options.potStartOf({ CAMPAIGN_POT_START: '0' })).toBe('56');
+    expect(options.campaignEnv(9200, '100').PAPER_BALANCE).toBe('100');
   });
 });
 
@@ -128,6 +175,19 @@ describe('launcher in a stub tree', () => {
     expect(launch('--mock').stdout).not.toContain('纸面交易模式');
     writeFileSync(join(root, '.env'), 'PAPER_TRADING=0\n');
     expect(launch().stdout).not.toContain('纸面交易模式');
+  });
+
+  it("--campaign says that it runs the campaign on the pot's own paper account, never writes to .env, and is refused with --mock", () => {
+    writeFileSync(join(root, '.env'), 'PAPER_TRADING=0\nCAMPAIGN_ENABLED=0\n');
+    const run = launch('--campaign');
+    expect(run.status).toBe(1); // the stub build fails; the mode is announced before it
+    expect(run.stdout).toContain('滚仓模式（纸面交易：OKX 实盘行情，资金池专用的虚拟账户 data/paper-campaign.json，账本 data/campaign-ledger.json，不会向 OKX 下单）');
+    expect(run.stdout).not.toContain('纸面交易模式');
+    expect(readFileSync(join(root, '.env'), 'utf8')).toBe('PAPER_TRADING=0\nCAMPAIGN_ENABLED=0\n');
+    const both = launch('--mock', '--campaign');
+    expect(both.status).toBe(1);
+    expect(both.stdout).toContain('--mock 和 --campaign 不能同时使用');
+    expect(both.stdout).not.toContain('正在构建');
   });
 
   it('paper trading is refused while .env points the market data at the mock exchange', () => {

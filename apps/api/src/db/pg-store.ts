@@ -42,17 +42,19 @@ CREATE TABLE IF NOT EXISTS fills (
   fee_ccy text NOT NULL DEFAULT '',
   exec_type text NOT NULL DEFAULT '',
   ts bigint NOT NULL,
-  PRIMARY KEY (inst_id, trade_id)
+  PRIMARY KEY (inst_id, trade_id, ord_id)
 );
--- Upgrade journals created with the old single-column key: OKX trade ids are only unique per instrument.
+-- Upgrade journals created with an older key, trade_id alone (the first release) or (inst_id, trade_id): OKX trade
+-- ids are only unique per instrument, and the fills of liquidations all carry trade id 0, so the order is part of the
+-- key. A wider key cannot be violated by rows the narrower one held.
 DO $$
 BEGIN
   IF EXISTS (
     SELECT 1 FROM pg_constraint
-    WHERE conname = 'fills_pkey' AND conrelid = 'fills'::regclass AND array_length(conkey, 1) = 1
+    WHERE conname = 'fills_pkey' AND conrelid = 'fills'::regclass AND array_length(conkey, 1) < 3
   ) THEN
     ALTER TABLE fills DROP CONSTRAINT fills_pkey;
-    ALTER TABLE fills ADD CONSTRAINT fills_pkey PRIMARY KEY (inst_id, trade_id);
+    ALTER TABLE fills ADD CONSTRAINT fills_pkey PRIMARY KEY (inst_id, trade_id, ord_id);
   END IF;
 END $$;
 CREATE INDEX IF NOT EXISTS fills_inst_ts_idx ON fills (inst_id, ts);

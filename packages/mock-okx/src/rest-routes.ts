@@ -163,6 +163,37 @@ export class RestRouter {
       const f = e.fundingRate(instId);
       return f ? ok([f]) : err('51001', 'Instrument ID does not exist.');
     });
+    // One tier per instrument family: the engine liquidates every position by the tier-1 rate, whatever its size.
+    // The refusals are the ones OKX answered with on 2026-10-05.
+    this.get('/api/v5/public/position-tiers', false, (q) => {
+      const instType = q.get('instType');
+      if (!instType) return err('50014', 'Parameter instType can not be empty.');
+      const tdMode = q.get('tdMode');
+      if (!tdMode) return err('50014', 'Parameter tdMode can not be empty.');
+      if (tdMode !== 'cross' && tdMode !== 'isolated') return err('51000', 'Parameter tdMode error');
+      if (instType !== 'SWAP') return err('51000', 'Parameter instType error');
+      const families = (q.get('instFamily') ?? q.get('uly') ?? '').split(',').filter((f) => f !== '');
+      if (families.length === 0) return err('50015', 'Either parameter instFamily or uly is required');
+      if (families.length > 5) return err('50025', 'Parameter instFamily count exceeds the limit 5.');
+      const listed = e.instrumentList().filter((inst) => families.includes(inst.instFamily));
+      if (listed.length === 0) return err('51000', 'Parameter instFamily error');
+      const tier = q.get('tier');
+      if (tier && tier !== '1') return ok([]);
+      return ok(listed.map((inst) => ({
+        baseMaxLoan: '',
+        imr: d(1).div(d(inst.lever)).toDecimalPlaces(4).toFixed(),
+        instFamily: inst.instFamily,
+        instId: '',
+        maxLever: inst.lever,
+        maxSz: inst.maxLmtSz,
+        minSz: '0',
+        mmr: (e.mmr.get(inst.instId) ?? d(0)).toFixed(),
+        optMgnFactor: '0',
+        quoteMaxLoan: '',
+        tier: '1',
+        uly: inst.uly,
+      })));
+    });
     this.get('/api/v5/public/open-interest', false, (q) => {
       const instType = q.get('instType');
       if (!instType) return err('50014', 'Parameter instType cannot be empty.');
@@ -276,8 +307,12 @@ export class RestRouter {
       if (posSideRaw === 'long' || posSideRaw === 'short') posSide = posSideRaw;
       else if (posSideRaw !== undefined && posSideRaw !== '' && posSideRaw !== 'net') return err('51000', 'Parameter posSide error');
       if (e.posMode === 'long_short_mode' && mgnMode === 'isolated' && !posSide) return err('51000', 'Parameter posSide error');
+      // An open isolated position takes the new leverage with the margin it moves; a change that cannot be made is refused.
+      const refused = mgnMode === 'isolated' ? e.changeIsolatedLeverage(instId, lever, posSide) : null;
+      if (refused) return err(refused.sCode, refused.sMsg);
       return ok(e.setLeverage(instId, mgnMode, lever, posSide));
     });
+    this.post('/api/v5/account/position/margin-balance', (_q, body) => e.adjustMargin(body));
   }
 
   private registerTrade(): void {

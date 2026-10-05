@@ -91,7 +91,8 @@ export function validatePlace(body: unknown, ctx: EngineContext): OrderRec | Rej
     if (!existing || existing.qty.isZero()) return reject('51023', 'Position does not exist.');
     if (existing.qty.lt(sz)) return reject('51119', 'Order size exceeds the position size on the closing side.');
   }
-  const lever = account.leverFor(instId, tdMode, posSide);
+  // An open isolated position posts what is added to it at the leverage it was opened with.
+  const lever = tdMode === 'isolated' && existing && !existing.qty.isZero() ? existing.lever : account.leverFor(instId, tdMode, posSide);
   const marginError = checkMargin(ctx, inst.instId, tdMode, side, posSide, sz, px, lever, reduceOnly);
   if (marginError) return marginError;
   const attachSl = parseAttachedSl(raw['attachAlgoOrds'], ctx, instId, side, px, opening && !reduceOnly);
@@ -124,6 +125,7 @@ export function validatePlace(body: unknown, ctx: EngineContext): OrderRec | Rej
     amendResult: '',
     reqId: '',
     attachSl,
+    category: 'normal',
   };
 }
 
@@ -175,7 +177,10 @@ function checkMargin(ctx: EngineContext, instId: string, tdMode: OkxMgnMode, sid
   if (openingQty.lte(0)) return null;
   const top = side === 'buy' ? market.book.bestAsk() : market.book.bestBid();
   const refPx = px ?? top?.px ?? market.markPx;
-  const required = openingQty.mul(d(inst.ctVal)).mul(refPx).div(lever);
+  const notional = openingQty.mul(d(inst.ctVal)).mul(refPx);
+  // An isolated order needs its margin and its fee in the available balance: the margin leaves it for the
+  // position, and what is left must still pay the fee (the taker rate, the higher one, is assumed).
+  const required = tdMode === 'isolated' ? notional.div(lever).add(notional.mul(ctx.takerFee)) : notional.div(lever);
   const availEq = ctx.account.availEq(ctx.orders.ordFrozen(ctx.instruments));
   if (required.gt(availEq)) return reject('51008', 'Order failed. Insufficient USDT margin in account.');
   return null;

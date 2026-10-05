@@ -48,6 +48,9 @@ const keyOf = (instId: string, mgnMode: string, posSide: string): string => `${i
  * `contracts x contract value x mark price x rate`, paid by the long when the rate is positive. Positions are
  * followed through their size history, so a settlement that is applied late (the program was closed, or the
  * rate was published a minute after the hour) still uses the size and the mark price of its own time.
+ *
+ * A cross position settles with the balance; an isolated one with its own margin, as on OKX ("The funding fee is
+ * deducted from the isolated margin of the position" and credited there), so funding moves its liquidation price.
  */
 export class FundingSettler {
   private running: Promise<number> | null = null;
@@ -107,7 +110,12 @@ export class FundingSettler {
           }
           for (const h of held) {
             const amount = h.pos.mul(d(inst.ctVal)).mul(markPx).mul(d(s.rate)).neg();
-            this.engine.account.applyFunding(instId, h.mgnMode, h.posSide, amount);
+            // An isolated position settles through its margin. One that was liquidated since this settlement lost
+            // that margin whole, the payment with it: nothing is booked on top.
+            if (!this.engine.account.applyFunding(instId, h.mgnMode, h.posSide, amount, s.fundingTime)) {
+              this.log(`funding ${instId} ${new Date(s.fundingTime).toISOString()}: ${amount.toFixed(4)} USDT not booked: the ${h.mgnMode} position it was charged on was liquidated afterwards, and its margin is lost already`);
+              continue;
+            }
             this.state.ledger.push({ instId, mgnMode: h.mgnMode, posSide: h.posSide, fundingTime: s.fundingTime, rate: s.rate, pos: h.pos.toFixed(), markPx: markPx.toFixed(), amount: amount.toFixed() });
             this.log(`funding ${instId} ${new Date(s.fundingTime).toISOString()}: rate ${s.rate}, ${h.pos.toFixed()} contracts at mark ${markPx.toFixed()} -> ${amount.toFixed(4)} USDT`);
             booked++;

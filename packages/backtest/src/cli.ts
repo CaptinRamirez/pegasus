@@ -29,7 +29,7 @@ function readLiveR(file: string): number[] {
   return parsed as number[];
 }
 
-/** One line per combination of the grid: is the result a plateau or a single point (docs/strategy.md section 5)? */
+/** One line per combination of the grid: is the result a plateau or a single point (docs/archive/strategy-breakout.md section 5)? */
 async function sweep(opts: CliOptions, data: readonly InstrumentData[]): Promise<void> {
   if (!opts.sweep) return;
   const configs = sweepConfigs(opts.sweep, opts.config);

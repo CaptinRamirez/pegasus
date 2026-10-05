@@ -26,6 +26,8 @@ export interface MockOkxOptions {
   initialBalanceUsdt?: string;
   takerFeeRate?: string;
   makerFeeRate?: string;
+  /** Tier-1 maintenance margin rate per instId, over the defaults (BTC and ETH 0.004; another instrument half the initial margin rate of its highest leverage). */
+  mmr?: Record<string, string>;
   log?: (msg: string) => void;
 }
 

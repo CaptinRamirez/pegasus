@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { D, Decimal, ZERO, notionalQuote, utcDayStart, type CancelSweepState, type Instrument, type Order, type OrdType, type PosSide, type Position, type PositionOverLimit, type RiskCheckResult, type RiskConfig, type RiskState, type Side } from '@pegasus/shared';
+import { D, Decimal, ZERO, contractsToCoin, notionalQuote, positionDirection, utcDayStart, type CancelSweepState, type Instrument, type Order, type OrdType, type PosSide, type Position, type PositionOverLimit, type RiskCheckResult, type RiskConfig, type RiskState, type Side } from '@pegasus/shared';
 import type { Store } from '../db/store.js';
 import { AppError } from '../errors.js';
 import type { Logger } from '../logger.js';
@@ -31,7 +31,32 @@ export interface RiskCheckInput {
   /** Opening orders already accepted that the positions above may not show yet */
   reservations: ExposureReservation[];
   instrumentOf: (instId: string) => Instrument | undefined;
+  /** Set for the opening orders of a campaign only, never from a request of the terminal: see CampaignRiskContext */
+  campaign?: CampaignRiskContext;
 }
+
+/**
+ * An opening order of a campaign (services/campaign-orders.ts): an isolated long that is checked on the leverage it
+ * runs at, not on the leverage set for it. A campaign sets the instrument's highest leverage, so that an add posts as
+ * little margin as possible and can be carried by the margin the position already holds; what bounds its risk is
+ * its notional over its equity. With this context the leverage rule (MAX_LEVERAGE) measures that, and the setting is
+ * not looked at; every other rule applies as to any order.
+ */
+export interface CampaignRiskContext {
+  /** The campaign's leverage: the most the position's notional may be of its equity once the operation is complete */
+  leverage: string;
+  /**
+   * Margin the isolated position holds once the operation is complete: the stake an entry is topped up to after its
+   * fill; for a margin-neutral add, the margin it has less the fee of the add
+   */
+  margin: string;
+}
+
+/**
+ * What the leverage of a campaign may exceed its limit by: the rounding of the margin, the estimated fill against the
+ * real one, the mark against the fill. A fraction of the limit (10 allows 10.1).
+ */
+export const CAMPAIGN_LEVERAGE_TOLERANCE = '0.01';
 
 /** An accepted opening order, held against the limits until the account mirror has caught up with it. */
 export interface ExposureReservation {
@@ -153,7 +178,16 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
     if (this.state.killSwitch) this.log.warn({ reason: this.state.killSwitchReason, sweepDone: this.sweepDone }, 'kill switch is ON (restored from store)');
   }
 
-  /** Feed the latest total equity; rolls the daily baseline at 00:00 UTC and trips the kill switch on the loss limit. */
+  /**
+   * Feed the latest total equity; rolls the daily baseline at 00:00 UTC and trips the kill switch on the loss limit.
+   *
+   * A liquidation is not an order of this server and is never checked here: the exchange closes the isolated position
+   * on its mark price and its margin is gone. The daily-loss rule sees it through the equity like any other loss: the
+   * open loss counts while the mark falls, the rest when the liquidation takes the margin, and the day's total trips
+   * the kill switch at the limit, which then refuses new entries and adds (never exits). An isolated position cannot
+   * lose more than its margin, so a liquidated campaign costs at most its stake; a halt set off by the loss does not
+   * undo it.
+   */
   updateEquity(totalEq: string): void {
     // An empty equity is "not reported", never zero: as a value it would read as a total loss or become a zero baseline.
     if (totalEq === '') return;
@@ -280,7 +314,10 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
     if (notional.gt(c.maxOrderNotional)) {
       return fail('MAX_ORDER_NOTIONAL', `order notional ${notional.toFixed(2)} exceeds the limit ${c.maxOrderNotional}`, { notional: notional.toFixed(2), limit: c.maxOrderNotional });
     }
-    if (D(input.lever).gt(c.maxLeverage)) {
+    if (input.campaign) {
+      const refused = this.checkCampaignLeverage(input, input.campaign);
+      if (refused) return refused;
+    } else if (D(input.lever).gt(c.maxLeverage)) {
       return fail('MAX_LEVERAGE', `leverage ${input.lever}x exceeds the limit ${c.maxLeverage}x`, { lever: input.lever, limit: c.maxLeverage });
     }
     if (input.openOrders.length + 1 > c.maxOpenOrders && input.ordType !== 'market') {
@@ -311,6 +348,40 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
     return pass();
   }
 
+  /**
+   * The leverage rule of a campaign's opening order: the leverage its isolated position runs at once the operation is
+   * complete (campaignEffectiveLeverage) must not exceed the campaign's leverage, nor RISK_MAX_LEVERAGE when that is
+   * lower, by more than CAMPAIGN_LEVERAGE_TOLERANCE. Fails closed when it cannot be computed.
+   */
+  private checkCampaignLeverage(input: RiskCheckInput, ctx: CampaignRiskContext): RiskCheckResult | null {
+    const limit = Decimal.min(ctx.leverage, this.config.maxLeverage).mul(D(1).plus(CAMPAIGN_LEVERAGE_TOLERANCE));
+    const effective = campaignEffectiveLeverage(input, ctx);
+    if (effective === null) {
+      return fail('MAX_LEVERAGE', `the leverage the isolated ${input.inst.instId} position would run at cannot be computed (no price, a position that cannot be valued, or no equity left)`, { margin: ctx.margin, limit: limit.toFixed() });
+    }
+    if (effective.leverage.gt(limit)) {
+      return fail('MAX_LEVERAGE', `the isolated ${input.inst.instId} position would run at ${effective.leverage.toFixed(2)}x its equity (notional ${effective.notional.toFixed(2)} over ${effective.equity.toFixed(2)}), above the campaign limit ${limit.toFixed()}x`, {
+        lever: effective.leverage.toFixed(4),
+        limit: limit.toFixed(),
+        notional: effective.notional.toFixed(),
+        equity: effective.equity.toFixed(),
+        setting: input.lever,
+      });
+    }
+    return null;
+  }
+
+  /**
+   * Margin moved on an isolated position (POST /api/v5/account/position/margin-balance). Adding margin only takes risk
+   * away and always passes, kill switch or not. Taking margin out raises the leverage the position runs at: refused
+   * while the kill switch is on. A campaign takes margin out only right before an add whose own check passed with that
+   * margin taken into account (CampaignRiskContext).
+   */
+  checkMarginTransfer(type: 'add' | 'reduce'): RiskCheckResult {
+    if (type === 'reduce' && this.state.killSwitch) return fail('KILL_SWITCH', `trading halted: ${this.state.killSwitchReason}`);
+    return pass();
+  }
+
   private persist(): void {
     const p: PersistedRiskState = {
       killSwitch: this.state.killSwitch,
@@ -333,6 +404,32 @@ export function positionSignedNotional(p: Position, inst?: Instrument): ReturnTy
   }
   const isShort = p.posSide === 'short' || (p.posSide === 'net' && pos.lt(0));
   return isShort ? abs.neg() : abs;
+}
+
+/**
+ * The leverage an isolated position of a campaign runs at once the order has filled and the operation has left it
+ * `ctx.margin`: notional over equity, the equity being that margin plus the open P&L of what the position already
+ * holds, both at the reference price; the order counts at its own notional. For an entry nothing is held yet, so it is
+ * notional / margin. For an add the open profit carries the add (campaignAddQuantity sizes it so) and an open loss
+ * weighs against it. null when it cannot be computed: no reference price, an inverse contract, a held position
+ * without its average price or on the other side of the order, or an equity of zero or less.
+ */
+export function campaignEffectiveLeverage(input: RiskCheckInput, ctx: CampaignRiskContext): { leverage: Decimal; notional: Decimal; equity: Decimal } | null {
+  const ref = D(input.refPrice || '0');
+  if (ref.lte(0) || input.inst.ctType !== 'linear') return null;
+  let notional = D(input.notional);
+  let equity = D(ctx.margin);
+  const held = input.positions.find((p) => p.instId === input.inst.instId && p.mgnMode === 'isolated' && p.posSide === input.posSide && !D(p.pos || '0').isZero());
+  if (held) {
+    const direction = positionDirection(held);
+    if (direction !== (input.side === 'buy' ? 'long' : 'short') || held.avgPx === '') return null;
+    const coin = contractsToCoin(D(held.pos).abs(), input.inst);
+    const open = coin.mul(ref.minus(held.avgPx));
+    notional = notional.plus(coin.mul(ref));
+    equity = equity.plus(direction === 'long' ? open : open.neg());
+  }
+  if (equity.lte(0)) return null;
+  return { leverage: notional.div(equity), notional, equity };
 }
 
 /**

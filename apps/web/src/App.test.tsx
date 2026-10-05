@@ -2,14 +2,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import type { HelloPayload, Instrument, ServerMessage } from '@pegasus/shared';
+import type { CampaignView, HelloPayload, Instrument, ServerMessage } from '@pegasus/shared';
 import { App } from './App';
 import { LANG_KEY, useLangStore } from './i18n';
 import { TOKEN_KEY } from './lib/http';
 import { useStore } from './store/store';
 import { initialState } from './store/types';
+import { disabledView, logPage2, runningView } from './test/campaign-fixtures';
 
 vi.mock('./hooks/useCandleChart', () => ({ useCandleChart: () => undefined }));
+vi.mock('./hooks/useLineChart', () => ({ useLineChart: () => undefined }));
 
 class FakeSocket {
   static last: FakeSocket | null = null;
@@ -99,6 +101,9 @@ function envelope(data: unknown): Response {
   return new Response(JSON.stringify({ ok: true, data }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 }
 
+/** What GET /api/campaign answers in a test; the API's default is a disabled campaign. */
+let campaignReply: CampaignView = disabledView;
+
 describe('App', () => {
   let root: Root;
   let container: HTMLDivElement;
@@ -107,8 +112,14 @@ describe('App', () => {
   beforeEach(() => {
     vi.stubGlobal('WebSocket', FakeSocket);
     vi.stubGlobal('fetch', fetchMock);
+    campaignReply = disabledView;
     fetchMock.mockImplementation((input) => {
       const url = String(input);
+      // an API that has no replay route yet
+      if (url.startsWith('/api/campaign/replay')) return Promise.resolve(new Response(JSON.stringify({ ok: false, error: { code: 'NOT_FOUND', message: 'route not found' } }), { status: 404 }));
+      if (url.startsWith('/api/campaign/log')) return Promise.resolve(envelope(logPage2));
+      if (url.startsWith('/api/campaign')) return Promise.resolve(envelope(campaignReply));
+      if (url.startsWith('/api/signals')) return Promise.resolve(new Response(JSON.stringify({ ok: false, error: { code: 'NO_DATA', message: 'no data yet' } }), { status: 503 }));
       if (url.startsWith('/api/orders/history') || url.startsWith('/api/fills') || url.startsWith('/api/candles')) return Promise.resolve(envelope([]));
       if (url.startsWith('/api/account/leverage')) return Promise.resolve(envelope([{ instId: 'BTC-USDT-SWAP', mgnMode: 'cross', posSide: 'net', lever: '5' }]));
       if (url.startsWith('/api/instruments')) return Promise.resolve(envelope([btc]));
@@ -418,7 +429,7 @@ describe('App', () => {
       button('中文')?.click();
     });
     expect(localStorage.getItem(LANG_KEY)).toBe('zh');
-    expect([...container.querySelectorAll('button.tab')].map((b) => b.textContent)).toEqual(['持仓', '当前委托', '止损单', '历史委托', '成交记录', '信号']);
+    expect([...container.querySelectorAll('button.tab')].map((b) => b.textContent)).toEqual(['滚仓', '持仓', '当前委托', '止损单', '历史委托', '成交记录', '信号（已存档）']);
     const banner = container.querySelector('.banner')?.textContent ?? '';
     expect(banner).toContain('账户数据未更新：API key 无效（OKX: [50111] Invalid OK-ACCESS-KEY）');
     expect(banner).not.toContain('Account data is not updating');
@@ -629,6 +640,65 @@ describe('App', () => {
       ws.push({ type: 'risk', data: { ...hello.risk, killSwitch: true, killSwitchReason: 'manual (terminal)', cancelSweep: { state: 'skipped', message: 'skipped: read-only key', ts: 2 } } });
     });
     expect(container.textContent).toContain('Cancel all open orders: skipped: read-only key. Open orders are NOT cancelled; cancel them on OKX.');
+  });
+
+  const settleAll = (): Promise<void> =>
+    act(async () => {
+      await new Promise((r) => setTimeout(r, 10));
+    });
+  const activeTab = (): string => container.querySelector('button.tab.active')?.textContent ?? '';
+  const pickTab = (label: string): Promise<void> =>
+    act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>('button.tab')].find((b) => b.textContent?.startsWith(label))?.click();
+    });
+
+  it('opens on the campaign tab while the campaign is not disabled; a tab picked by hand stays', async () => {
+    campaignReply = runningView;
+    const ws = await connect(hello);
+    await act(async () => {
+      ws.push({ type: 'campaign', data: runningView });
+    });
+    await settleAll();
+    expect(activeTab()).toBe('Campaign');
+    expect(container.querySelector('.panel-bottom-tall')).not.toBeNull();
+    expect(container.querySelector('.campaign-status')?.textContent).toBe('running');
+    // an API without the replay route: the replay parts say so, the rest of the scoreboard is there
+    expect(container.querySelector('.campaign-replay-note')?.textContent).toContain('does not offer it yet');
+    expect(container.querySelectorAll('tr.campaign-row')).toHaveLength(5);
+
+    await pickTab('Positions');
+    expect(activeTab()).toBe('Positions1');
+    expect(container.querySelector('.panel-bottom-tall')).toBeNull();
+    // later views do not move the page back
+    await act(async () => {
+      ws.push({ type: 'campaign', data: { ...runningView, errorCount: 3, serverTime: runningView.serverTime + 1 } });
+    });
+    expect(activeTab()).toBe('Positions1');
+    expect(useStore.getState().campaign?.errorCount).toBe(3);
+  });
+
+  it('opens on the positions tab while the campaign is disabled, and the campaign tab says why', async () => {
+    await connect(hello);
+    await settleAll();
+    expect(useStore.getState().campaign?.status).toBe('disabled');
+    expect(activeTab()).toBe('Positions1');
+    await pickTab('Campaign');
+    expect(container.querySelector('.campaign-status')?.textContent).toBe('disabled');
+    expect(container.querySelector('.campaign-reason')?.textContent).toContain('CAMPAIGN_ENABLED=1');
+  });
+
+  it('the Signals tab is labelled as the archived 55-day breakout framework', async () => {
+    await connect(hello);
+    const signals = [...container.querySelectorAll<HTMLButtonElement>('button.tab')].find((b) => b.textContent === 'Signals (archived)');
+    expect(signals?.title).toContain('archived 55-day breakout framework');
+    expect(signals?.title).toContain('docs/archive/strategy-breakout.md');
+    await pickTab('Signals');
+    expect(container.querySelector('.signals-archived')?.textContent).toBe(
+      'Archived: the 55-day breakout framework, docs/archive/strategy-breakout.md. The current framework is the campaign rule (CAMPAIGN tab).',
+    );
+    await act(async () => useLangStore.getState().setLang('zh'));
+    expect(container.querySelector('button.tab.active')?.textContent).toBe('信号（已存档）');
+    expect(container.querySelector('.signals-archived')?.textContent).toContain('55 日突破框架，见 docs/archive/strategy-breakout.md');
   });
 
   it('labels account data with its time once the last sync is older than 90 s', async () => {

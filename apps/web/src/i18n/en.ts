@@ -1,6 +1,25 @@
 import type { CancelSweepState, Order, PlaceOrderRequest, PosSide, Side, TrendParams } from '@pegasus/shared';
 import type { Intent } from '../components/ticket/form';
+import { pad2, splitDuration } from '../lib/campaign';
 import { fmtAgeCoarse } from '../lib/format';
+
+/** The rule of the campaign in one line, its figures formatted. */
+export interface CampaignRuleText {
+  instruments: number;
+  potStart: string;
+  minStake: string;
+  /** The structure's name in the page's language */
+  structure: string;
+  /** The structure adds to a campaign that works (pyramid) */
+  adds: boolean;
+  leverage: string;
+  entryChannel: number;
+  exitChannel: number;
+  addStep: string;
+  stakeFraction: string;
+  bankFraction: string;
+  rungFactor: string;
+}
 
 /** Diagnostic values of a risk rejection (RiskCheckResult.details). */
 export type RiskDetails = Record<string, unknown>;
@@ -120,7 +139,16 @@ export const en = {
     loading: 'loading…',
   },
 
-  tabs: { positions: 'Positions', orders: 'Open orders', stops: 'Stops', history: 'History', fills: 'Fills', signals: 'Signals' },
+  tabs: {
+    campaign: 'Campaign',
+    positions: 'Positions',
+    orders: 'Open orders',
+    stops: 'Stops',
+    history: 'History',
+    fills: 'Fills',
+    signals: 'Signals (archived)',
+    signalsTitle: 'The archived 55-day breakout framework (docs/archive/strategy-breakout.md). The current framework is the campaign rule.',
+  },
 
   account: {
     title: 'Account',
@@ -329,6 +357,7 @@ export const en = {
   },
 
   signals: {
+    archived: 'Archived: the 55-day breakout framework, docs/archive/strategy-breakout.md. The current framework is the campaign rule (CAMPAIGN tab).',
     ticketFilled: (side: Side, contracts: string, instId: string, px: string, cut: string | null, noStop: boolean) =>
       `Ticket filled: ${side} ${contracts} contracts ${instId} @ ${px}${cut === null ? '' : ` (${cut} cut)`}${
         noStop ? '. NO stop was carried into the ticket (the plan has no positive stop price): set the stop yourself' : ''
@@ -435,6 +464,212 @@ export const en = {
     shortEntry: 'SHORT ENTRY',
     longExit: 'LONG EXIT',
     shortExit: 'SHORT EXIT',
+  },
+
+  /** The CAMPAIGN tab: the scoreboard of the pot the API runs on the paper exchange (docs/strategy.md). */
+  campaign: {
+    loading: 'Loading the campaign…',
+    what: 'the campaign',
+
+    // the status
+    status: 'Status',
+    statusLabel: { disabled: 'disabled', blocked: 'blocked', running: 'running', finished: 'finished' },
+    /** The reason of the status in words, by CampaignStatusReason.code; a code that is not here is shown with the API's message */
+    reasons: {
+      CAMPAIGN_DISABLED: 'The campaign is not enabled. It runs on paper trading only, with CAMPAIGN_ENABLED=1.',
+      LEDGER_UNREADABLE: 'The ledger file cannot be read: nothing is traded until it is repaired or moved away.',
+      ACCOUNT_NOT_DEDICATED: "The paper account is not the pot's own. The pot starts only on an account of its own: equity equal to the pot's start, no position, no open order.",
+      ACCOUNT_UNAVAILABLE: 'The paper account cannot be read yet: nothing is traded until it can.',
+      POT_FINISHED: 'The pot is finished: no campaign is open and the free cash is below the minimum stake. No other pot is started.',
+    },
+    rule: (r: CampaignRuleText) =>
+      `${r.instruments} instruments · ${r.structure} · ${r.leverage}× isolated longs · enter on a daily close above the ${r.entryChannel}-day high, exit on one below the ${r.exitChannel}-day low${
+        r.adds ? ` · add at every +${r.addStep}` : ''
+      } · stake ${r.stakeFraction} of the free cash, at least ${r.minStake} USDT · pot ${r.potStart} USDT, bank ${r.bankFraction} of its value at every ×${r.rungFactor} rung`,
+
+    // the steps
+    steps: 'Steps',
+    lastStep: 'Last step',
+    nextStep: 'Next step',
+    noStepYet: 'none yet',
+    noNextStep: 'none: the campaign is not running',
+    stepKind: { close: 'close', 'catch-up': 'catch-up' },
+    stepRunning: 'running',
+    stepEnded: (time: string) => `ended ${time}`,
+    stepErrors: (n: number) => (n === 1 ? '1 execution error' : `${n} execution errors`),
+    nextDaily: 'daily close: entries, exits, adds and the ladder',
+    nextHalfDay: '12-hour close: adds and the ladder',
+    /** Time left until the next close, ticking */
+    countdown: (ms: number): string => {
+      if (ms <= 0) return 'due now';
+      const { h, m, s } = splitDuration(ms);
+      return h > 0 ? `in ${h} h ${pad2(m)} min` : `in ${m} min ${pad2(s)} s`;
+    },
+    missedCloses: 'Missed closes',
+    missedTitle:
+      'Closes the service did not process in time (it was not running, or the account could not be read). An exit signal of a missed close is carried out late; adds and entries that were due are only logged.',
+    foreign: (positions: string) =>
+      `Positions on the campaign's instruments that the ledger does not know: ${positions}. They are reported, never touched, and no entry is made on those instruments.`,
+
+    // the paper-stage acceptance
+    acceptance: 'Paper-stage acceptance',
+    ranToEnd: 'Campaigns run to their end',
+    ranToEndTitle:
+      'Campaigns the program ran to their end: closed on the exit signal, liquidated, or sold whole by a harvest. Stage G0 asks for 20, with no execution error.',
+    ofTarget: (n: number, target: number) => `${n} of ${target}`,
+    notCounted: (open: number, external: number, unknown: number) =>
+      `Not counted: ${open} open, ${external} closed by hand (external), ${unknown} ended without explanation (unknown).`,
+    errorCount: 'Execution errors',
+    errorCountTitle:
+      'Actions the rule decided that were not carried out as decided, orders the book filled only in part, and positions left in a state the rule does not have. Skips the rule foresees are not errors.',
+    errorTarget: 'target 0',
+    noErrors: 'No execution error so far.',
+    errors: 'Last execution errors',
+    errorsShown: (shown: number, total: number) => `newest ${shown} of ${total}`,
+    showAll: (n: number) => `Show all ${n}`,
+    showFewer: 'Show fewer',
+    code: 'Code',
+    action: 'Action',
+    message: 'Message',
+
+    // the pot
+    pot: 'Pot',
+    notStarted: 'The pot has not started.',
+    startValue: 'Start value',
+    valueNow: 'Value now',
+    freeCash: 'Free cash',
+    openEquity: 'Open equity',
+    banked: 'Banked',
+    potMultiple: '(Value + banked) / start',
+    potMultipleTitle: 'What the pot is worth now together with what it has banked, as a multiple of its start value',
+    unknownNow: 'unknown: the account does not show it yet',
+    nextRung: 'Next rung',
+    rungsPassed: (n: number) => `${n} passed`,
+    peak: 'Peak',
+    noPeak: 'none yet',
+    structure: 'Structure',
+    structureLabel: { pyramid: 'pyramid', noadd: 'no-add' },
+    btcAtStart: 'BTC mark at start',
+    finishedAt: 'Finished',
+
+    // the chart
+    chart: 'Pot value',
+    chartEmpty: 'No close processed yet: the lines start at the first step.',
+    line: { value: 'Pot value', banked: 'Banked', heldBtc: 'Start value held in BTC' },
+    replayLine: (structure: string, own: boolean) => (own ? `Replay, ${structure} (the pot's)` : `Replay, ${structure}`),
+    latest: 'latest',
+    replayOff: 'Replay unavailable: the pot has not started.',
+    replayLoading: 'Loading the replay…',
+    replayMissing: 'Replay unavailable: the API does not offer it yet (GET /api/campaign/replay answered 404).',
+    replayError: (err: string) => `Replay unavailable: it could not be loaded (${err}).`,
+    replayStatus: { unavailable: 'Replay unavailable', running: 'Replay being computed…', ready: 'Replay', failed: 'Replay failed' },
+    replayWhy: (status: string, reason: string) => `${status}: ${reason}`,
+    replayEarlier: (reason: string) => `The last replay failed (${reason}); the earlier result is shown.`,
+    replayThrough: (through: string, computed: string) => `Replay through the ${through} close, computed ${computed}.`,
+
+    // the campaigns
+    campaigns: 'Campaigns',
+    noCampaigns: 'No campaign yet',
+    signalClose: 'Signal close',
+    entryFill: 'Entry fill',
+    stake: 'stake',
+    adds: 'Adds',
+    harvested: 'Harvested',
+    proceeds: 'Proceeds',
+    state: 'Status',
+    multiple: 'Multiple',
+    now: 'now',
+    liqPx: 'Liq px',
+    stateLabel: { open: 'open', exit: 'exit', liquidated: 'liquidated', harvest: 'harvest', external: 'external', unknown: 'unknown' },
+    stateTitle: {
+      open: 'Open: the multiple is (harvested + equity at the mark) / stake, now.',
+      exit: 'Closed on the exit signal.',
+      liquidated: 'Closed by the exchange: liquidated.',
+      harvest: 'A harvest sold all of it (less than the minimum order would have been left).',
+      external: "Closed by an order that was not the campaign's (by hand): the proceeds are not measured.",
+      unknown: "The position was gone and the exchange's order history did not say why: an execution error.",
+    },
+    exitPending: 'exit pending',
+    exitPendingTitle: (close: string) => `The exit signal of the ${close} close is not carried out yet: it is attempted again at every step.`,
+    notMeasured: 'not measured',
+    entryTitle: (time: string, contracts: string, price: string) => `filled ${time}: ${contracts} contracts; sized at ${price}`,
+    addLine: (time: string, contracts: string, px: string) => `${time}: +${contracts} contracts @ ${px}`,
+
+    // the bankings
+    bankings: 'Bankings',
+    noBankings: 'Nothing banked yet',
+    close: 'Close',
+    rungs: 'Rungs',
+    value: 'Value',
+    target: 'Target',
+    fromCash: 'From cash',
+    sold: 'Sold',
+    fromSales: 'From sales',
+    amount: 'Amount',
+
+    // the reconciliation
+    reconciliation: 'Reconciliation with the replay',
+    verdict: { match: 'match', differs: 'differs', 'live-only': 'live only', 'replay-only': 'replay only' },
+    reconAllMatch: 'Every campaign matches the replay.',
+    reconNone: 'No campaign to reconcile yet.',
+    campaign: 'Campaign',
+    verdictCol: 'Verdict',
+    differences: 'Differences',
+    diff: (field: string, live: string, replay: string) => `${field}: live ${live}, replay ${replay}`,
+    tolerances: (list: string) => `Tolerances: ${list}.`,
+
+    // the decision log
+    log: 'Decision log',
+    logWhat: 'the decision log',
+    logLoading: 'Loading the decision log…',
+    logEmpty: 'No step yet',
+    logCount: (shown: number, total: number) => `${shown} of ${total} steps`,
+    loadOlder: 'Load older steps',
+    loadingOlder: 'Loading…',
+    seq: '#',
+    kind: 'Kind',
+    started: 'Started',
+    ended: 'Ended',
+    potBefore: 'Pot before',
+    potBeforeLine: (value: string, freeCash: string, openEquity: string, banked: string, rungs: number) =>
+      `Pot before the step: ${value} USDT · free cash ${freeCash} · open equity ${openEquity} · banked ${banked} · rungs passed ${rungs}`,
+    actions: 'Actions',
+    errorsCol: 'Errors',
+    accountUnread: 'account not read',
+    closesLooked: (closes: string) => `Closes looked at: ${closes}`,
+    inputs: 'Inputs',
+    notes: 'Notes',
+    noActions: 'No action',
+    halfDayBar: '12-hour bar O / H / L / C',
+    price: 'Price',
+    daily: 'Daily close',
+    entryHigh: 'Entry high',
+    exitLow: 'Exit low',
+    signals: 'Signals',
+    entrySignal: 'ENTRY',
+    exitSignal: 'EXIT',
+    notConfirmed: 'not confirmed in time',
+    note: 'Note',
+    plan: 'Plan',
+    result: 'Result',
+    outcome: 'Outcome',
+    reason: 'Reason',
+    attempts: 'Attempts',
+    errorTag: 'execution error',
+    actionKind: { bank: 'bank', sell: 'sell', exit: 'exit', add: 'add', enter: 'enter', liquidated: 'liquidated', gone: 'gone', foreign: 'foreign' },
+    outcomeLabel: { done: 'done', skipped: 'skipped', missed: 'missed', failed: 'failed', noted: 'noted' },
+    /** The rules behind a skip, by the reason the log gives; an error code is shown as it came */
+    skipReason: {
+      cash: 'free cash below the minimum stake',
+      'min-size': 'below the minimum order',
+      'add-cap': 'add cap reached',
+      'kill-switch': 'kill switch on',
+      'foreign-position': 'position the ledger does not know',
+      'position-gone': 'position gone',
+      liquidated: 'liquidated already',
+      external: 'closed by hand already',
+    },
+    group: (kind: string, outcome: string | null, count: number) => `${kind}${outcome === null ? '' : ` ${outcome}`} ×${count}`,
   },
 
   /** What an API error code means, for the codes the server explains in English only; empty here: the server's own message is shown. */
