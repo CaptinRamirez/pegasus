@@ -139,6 +139,10 @@ export const en = {
     loading: 'loading…',
   },
 
+  layout: {
+    resizeBottom: 'Drag to resize the panel; double-click to restore its height',
+  },
+
   tabs: {
     campaign: 'Campaign',
     positions: 'Positions',

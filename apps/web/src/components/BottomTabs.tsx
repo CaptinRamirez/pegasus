@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import type { CampaignServiceStatus } from '@pegasus/shared';
 import { useT } from '../i18n';
+import { readBottomHeight, writeBottomHeight } from '../lib/bottomHeight';
+import type { BottomSize } from '../lib/bottomHeight';
 import { useStore } from '../store/store';
 import { CampaignPanel } from './CampaignPanel';
 import { FillsTable } from './FillsTable';
@@ -8,6 +10,7 @@ import { OrdersTable } from './OrdersTable';
 import { Panel } from './Panel';
 import { PositionsTable } from './PositionsTable';
 import { SignalsPanel } from './SignalsPanel';
+import { Splitter } from './Splitter';
 import { StopsTable } from './StopsTable';
 
 export type Tab = 'campaign' | 'positions' | 'orders' | 'stops' | 'history' | 'fills' | 'signals';
@@ -35,6 +38,17 @@ export function BottomTabs() {
   const positions = useStore((s) => s.positions.length);
   const orders = useStore((s) => Object.keys(s.orders).length);
   const stops = useStore((s) => s.algoOrders?.orders.length ?? 0);
+  // The height the divider above was dragged to, kept per size in localStorage; null is the stylesheet's height.
+  const size: BottomSize = tab === 'campaign' ? 'tall' : 'normal';
+  const [heights, setHeights] = useState<Record<BottomSize, number | null>>(() => ({
+    normal: readBottomHeight('normal'),
+    tall: readBottomHeight('tall'),
+  }));
+  const height = heights[size];
+  const resize = (px: number | null) => {
+    writeBottomHeight(size, px);
+    setHeights((h) => ({ ...h, [size]: px }));
+  };
 
   const tabs: { id: Tab; label: string; count?: number; title?: string }[] = [
     { id: 'campaign', label: t.tabs.campaign },
@@ -58,14 +72,21 @@ export function BottomTabs() {
   );
 
   return (
-    <Panel title={title} className={`panel-bottom${tab === 'campaign' ? ' panel-bottom-tall' : ''}`}>
-      {tab === 'campaign' && <CampaignPanel />}
-      {tab === 'positions' && <PositionsTable />}
-      {tab === 'orders' && <OrdersTable mode="open" />}
-      {tab === 'stops' && <StopsTable />}
-      {tab === 'history' && <OrdersTable mode="history" />}
-      {tab === 'fills' && <FillsTable />}
-      {tab === 'signals' && <SignalsPanel />}
-    </Panel>
+    <>
+      <Splitter title={t.layout.resizeBottom} onResize={resize} onReset={() => resize(null)} />
+      <Panel
+        title={title}
+        className={`panel-bottom${tab === 'campaign' ? ' panel-bottom-tall' : ''}`}
+        {...(height !== null ? { style: { flex: `0 0 ${height}px` } } : {})}
+      >
+        {tab === 'campaign' && <CampaignPanel />}
+        {tab === 'positions' && <PositionsTable />}
+        {tab === 'orders' && <OrdersTable mode="open" />}
+        {tab === 'stops' && <StopsTable />}
+        {tab === 'history' && <OrdersTable mode="history" />}
+        {tab === 'fills' && <FillsTable />}
+        {tab === 'signals' && <SignalsPanel />}
+      </Panel>
+    </>
   );
 }

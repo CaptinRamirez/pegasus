@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 
 interface PanelProps {
   title: ReactNode;
@@ -6,12 +6,13 @@ interface PanelProps {
   /** Rendered at the right side of the header; null renders nothing */
   extra?: ReactNode;
   pad?: boolean;
+  style?: CSSProperties;
   children: ReactNode;
 }
 
-export function Panel({ title, className, extra, pad = false, children }: PanelProps) {
+export function Panel({ title, className, extra, pad = false, style, children }: PanelProps) {
   return (
-    <section className={`panel ${className ?? ''}`}>
+    <section className={`panel ${className ?? ''}`} style={style}>
       <div className="panel-head">
         <span>{title}</span>
         {extra !== undefined && extra !== null && <span className="grow right">{extra}</span>}

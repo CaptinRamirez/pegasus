@@ -76,7 +76,21 @@ a:hover { text-decoration: underline; }
 .col-left > .panel-book { flex: 3 1 0; }
 .col-left > .panel-trades { flex: 2 1 0; }
 .col-center > .panel-chart { flex: 1 1 0; }
-.col-center > .panel-bottom { flex: 0 0 300px; }
+.col-center > .panel-bottom { flex: 0 0 300px; max-height: calc(100% - 160px); }
+/* Divider between the chart and the bottom panel: drag it, arrow keys move it, double-click restores the default. */
+.col-center > .splitter {
+  flex: 0 0 5px;
+  margin: -2px 0;
+  position: relative;
+  z-index: 2;
+  cursor: row-resize;
+  touch-action: none;
+  background: transparent;
+}
+.col-center > .splitter:hover, .col-center > .splitter:active, .col-center > .splitter:focus-visible {
+  background: var(--accent);
+  outline: none;
+}
 .col-right { overflow-y: auto; }
 .col-right > .panel { flex: 0 0 auto; }
 

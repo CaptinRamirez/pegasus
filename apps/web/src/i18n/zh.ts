@@ -137,6 +137,10 @@ export const zh: Messages = {
     loading: '加载中…',
   },
 
+  layout: {
+    resizeBottom: '拖动调整面板高度；双击恢复默认高度',
+  },
+
   tabs: {
     campaign: '滚仓',
     positions: '持仓',
