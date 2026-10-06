@@ -1,7 +1,10 @@
 export const RISK_KEY = 'pegasus.signals.riskPct';
 
-/** Risk per trade the framework allows: 0.5% for the first three months, 0.75% afterwards (fractions of equity). */
-export const RISK_CHOICES = ['0.005', '0.0075'] as const;
+/**
+ * Risk of one followed signal, a fraction of equity: what its plan loses at the stop (the SIGNALS tab sizes every plan
+ * with it). 0.5% and 0.75% are the steps of the owner's risk budget; 1% is the API's default.
+ */
+export const RISK_CHOICES = ['0.005', '0.0075', '0.01'] as const;
 export type RiskChoice = (typeof RISK_CHOICES)[number];
 
 export const DEFAULT_RISK: RiskChoice = '0.005';

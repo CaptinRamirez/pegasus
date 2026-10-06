@@ -167,10 +167,17 @@ export function mapOrder(o: OkxOrder): Order {
   return order;
 }
 
+/** OKX triggers on the last price when the order names no type. */
+const triggerType = (type: string | undefined): 'last' | 'index' | 'mark' => (type === 'mark' || type === 'index' ? type : 'last');
+
+/**
+ * An algo order of the list. A one-way stop-loss carries exactly the fields of the first version; a take-profit adds
+ * its trigger price type, an oco order and a trailing stop their type, a trailing stop its callback and activation.
+ */
 export function mapAlgoOrder(a: OkxAlgoOrder): AlgoOrder {
   const slTriggerPx = a.slTriggerPx ?? '';
-  const type = a.slTriggerPxType;
-  return {
+  const tpTriggerPx = a.tpTriggerPx ?? '';
+  const order: AlgoOrder = {
     algoId: a.algoId,
     algoClOrdId: a.algoClOrdId ?? '',
     instId: a.instId,
@@ -180,13 +187,22 @@ export function mapAlgoOrder(a: OkxAlgoOrder): AlgoOrder {
     sz: a.sz ?? '',
     closeFraction: a.closeFraction ?? '',
     slTriggerPx,
-    // OKX triggers on the last price when the order names no type.
-    slTriggerPxType: slTriggerPx === '' ? '' : type === 'mark' || type === 'index' ? type : 'last',
+    slTriggerPxType: slTriggerPx === '' ? '' : triggerType(a.slTriggerPxType),
     slOrdPx: a.slOrdPx ?? '',
-    tpTriggerPx: a.tpTriggerPx ?? '',
+    tpTriggerPx,
     cTime: num(a.cTime),
     uTime: num(a.uTime),
   };
+  if (a.ordType === 'oco' || a.ordType === 'move_order_stop') order.ordType = a.ordType;
+  if (tpTriggerPx !== '') order.tpTriggerPxType = triggerType(a.tpTriggerPxType);
+  if (a.amendPxOnTriggerType === '1') order.amendPxOnTriggerType = true;
+  if (a.ordType === 'move_order_stop') {
+    if (a.callbackRatio) order.callbackRatio = a.callbackRatio;
+    if (a.callbackSpread) order.callbackSpread = a.callbackSpread;
+    if (a.activePx) order.activePx = a.activePx;
+    order.moveTriggerPx = a.moveTriggerPx ?? '';
+  }
+  return order;
 }
 
 /**

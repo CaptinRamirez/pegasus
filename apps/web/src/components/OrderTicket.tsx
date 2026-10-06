@@ -1,37 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useMutation } from '@tanstack/react-query';
-import type { Localized, PlaceOrderRequest } from '@pegasus/shared';
-import { errorText, inEveryLang, labelOf, rejectionText, useLang, useT, type Messages } from '../i18n';
-import { api } from '../lib/api';
-import { isApiError } from '../lib/http';
-import { getSelectedInstrument, getKillSwitch, getTradingBlock, useStore } from '../store/store';
+import { labelOf, useLang, useT } from '../i18n';
+import { defaultExitForm } from '../lib/exits';
+import { useTrailing } from '../hooks/useTrailing';
+import { getSelectedInstrument, getSelectedMarket, getKillSwitch, getTradingBlock, useStore } from '../store/store';
+import { ExitPlanEditor } from './exits/ExitPlanEditor';
 import { Panel } from './Panel';
 import { LeverageControl } from './ticket/LeverageControl';
 import { PreviewPanel } from './ticket/PreviewPanel';
-import { ORD_TYPES, SIZE_UNITS, buildRequest, defaultForm, derivePosSide, describeRequest, intentOf, needsPrice, newClOrdId, unitLabel, type TicketForm } from './ticket/form';
+import { ORD_TYPES, SIZE_UNITS, buildRequest, defaultForm, derivePosSide, describeRequest, exitFieldsOf, intentOf, needsPrice, unitLabel, type TicketForm } from './ticket/form';
 import { useOrderPreview } from './ticket/useOrderPreview';
+import { usePlaceOrder } from './ticket/usePlaceOrder';
 
-/** Failures after which the order may or may not be on the exchange. */
-const UNKNOWN_OUTCOME_CODES: readonly string[] = ['NETWORK', 'INTERNAL', 'EXCHANGE_UNREACHABLE', 'ORDER_STATUS_UNKNOWN'];
-/** 5xx answers that are nevertheless definite: the exchange refused the order, or the server refused before sending anything. */
-const NOT_SENT_CODES: readonly string[] = ['EXCHANGE', 'NO_PRICE', 'NO_BOOK', 'NO_DATA', 'LEVERAGE_UNAVAILABLE', 'NOT_CONNECTED'];
-/** OKX's code for a client order id that is already in use. */
-const OKX_DUPLICATE_CL_ORD_ID = '51016';
-
-function outcomeUnknown(e: unknown): boolean {
-  if (!isApiError(e)) return true;
-  if (UNKNOWN_OUTCOME_CODES.includes(e.code) || e.status === 0) return true;
-  return e.status >= 500 && !NOT_SENT_CODES.includes(e.code);
-}
-
-interface Attempt {
-  /** The request without its client order id */
-  key: string;
-  clOrdId: string;
-  /** Whether the id was already used by an earlier attempt whose outcome is unknown */
-  retry: boolean;
-  unknown: boolean;
-}
+/** How long the ticket is highlighted after another tab put a coin into it. */
+const FLASH_MS = 1_500;
 
 export function OrderTicket() {
   const t = useT();
@@ -42,14 +23,23 @@ export function OrderTicket() {
   const tradingBlock = useStore(getTradingBlock);
   const ticketPrice = useStore((s) => s.ticketPrice);
   const ticketPrefill = useStore((s) => s.ticketPrefill);
+  const ticketFocus = useStore((s) => s.ticketFocus);
+  const lastPx = useStore((s) => {
+    const m = getSelectedMarket(s);
+    return m.ticker?.last ?? m.markPrice?.markPx ?? null;
+  });
   const pushToast = useStore((s) => s.pushToast);
+  const exitsOffered = useTrailing().available;
   const [form, setForm] = useState<TicketForm>(defaultForm);
   const patch = (p: Partial<TicketForm>) => setForm((f) => ({ ...f, ...p }));
+  const priceInput = useRef<HTMLInputElement | null>(null);
+  const sizeInput = useRef<HTMLInputElement | null>(null);
+  const [flash, setFlash] = useState(false);
 
   const instId = inst?.instId ?? null;
   useEffect(() => {
     // The close checkbox and a unit that a pre-fill brought belong to the instrument they were set for.
-    setForm((f) => ({ ...f, px: '', slTriggerPx: '', sizeValue: '', reduceOnly: false, sizeUnit: f.restoreUnit ?? f.sizeUnit, restoreUnit: null }));
+    setForm((f) => ({ ...f, px: '', slTriggerPx: '', sizeValue: '', reduceOnly: false, sizeUnit: f.restoreUnit ?? f.sizeUnit, restoreUnit: null, exits: defaultExitForm(), exitsOn: false }));
   }, [instId]);
 
   useEffect(() => {
@@ -64,45 +54,41 @@ export function OrderTicket() {
     setForm((f) => ({ ...f, side, ordType, px, slTriggerPx: ticketPrefill.slTriggerPx ?? '', sizeValue, sizeUnit, reduceOnly: false, restoreUnit: f.restoreUnit ?? f.sizeUnit }));
   }, [ticketPrefill, instId]);
 
+  // A coin and a side put here from another tab: nothing else is filled, and the first empty field takes the focus.
+  useEffect(() => {
+    if (ticketFocus === null || ticketFocus.instId !== instId) return;
+    setForm((f) => ({ ...f, side: ticketFocus.side, px: '', slTriggerPx: '', sizeValue: '', reduceOnly: false, exits: defaultExitForm(), exitsOn: false }));
+    setFlash(true);
+    const timer = setTimeout(() => setFlash(false), FLASH_MS);
+    const focus = setTimeout(() => (priceInput.current ?? sizeInput.current)?.focus(), 0);
+    return () => {
+      clearTimeout(timer);
+      clearTimeout(focus);
+    };
+  }, [ticketFocus, instId]);
+
   const longShort = posMode === 'long_short_mode';
+  const opening = !form.reduceOnly;
+  const exitEntry = needsPrice(form.ordType) ? (form.px.trim() === '' ? null : form.px.trim()) : lastPx;
+  const exitsActive = opening && form.exitsOn && exitsOffered === true;
   // While the position mode is unknown nothing is previewed: the request would be built for net mode.
-  const request = useMemo(() => (posMode === null ? null : buildRequest(form, instId, posMode)), [form, instId, posMode]);
+  const request = useMemo(
+    () => (posMode === null ? null : buildRequest({ ...form, exitsOn: exitsActive }, instId, posMode, { entry: exitEntry, inst })),
+    [form, instId, posMode, exitEntry, inst, exitsActive],
+  );
   const preview = useOrderPreview(request);
+  const exitBuilt = exitsActive ? exitFieldsOf(form, { entry: exitEntry, inst }) : null;
 
-  // What is shown under the submit button after a failed submit, in both languages: it follows a switch of the language.
-  const [submitError, setSubmitError] = useState<Localized | null>(null);
-  // The message is about the order as it was submitted: any edit makes it a different one.
-  useEffect(() => setSubmitError(null), [form]);
-  const attempt = useRef<Attempt | null>(null);
-
-  const place = useMutation({
-    mutationFn: (req: PlaceOrderRequest) => api.placeOrder(req),
-    onSuccess: ({ order }) => {
-      attempt.current = null;
-      setSubmitError(null);
-      pushToast('success', t.ticket.placed(order, intentOf(order.side, order.posSide)));
-    },
-    onError: (e) => {
-      const retry = attempt.current?.retry ?? false;
-      const failed = submitFailure(e, retry);
-      if (attempt.current !== null) attempt.current = { ...attempt.current, unknown: failed.unknown };
-      const text = inEveryLang(failed.text);
-      setSubmitError(text);
-      pushToast('error', text);
-    },
+  const flow = usePlaceOrder('pgw', ({ order }) => {
+    pushToast('success', t.ticket.placed(order, intentOf(order.side, order.posSide)), { kind: 'journal', instId: order.instId, mgnMode: order.tdMode, posSide: order.posSide, ordId: order.ordId });
   });
+  // The message is about the order as it was submitted: any edit makes it a different one.
+  const { clearError } = flow;
+  useEffect(() => clearError(), [form, clearError]);
 
   const submit = () => {
     if (preview.request === null || !preview.canSubmit || tradingBlock !== null) return;
-    const key = JSON.stringify(preview.request);
-    // The same order again after an unknown outcome carries the same id, so the server can look the first attempt up before sending anything.
-    // OKX itself refuses the id as a duplicate only while the first order still rests: a filled order frees its id.
-    // The retry is marked as one because the server's own memory of the id is lost when it restarts.
-    const last = attempt.current;
-    const retry = last !== null && last.unknown && last.key === key;
-    const clOrdId = retry ? last.clOrdId : newClOrdId();
-    attempt.current = { key, clOrdId, retry, unknown: false };
-    place.mutate(retry ? { ...preview.request, clOrdId, retry: true } : { ...preview.request, clOrdId });
+    flow.submit(preview.request);
   };
 
   if (inst === null) {
@@ -114,13 +100,13 @@ export function OrderTicket() {
   }
 
   // The kill switch is not a gate here: the server still accepts closing orders, and its verdict is in the preview.
-  const disabled = tradingBlock !== null || !preview.canSubmit || place.isPending;
+  const disabled = tradingBlock !== null || !preview.canSubmit || flow.isPending;
   const closing = longShort && form.reduceOnly;
   const posSide = derivePosSide(form.side, form.reduceOnly);
   // Once the server has answered for this exact form the button says what the server understood.
   const intent = !longShort ? null : preview.isCurrent && preview.preview !== undefined ? intentOf(preview.preview.side, preview.preview.posSide) : intentOf(form.side, posSide);
   return (
-    <Panel title={t.ticket.title} extra={<span className="num">{inst.instId}</span>} pad>
+    <Panel title={t.ticket.title} className={flash ? 'panel-flash' : ''} extra={<span className="num">{inst.instId}</span>} pad>
       <div className="form">
         {killSwitch && <div className="notice notice-danger">{t.ticket.killSwitchNotice}</div>}
         {tradingBlock !== null && <div className="notice notice-warn">{tradingBlock[lang]}</div>}
@@ -165,7 +151,7 @@ export function OrderTicket() {
             <label>
               {t.common.price} <span className="dim">{t.ticket.tick(inst.tickSz)}</span>
             </label>
-            <input className="num" inputMode="decimal" value={form.px} placeholder="0.0" onChange={(e) => patch({ px: e.target.value })} />
+            <input ref={priceInput} className="num" inputMode="decimal" value={form.px} placeholder="0.0" onChange={(e) => patch({ px: e.target.value })} />
           </div>
         )}
 
@@ -174,7 +160,7 @@ export function OrderTicket() {
             {t.common.size} <span className="dim">{t.ticket.sizeHint(inst.minSz, inst.lotSz)}</span>
           </label>
           <div className="input-group">
-            <input className="num" inputMode="decimal" value={form.sizeValue} placeholder="0" onChange={(e) => patch({ sizeValue: e.target.value })} />
+            <input ref={sizeInput} className="num" inputMode="decimal" value={form.sizeValue} placeholder="0" onChange={(e) => patch({ sizeValue: e.target.value })} />
             <select value={form.sizeUnit} onChange={(e) => patch({ sizeUnit: e.target.value as TicketForm['sizeUnit'], restoreUnit: null })}>
               {SIZE_UNITS.map((u) => (
                 <option key={u} value={u}>
@@ -185,12 +171,29 @@ export function OrderTicket() {
           </div>
         </div>
 
-        {!form.reduceOnly && (
+        {opening && (
           <div className="field">
             <label title={t.ticket.stopTitle}>
               {t.ticket.stopMark} <span className="dim">{t.ticket.stopHint(inst.tickSz)}</span>
             </label>
             <input className="num" inputMode="decimal" value={form.slTriggerPx} placeholder={t.ticket.none} onChange={(e) => patch({ slTriggerPx: e.target.value })} />
+          </div>
+        )}
+
+        {opening && exitsOffered === false && <div className="ticket-exits-off dim">{t.exits.unavailable}</div>}
+        {opening && exitsOffered === true && (
+          <div className={`ticket-exits${form.exitsOn ? ' open' : ''}`}>
+            <button type="button" className="ticket-exits-toggle" aria-expanded={form.exitsOn} title={t.exits.sectionTitle} onClick={() => patch({ exitsOn: !form.exitsOn })}>
+              <span className="chev">{form.exitsOn ? '▾' : '▸'}</span> {t.exits.section}
+            </button>
+            {form.exitsOn && (
+              <ExitPlanEditor
+                form={form.exits}
+                update={(change) => setForm((f) => ({ ...f, exits: change(f.exits) }))}
+                ctx={{ direction: form.side === 'buy' ? 'long' : 'short', entry: exitEntry, stop: form.slTriggerPx.trim() === '' ? null : form.slTriggerPx.trim(), inst, whole: true }}
+                error={exitBuilt !== null && !exitBuilt.ok ? exitBuilt.error : null}
+              />
+            )}
           </div>
         )}
 
@@ -211,23 +214,14 @@ export function OrderTicket() {
           onClick={submit}
           title={tradingBlock !== null ? tradingBlock[lang] : preview.request === null ? t.ticket.completeForm : describeRequest(preview.request, t)}
         >
-          {place.isPending ? t.ticket.submitting : t.ticket.submitLabel(intent, form.side, inst.baseCcy, labelOf(t.enums.ordType, form.ordType))}
+          {flow.isPending ? t.ticket.submitting : t.ticket.submitLabel(intent, form.side, inst.baseCcy, labelOf(t.enums.ordType, form.ordType))}
         </button>
-        {submitError !== null && (
+        {flow.error !== null && (
           <div className="notice notice-danger" role="alert">
-            {submitError[lang]}
+            {flow.error[lang]}
           </div>
         )}
       </div>
     </Panel>
   );
-}
-
-/** Why a submit failed, as a text for either dictionary, and whether the order may nevertheless be on the exchange. */
-function submitFailure(e: unknown, retry: boolean): { text: (t: Messages) => string; unknown: boolean } {
-  if (retry && isApiError(e) && e.code === 'EXCHANGE' && e.details?.['okxCode'] === OKX_DUPLICATE_CL_ORD_ID) {
-    return { text: (t) => t.ticket.errDuplicate, unknown: false };
-  }
-  if (outcomeUnknown(e)) return { text: (t) => t.ticket.errUnknown(errorText(e, t)), unknown: true };
-  return { text: (t) => t.ticket.errRejected(errorText(e, t), rejectionText(e, t)), unknown: false };
 }

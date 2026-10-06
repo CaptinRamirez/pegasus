@@ -1,10 +1,14 @@
+import { useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
-import { D, stopCoverage, type ClosePositionRequest, type Instrument, type PlaceStopRequest, type Position, type StopCoverage } from '@pegasus/shared';
+import { D, stopCoverage, type AlgoOrder, type ChannelTrailingEntry, type ClosePositionRequest, type Instrument, type PlaceStopRequest, type Position, type StopCoverage } from '@pegasus/shared';
 import { api } from '../lib/api';
 import { errorText, labelOf, useLang, useT, type Messages } from '../i18n';
-import { fmtCoin, fmtContracts, fmtNum, fmtPct, fmtPx, fmtSigned, fmtTime, signOf } from '../lib/format';
+import { channelOf, takeProfitsOf, trailingStopsOf } from '../lib/exits';
+import { DASH, fmtCoin, fmtContracts, fmtNum, fmtPct, fmtPx, fmtSigned, fmtTime, signOf } from '../lib/format';
+import { useTrailing } from '../hooks/useTrailing';
 import { accountAsOf, accountUnknown, trimAdvice, trimShares, type AccountUnknown } from '../store/alerts';
 import { getTradingBlock, useStore } from '../store/store';
+import { PositionExitsDialog } from './positions/PositionExitsDialog';
 
 const unknownText = (t: Messages): Record<AccountUnknown, string> => ({
   waiting: t.common.waitingServer,
@@ -44,6 +48,30 @@ function StopCell({ coverage, inst, onAdd }: { coverage: StopCoverage | null; in
   );
 }
 
+/** The take-profit orders of the position, as last read: their triggers, or how many. */
+function TpCell({ tps, inst }: { tps: AlgoOrder[] | null; inst: Instrument | undefined }) {
+  const t = useT();
+  if (tps === null) return <span className="dim" title={t.positions.stopsUnread}>?</span>;
+  if (tps.length === 0) return <span className="dim">{DASH}</span>;
+  return <span title={t.exits.colTpTitle}>{tps.length <= 2 ? tps.map((a) => fmtPx(a.tpTriggerPx, inst)).join(' / ') : t.exits.tpCount(tps.length)}</span>;
+}
+
+/** The exchange's trailing stop (its callback and where it triggers now) or Pegasus's channel trailing (its level now). */
+function TrailingCell({ stops, channel, inst }: { stops: AlgoOrder[] | null; channel: ChannelTrailingEntry | null; inst: Instrument | undefined }) {
+  const t = useT();
+  const parts: string[] = [];
+  if (channel !== null) parts.push(t.exits.channelShort(channel.bars, channel.level === null ? DASH : fmtPx(channel.level, inst)));
+  for (const a of stops ?? []) parts.push(t.exits.callbackShort(fmtPct(a.callbackRatio ?? '', 2), a.moveTriggerPx === undefined || a.moveTriggerPx === '' ? '' : fmtPx(a.moveTriggerPx, inst)));
+  if (parts.length === 0) return <span className="dim">{DASH}</span>;
+  return (
+    <span className="pos-trailing" title={t.exits.colTrailingTitle}>
+      {parts.map((p) => (
+        <span key={p}>{p}</span>
+      ))}
+    </span>
+  );
+}
+
 function sideOf(p: Position): 'long' | 'short' | 'flat' {
   if (p.posSide === 'long' || p.posSide === 'short') return p.posSide;
   const d = D(p.pos);
@@ -65,6 +93,13 @@ export function PositionsTable() {
   const pushToast = useStore((s) => s.pushToast);
   const unknown = useStore(accountUnknown);
   const asOf = accountAsOf(connection, Date.now());
+  const campaign = useStore((s) => s.campaign);
+  const trailing = useTrailing();
+  const [exitsOf, setExitsOf] = useState<string | null>(null);
+  const keyOf = (p: Position): string => `${p.instId}:${p.posSide}:${p.mgnMode}`;
+  /** An isolated position on a coin with an open campaign is the pot's: its exits are the rule's. */
+  const campaignOwned = (p: Position): boolean => p.mgnMode === 'isolated' && (campaign?.campaigns.some((c) => c.end === null && c.instId === p.instId) ?? false);
+  const exitsTitle = trailing.available === true ? t.exits.openTitle : trailing.available === false ? t.exits.unavailable : t.exits.unknown;
 
   const close = useMutation({
     mutationFn: (body: ClosePositionRequest) => api.closePosition(body),
@@ -106,12 +141,14 @@ export function PositionsTable() {
   // An empty list only means a flat account once the positions were actually loaded.
   if (open.length === 0) return <div className="empty">{unknown === null ? <>{t.positions.empty} {asOfTag}</> : unknownText(t)[unknown]}</div>;
 
+  const exitsPosition = exitsOf === null ? undefined : open.find((x) => keyOf(x) === exitsOf);
   return (
-    <table className="table">
+    <>
+    <table className="table pos-table">
       {asOfTag !== null && <caption className="as-of">{t.positions.caption} {asOfTag}</caption>}
       <thead>
         <tr>
-          <th>{t.common.instrument}</th>
+          <th className="pos-sticky-left">{t.common.instrument}</th>
           <th className="left">{t.common.side}</th>
           <th>{t.positions.contracts}</th>
           <th>{t.positions.coin}</th>
@@ -124,7 +161,9 @@ export function PositionsTable() {
           <th>{t.positions.liqPx}</th>
           <th>{t.positions.margin}</th>
           <th>{t.positions.notional}</th>
-          <th />
+          <th title={t.exits.colTpTitle}>{t.exits.colTp}</th>
+          <th title={t.exits.colTrailingTitle}>{t.exits.colTrailing}</th>
+          <th className="pos-sticky-right" />
         </tr>
       </thead>
       <tbody>
@@ -138,9 +177,12 @@ export function PositionsTable() {
           const share = over === undefined ? undefined : trimShares(open, over).get(p);
           const trim = over === undefined || share === undefined ? null : trimAdvice(p, { ...over, excess: share.toFixed() }, inst);
           const coverage = algoOrders === null ? null : stopCoverage(p, algoOrders.orders);
+          const tps = algoOrders === null ? null : takeProfitsOf(p, algoOrders.orders);
+          const trailingStops = algoOrders === null ? null : trailingStopsOf(p, algoOrders.orders);
+          const channel = channelOf(p, trailing.view?.entries);
           return (
-            <tr key={`${p.instId}:${p.posSide}:${p.mgnMode}`} className={over === undefined ? 'num' : 'num over-limit'}>
-              <td className="left">
+            <tr key={keyOf(p)} className={over === undefined ? 'num' : 'num over-limit'}>
+              <td className="left pos-sticky-left">
                 {p.instId}
                 {inst === undefined && (
                   <span className="untracked-tag" title={t.common.untrackedTitle}>
@@ -174,19 +216,44 @@ export function PositionsTable() {
                 )}
               </td>
               <td>
-                <button
-                  className="btn btn-sm btn-danger"
-                  onClick={() => onClose(p)}
-                  disabled={close.isPending || tradingBlock !== null}
-                  {...(tradingBlock === null ? {} : { title: tradingBlock[lang] })}
-                >
-                  {t.positions.close}
-                </button>
+                <TpCell tps={tps} inst={inst} />
+              </td>
+              <td>
+                <TrailingCell stops={trailingStops} channel={channel} inst={inst} />
+              </td>
+              <td className="pos-sticky-right">
+                <span className="pos-actions">
+                  <button
+                    className="btn btn-sm btn-danger"
+                    onClick={() => onClose(p)}
+                    disabled={close.isPending || tradingBlock !== null}
+                    {...(tradingBlock === null ? {} : { title: tradingBlock[lang] })}
+                  >
+                    {t.positions.close}
+                  </button>
+                  <button
+                    className="btn btn-sm pos-exits"
+                    onClick={() => setExitsOf(keyOf(p))}
+                    disabled={trailing.available !== true || tradingBlock !== null}
+                    title={tradingBlock !== null ? tradingBlock[lang] : exitsTitle}
+                  >
+                    {t.exits.open}
+                  </button>
+                </span>
               </td>
             </tr>
           );
         })}
       </tbody>
     </table>
+    {exitsPosition !== undefined && (
+      <PositionExitsDialog
+        position={exitsPosition}
+        inst={instruments.find((i) => i.instId === exitsPosition.instId)}
+        campaignOwned={campaignOwned(exitsPosition)}
+        onClose={() => setExitsOf(null)}
+      />
+    )}
+    </>
   );
 }

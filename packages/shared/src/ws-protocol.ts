@@ -19,6 +19,7 @@ import type {
   Trade,
 } from './types.js';
 import type { CampaignView } from './campaign-api.js';
+import type { JournalUpdate } from './journal.js';
 import { candleBarSchema, instIdSchema } from './schemas.js';
 
 /**
@@ -77,6 +78,7 @@ export type ServerMessage =
   | { type: 'subscribed'; data: { instId: string; bar: CandleBar } }
   | { type: 'error'; data: { code: string; message: string } }
   | CampaignMessage
+  | JournalMessage
   | { type: 'pong'; data: { ts: number } };
 
 export type ServerMessageType = ServerMessage['type'];
@@ -86,6 +88,9 @@ export type ServerMessageType = ServerMessage['type'];
  * ledger, while the campaign is enabled.
  */
 export type CampaignMessage = { type: 'campaign'; data: CampaignView };
+
+/** The trade journal changed (GET /api/journal): the status and the trades that changed, sent to every client after every change. */
+export type JournalMessage = { type: 'journal'; data: JournalUpdate };
 
 /** Everything the server sends over /ws: the same union as ServerMessage, which carries the campaign message now. */
 export type ServerPush = ServerMessage;

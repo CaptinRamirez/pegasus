@@ -145,8 +145,8 @@ describe('loadConfig campaign', () => {
       // the replay beside the pot keeps what it reads from OKX under data/, which git ignores
       replayCacheDir: join(root, 'data', 'campaign-replay'),
     });
-    // while it is off its instruments are not tracked
-    expect(config.instruments).toEqual(['BTC-USDT-SWAP', 'ETH-USDT-SWAP']);
+    // its instruments are tracked whether it is on or not: the signals page shows the campaign rule on them
+    expect(config.instruments).toEqual([...new Set(['BTC-USDT-SWAP', 'ETH-USDT-SWAP', ...CAMPAIGN_INSTRUMENTS])]);
   });
 
   it('refuses to start enabled anywhere but on the paper exchange: this stage is paper only', () => {
@@ -173,8 +173,8 @@ describe('loadConfig campaign', () => {
     expect(on.instruments).toEqual([...CAMPAIGN_INSTRUMENTS]);
     expect(on.signalInstruments).toEqual(['BTC-USDT-SWAP']);
     const off = loadConfig({ ...PAPER, INSTRUMENTS: 'ETH-USDT-SWAP,SOL-USDT-SWAP' });
-    expect(off.instruments).toEqual(['ETH-USDT-SWAP', 'SOL-USDT-SWAP']);
-    expect(off.signalInstruments).toEqual(off.instruments);
+    expect(off.instruments).toEqual([...new Set(['ETH-USDT-SWAP', 'SOL-USDT-SWAP', ...CAMPAIGN_INSTRUMENTS])]);
+    expect(off.signalInstruments).toEqual(['ETH-USDT-SWAP', 'SOL-USDT-SWAP']);
   });
 
   it('refuses settings that would break it silently', () => {

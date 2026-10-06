@@ -172,6 +172,23 @@ export function fmtDateTime(ts: number): string {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${fmtTime(ts)}`;
 }
 
+/** The browser's local wall-clock time to the minute: "2026-10-03 08:00". */
+export function fmtLocalMinute(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/**
+ * The browser's local time of a moment shown in UTC beside it: "08:00", or "10-02 19:00" when it is another day
+ * there than in UTC.
+ */
+export function fmtLocalTime(ts: number): string {
+  const d = new Date(ts);
+  const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  const sameDay = d.getFullYear() === d.getUTCFullYear() && d.getMonth() === d.getUTCMonth() && d.getDate() === d.getUTCDate();
+  return sameDay ? time : `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${time}`;
+}
+
 /** UTC wall-clock time to the minute: "2026-10-03 00:00 UTC". */
 export function fmtUtcMinute(ts: number): string {
   const d = new Date(ts);

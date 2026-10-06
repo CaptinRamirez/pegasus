@@ -1,68 +1,53 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import { ceilToStep, D, DEFAULT_TREND_PARAMS, floorToStep, isSignalReportError, phaseDayStart, toPlainString, type InstrumentSignalReport, type Side, type SignalPhase, type SignalReportRow, type TrendParams } from '@pegasus/shared';
+import type { CampaignFollowPlan, CampaignSignalRow, SignalSnapshot } from '@pegasus/shared';
+import { useCampaignSignals } from '../hooks/useCampaignSignals';
+import { useTrailing } from '../hooks/useTrailing';
 import { errorText, useLang, useT } from '../i18n';
-import { api, type SignalsQuery } from '../lib/api';
-import { fmtDateTime, fmtNum, fmtPct, fmtUtcMinute, safeDecimal } from '../lib/format';
-import { useStore } from '../store/store';
-import { SignalRow, cutLabel } from './signals/SignalRow';
+import { fmtDateTime, fmtNum, fmtPct } from '../lib/format';
+import { followBlock, sortRows } from '../lib/signals';
+import { PAPER_WEB_PORT, stackUrl } from '../lib/stacks';
+import { getKillSwitch, getTradingBlock, useStore } from '../store/store';
+import { useUi } from '../store/ui';
+import { LoadFailed } from './LoadFailed';
+import { CoinCard } from './signals/CoinCard';
+import { CoinList } from './signals/CoinList';
+import { FollowSheet } from './signals/FollowSheet';
 import { RISK_CHOICES, readStoredRiskPct, writeStoredRiskPct, type RiskChoice } from './signals/riskPref';
 
-const REFETCH_MS = 5 * 60_000;
-const STALE_MS = 60_000;
-/** A report older than this missed two refreshes in a row: it is no longer shown as current. */
-const OUTDATED_MS = 2 * REFETCH_MS;
-const CLOCK_MS = 30_000;
-const DAY_MS = 86_400_000;
-/** A daily bar that closed longer ago than this is not the latest one: a newer bar should exist by now. */
-const BAR_STALE_MS = DAY_MS + 10 * 60_000;
+/** A refresh that failed twice in a row: the figures on screen are no longer current. */
+const OUTDATED_MS = 2 * 30_000 + 15_000;
 
-/** One table row per instrument and cut. */
-const rowKey = (row: SignalReportRow): string => `${row.instId}:${row.phase}`;
+type Followable = CampaignSignalRow & { plan: CampaignFollowPlan; signal: SignalSnapshot };
+const followable = (row: CampaignSignalRow): row is Followable => row.plan !== null && row.signal !== null;
 
-const NO_PHASES: SignalPhase[] = [];
-
-/** Live equity as the API accepts it (plain positive decimal), or undefined to let the server pick. */
-function equityParam(totalEq: string | null): string | undefined {
-  const d = safeDecimal(totalEq);
-  return d !== null && d.gt(0) ? d.toFixed() : undefined;
-}
-
+/**
+ * The SIGNALS tab: the campaign rule read coin by coin (GET /api/campaign/signals). The coins on the left, actionable
+ * first; the chosen coin's state in words, its levels, a chart and the plan on the right, with the two ways in: follow
+ * the signal through the confirmation sheet, or open by hand from the order ticket.
+ */
 export function SignalsPanel() {
   const t = useT();
   const lang = useLang();
-  const totalEq = useStore((s) => s.balance?.totalEq ?? null);
-  const instruments = useStore((s) => s.instruments);
-  const positions = useStore((s) => s.positions);
-  const openOrders = useStore((s) => s.orders);
-  const applyTicketPrefill = useStore((s) => s.applyTicketPrefill);
-  const pushToast = useStore((s) => s.pushToast);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [riskPct, setRiskPct] = useState<RiskChoice>(readStoredRiskPct);
-
-  const equity = equityParam(totalEq);
-  const q = useQuery({
-    // The reasons and sizing notes of a report are written by the server, in the language asked for.
-    queryKey: ['signals', riskPct, lang],
-    queryFn: () => {
-      const query: SignalsQuery = { riskPct };
-      if (equity !== undefined) query.equity = equity;
-      if (lang !== 'en') query.lang = lang;
-      return api.signals(query);
-    },
-    refetchInterval: REFETCH_MS,
-    staleTime: STALE_MS,
-    // The page stays open for hours in a background tab; coming back to it must show the current bar.
-    refetchOnWindowFocus: 'always',
-  });
-
+  const q = useCampaignSignals(riskPct);
+  const exits = useTrailing();
+  const killSwitch = useStore(getKillSwitch);
+  const tradingBlock = useStore(getTradingBlock);
+  const instruments = useStore((s) => s.instruments);
+  const focusTicket = useStore((s) => s.focusTicket);
+  const coin = useUi((s) => s.signalsCoin);
+  const setCoin = useUi((s) => s.setSignalsCoin);
+  const [sheet, setSheet] = useState<Followable | null>(null);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), CLOCK_MS);
+    const timer = setInterval(() => setNow(Date.now()), 30_000);
     return () => clearInterval(timer);
   }, []);
-  // A failed refresh keeps the previous table on screen; it must not look live or be acted on.
-  const outdated = q.data !== undefined && (q.isError || now - q.dataUpdatedAt > OUTDATED_MS);
+
+  const res = q.data;
+  const rows = useMemo(() => sortRows(res?.rows ?? []), [res]);
+  const selected = rows.find((r) => r.instId === coin) ?? rows[0] ?? null;
+  const outdated = res !== undefined && (q.isError || now - q.dataUpdatedAt > OUTDATED_MS);
 
   const chooseRisk = (value: string) => {
     const choice = RISK_CHOICES.find((c) => c === value);
@@ -71,67 +56,12 @@ export function SignalsPanel() {
     setRiskPct(choice);
   };
 
-  /**
-   * Close times of the daily bars behind the reports (open time plus one day): the newest one is the bar shown,
-   * the oldest one decides whether some row is overdue. null without reports.
-   */
-  const barClosed = useMemo(() => {
-    let oldest: number | null = null;
-    let newest: number | null = null;
-    for (const r of q.data?.reports ?? []) {
-      if (isSignalReportError(r)) continue;
-      if (oldest === null || r.indicators.asOf < oldest) oldest = r.indicators.asOf;
-      if (newest === null || r.indicators.asOf > newest) newest = r.indicators.asOf;
-    }
-    return oldest === null || newest === null ? null : { oldest: oldest + DAY_MS, newest: newest + DAY_MS };
-  }, [q.data]);
-
-  /** The daily cuts the server computes. */
-  const phases = q.data?.phases ?? NO_PHASES;
-
-  /** The cut whose daily bar closed most recently before the report was generated; null when there is only one cut. */
-  const latestPhase = useMemo(() => {
-    if (q.data === undefined || q.data.phases.length < 2) return null;
-    const generatedAt = q.data.generatedAt;
-    return q.data.phases.reduce((a, b) => (phaseDayStart(generatedAt, b) > phaseDayStart(generatedAt, a) ? b : a));
-  }, [q.data]);
-
-  const params: TrendParams = useMemo(() => {
-    const first = q.data?.reports.find((r) => !isSignalReportError(r));
-    return first !== undefined && !isSignalReportError(first) ? first.params : DEFAULT_TREND_PARAMS;
-  }, [q.data]);
-
-  const shortsOff = params.allowShort === false;
-
-  const orders = useMemo(() => Object.values(openOrders), [openOrders]);
-
-  const toggle = (key: string) => setExpanded((e) => ({ ...e, [key]: !(e[key] ?? false) }));
-
-  const apply = (r: InstrumentSignalReport, side: Side) => {
-    if (r.sizing === null) return;
-    // the row's own plan: one cut's lot, and each side has its own (shorts, crisis entries and crowded entries are sized down)
-    const plan = side === 'buy' ? r.sizing.long : r.sizing.short;
-    const inst = instruments.find((i) => i.instId === r.instId);
-    const px = inst === undefined ? r.indicators.close : toPlainString(r.indicators.close, inst.tickSz);
-    // the plan's stop for that side, on the tick towards the entry as the server would round it
-    const rawStop = side === 'buy' ? plan.stopLong : plan.stopShort;
-    const slTriggerPx = inst === undefined ? rawStop : toPlainString(side === 'buy' ? ceilToStep(rawStop, inst.tickSz) : floorToStep(rawStop, inst.tickSz), inst.tickSz);
-    // a stop distance wider than the price leaves no stop to place
-    const withStop = D(slTriggerPx).gt(0);
-    applyTicketPrefill({ instId: r.instId, side, ordType: 'limit', px, sizeValue: plan.contracts, sizeUnit: 'contracts', ...(withStop ? { slTriggerPx } : {}) });
-    // the trader must not assume the plan's stop came along when it did not
-    pushToast('info', t.signals.ticketFilled(side, plan.contracts, r.instId, px, phases.length > 1 ? cutLabel(r.phase) : null, !withStop));
-  };
-
-  // The framework this tab implements is retired: said once, above everything else on the tab.
-  const archived = <div className="signals-archived">{t.signals.archived}</div>;
-
   const toolbar = (
-    <div className="signals-toolbar">
+    <div className="sig-toolbar">
       <button className="btn btn-sm" onClick={() => void q.refetch()} disabled={q.isFetching}>
         {q.isFetching ? t.signals.refreshing : t.common.refresh}
       </button>
-      <label title={t.signals.riskTitle(phases.length)}>
+      <label title={t.signals.riskTitle}>
         {t.signals.risk}{' '}
         <select value={riskPct} onChange={(e) => chooseRisk(e.target.value)}>
           {RISK_CHOICES.map((c) => (
@@ -141,140 +71,82 @@ export function SignalsPanel() {
           ))}
         </select>
       </label>
-      {q.data !== undefined && (
+      {res !== undefined && (
         <>
-          {barClosed !== null && (
-            <span
-              className={`signals-bar num${Date.now() - barClosed.oldest > BAR_STALE_MS ? ' warn' : ''}`}
-              title={t.signals.barClosedTitle}
-            >
-              {t.signals.barClosed(fmtUtcMinute(barClosed.newest), Date.now() - barClosed.newest)}
-            </span>
-          )}
           <span>
-            {t.signals.updated} <span className="num">{fmtDateTime(q.data.generatedAt)}</span>
+            {t.signals.equity} <span className="num">{res.equity === null ? t.common.na : `${fmtNum(res.equity, 2)} USDT`}</span>
           </span>
           <span>
-            {t.signals.equity} <span className="num">{q.data.equity === null ? t.common.na : fmtNum(q.data.equity, 2)}</span>
+            {t.signals.updated} <span className="num">{fmtDateTime(res.generatedAt)}</span>
           </span>
-          {phases.length > 1 ? (
-            // sizingParams are those of one cut's lot; the unit the owner chose is the lots together
-            <span title={t.signals.lotTitle(fmtPct(q.data.sizingParams.riskPct, 3), fmtPct(q.data.sizingParams.maxNotionalPct, 1))}>
-              {t.signals.perUnit(fmtPct(D(q.data.sizingParams.riskPct).mul(phases.length).toFixed(), 2), fmtPct(D(q.data.sizingParams.maxNotionalPct).mul(phases.length).toFixed(), 0), phases.length)}
-            </span>
-          ) : (
-            <span>{t.signals.perTrade(fmtPct(q.data.sizingParams.riskPct, 2), fmtPct(q.data.sizingParams.maxNotionalPct, 0))}</span>
-          )}
+          <span className="dim sig-rule">
+            {t.signals.rule({
+              entryChannel: res.params.entryChannel,
+              exitChannel: res.params.exitChannel,
+              addStep: fmtPct(res.params.addStep, 0),
+              adds: res.params.structure === 'pyramid',
+              leverage: res.params.leverage,
+            })}
+          </span>
         </>
       )}
-      <span className="dim">{t.signals.summary(phases.map(cutLabel), phases[0] === undefined || phases[0] === 0, params, shortsOff)}</span>
       {q.isError && <span className="neg">{errorText(q.error, t)}</span>}
     </div>
   );
 
-  if (q.data === undefined) {
+  if (res === undefined) {
     return (
-      <div className="signals">
-        {archived}
+      <div className="sig">
         {toolbar}
-        <div className="empty">{q.isError ? t.signals.unavailable : t.signals.loading}</div>
-      </div>
-    );
-  }
-  if (q.data.reports.length === 0) {
-    return (
-      <div className="signals">
-        {archived}
-        {toolbar}
-        <div className="empty">{t.signals.noInstruments}</div>
+        <div className="empty">{q.isError ? <LoadFailed what={t.signals.what} busy={q.isFetching} onRetry={() => void q.refetch()} /> : t.signals.loading}</div>
       </div>
     );
   }
 
+  const ownAccount = res.campaign.ownAccount;
+  const banners: Array<{ key: string; cls: string; text: string }> = [];
+  if (ownAccount) banners.push({ key: 'campaign', cls: 'notice-danger', text: t.signals.banner.campaignAccount(stackUrl(PAPER_WEB_PORT)) });
+  if (killSwitch) banners.push({ key: 'kill', cls: 'notice-danger', text: t.signals.banner.killSwitch });
+  if (exits.available === false && !ownAccount) banners.push({ key: 'exits', cls: 'notice-warn', text: t.signals.banner.exitsUnavailable });
+
+  const inst = selected === null ? undefined : instruments.find((i) => i.instId === selected.instId);
+  const block = selected === null ? null : followBlock(selected, { ownAccount, killSwitch, exits: exits.available, tradingBlocked: tradingBlock !== null });
+  const manualBlock = tradingBlock !== null ? tradingBlock[lang] : inst === undefined ? t.signals.manualUntracked : null;
+
   return (
-    <div className={`signals${outdated ? ' signals-stale' : ''}`}>
-      {archived}
+    <div className={`sig${outdated ? ' sig-outdated' : ''}`}>
       {toolbar}
-      {outdated && <div className="notice notice-warn signals-outdated">{t.signals.outdated(fmtDateTime(q.dataUpdatedAt))}</div>}
-      <table className="table signals-table">
-        <thead>
-          <tr>
-            <th>{t.common.instrument}</th>
-            <th className="left">{t.signals.regime}</th>
-            <th>{t.signals.close}</th>
-            <th>
-              MA{params.trendMaPeriod}
-              <span className="sub">{t.signals.distAtr}</span>
-            </th>
-            <th>
-              ATR({params.atrPeriod})
-              <span className="sub">{t.signals.atrPct}</span>
-            </th>
-            <th>
-              {t.signals.dHigh(params.entryChannel)}
-              <span className="sub">{t.signals.dLow(params.entryChannel)}</span>
-            </th>
-            <th title={t.signals.exitTitle}>
-              {t.signals.dHigh(params.exitChannel)}
-              <span className="sub">{t.signals.dLow(params.exitChannel)}</span>
-            </th>
-            <th title={t.signals.erTitle(params.efficiencyPeriod)}>ER</th>
-            <th title={t.signals.volRatioTitle(params.volShortPeriod, params.volLongPeriod)}>{t.signals.volRatio}</th>
-            <th>
-              {t.signals.funding3d}
-              <span className="sub">{t.signals.annualised}</span>
-            </th>
-            <th title={t.signals.bookTitle}>
-              {t.signals.book}
-              <span className="sub">{t.signals.spreadDepth}</span>
-            </th>
-            <th title={t.signals.oiTitle}>
-              {t.signals.oi}
-              <span className="sub">{t.signals.oiSub}</span>
-            </th>
-            <th className="left">{t.signals.signals}</th>
-            <th>
-              {t.signals.stopLong}
-              <span className="sub">{t.signals.stopShort}</span>
-            </th>
-            <th>{t.signals.stopPct}</th>
-            <th title={t.signals.contractsTitle(shortsOff)}>
-              {t.signals.contractsLong}
-              <span className="sub">{t.signals.short}</span>
-            </th>
-            <th>
-              {t.signals.coinLong}
-              <span className="sub">{t.signals.short}</span>
-            </th>
-            <th title={t.signals.notionalTitle}>
-              {t.signals.notionalLong}
-              <span className="sub">{t.signals.short}</span>
-            </th>
-            <th>
-              {t.signals.riskLong}
-              <span className="sub">{t.signals.short}</span>
-            </th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {q.data.reports.map((row) => (
-            <SignalRow
-              key={rowKey(row)}
-              row={row}
-              latest={latestPhase !== null && row.phase === latestPhase}
-              cuts={phases.length}
-              inst={instruments.find((i) => i.instId === row.instId)}
-              positions={positions}
-              orders={orders}
-              outdated={outdated}
-              expanded={expanded[rowKey(row)] ?? false}
-              onToggle={() => toggle(rowKey(row))}
-              onApply={apply}
-            />
-          ))}
-        </tbody>
-      </table>
+      {banners.map((b) => (
+        <div key={b.key} className={`notice ${b.cls} sig-banner`}>
+          {b.text}
+        </div>
+      ))}
+      {outdated && <div className="notice notice-warn sig-banner">{t.signals.outdated(fmtDateTime(q.dataUpdatedAt))}</div>}
+      {rows.length === 0 || selected === null ? (
+        <div className="empty">{t.signals.empty}</div>
+      ) : (
+        <div className="sig-body">
+          <CoinList rows={rows} selected={selected.instId} instruments={instruments} onSelect={setCoin} />
+          <CoinCard
+            row={selected}
+            res={res}
+            inst={inst}
+            block={block}
+            manualBlock={manualBlock}
+            now={now}
+            onFollow={() => {
+              if (block === null && followable(selected)) setSheet(selected);
+            }}
+            onManual={() => {
+              if (manualBlock === null) focusTicket(selected.instId, 'buy');
+            }}
+          />
+        </div>
+      )}
+      {sheet !== null && (() => {
+        const sheetInst = instruments.find((i) => i.instId === sheet.instId);
+        return sheetInst === undefined ? null : <FollowSheet row={sheet} res={res} inst={sheetInst} onClose={() => setSheet(null)} />;
+      })()}
     </div>
   );
 }

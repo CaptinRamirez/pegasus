@@ -378,7 +378,7 @@ export class Engine implements EngineContext {
     return this.orders.historyOrders(instId, limit).map((o) => orderToWire(o, true));
   }
 
-  /** Active stops as algo orders, newest first. */
+  /** Active algo orders (TP/SL orders and trailing stops), newest first. */
   algoOrdersPending(instId?: string): OkxAlgoOrder[] {
     return this.orders
       .activeStops(instId)

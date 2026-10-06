@@ -2,7 +2,7 @@ import type { Instrument } from '@pegasus/shared';
 import { errorText, rejectionText, riskText, useT, type Messages } from '../../i18n';
 import type { OrderPreview } from '../../lib/api';
 import { isApiError } from '../../lib/http';
-import { fmtNum, fmtPct, fmtPx } from '../../lib/format';
+import { fmtContracts, fmtNum, fmtPct, fmtPx } from '../../lib/format';
 import { intentOf } from './form';
 
 interface Props {
@@ -93,6 +93,15 @@ export function PreviewPanel({ preview, error, isFetching, inst }: Props) {
           </div>
         </>
       )}
+      {preview.takeProfits !== undefined &&
+        preview.takeProfits.map((leg, i) => (
+          <div className="kv num" key={i}>
+            <span>{t.follow.tpLeg(i + 1)}</span>
+            <span>
+              {fmtPx(leg.triggerPx, inst)} · {fmtContracts(leg.sz, inst)} · <span className="pos">+{fmtNum(leg.profitQuote)} {quote}</span>
+            </span>
+          </div>
+        ))}
       <div className={`risk-msg ${preview.risk.ok ? 'good' : 'bad'}`}>
         {preview.risk.ok ? (closing ? t.preview.closingOk : t.preview.riskOk) : `${preview.risk.code}: ${riskText(preview.risk, t)}`}
       </div>

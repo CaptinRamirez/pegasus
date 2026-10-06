@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { DECIMAL_STRING_RE } from './decimal.js';
+import { D, DECIMAL_STRING_RE } from './decimal.js';
 import { CANDLE_BARS } from './types.js';
 
 /** A non-negative decimal string. */
@@ -37,6 +37,51 @@ export const orderSizeSchema = z.object({
 });
 export type OrderSize = z.infer<typeof orderSizeSchema>;
 
+/** A fraction in (0, 1] as a decimal string, e.g. "0.5". */
+export const fractionString = positiveDecimalString.refine((s) => D(s).lte(1), 'must be at most 1');
+
+/** One take-profit of an opening order: when its trigger price is reached, `fraction` of the order's filled size is closed at market (mark-triggered). */
+export const takeProfitLegSchema = z.object({
+  triggerPx: positiveDecimalString,
+  /** Share of the filled size this leg closes; the legs of one order add up to at most 1 */
+  fraction: fractionString,
+});
+export type TakeProfitLeg = z.infer<typeof takeProfitLegSchema>;
+
+/**
+ * A trailing exit, for the position an opening order creates or for an open position.
+ * - channel: Pegasus keeps the position's stop-loss at the lowest low of the last `bars` confirmed daily bars (the
+ *   highest high for a short), moving it after each daily close and never against the position. The campaign
+ *   rule's exit line is the 10-bar channel. The stop rests at the exchange; moving it needs the API running.
+ * - callback: the exchange's own trailing stop (OKX move_order_stop): it closes the position once the price has
+ *   fallen `ratio` below the highest price since activation (risen above the lowest, for a short); `activePx`
+ *   delays the activation until that price is reached.
+ */
+export const trailingExitSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('channel'), bars: z.number().int().min(2).max(100) }),
+  z.object({ kind: z.literal('callback'), ratio: fractionString, activePx: positiveDecimalString.optional() }),
+]);
+export type TrailingExit = z.infer<typeof trailingExitSchema>;
+
+/** Where an order comes from, as the trade journal records it. The campaign service's orders are 'campaign' (client order ids starting with 'pc'). */
+export const orderSourceSchema = z.enum(['manual', 'signal']);
+export type OrderSource = z.infer<typeof orderSourceSchema>;
+
+/** The signal an order follows, as the page showed it when the order was sent (recorded in the trade journal). */
+export const signalSnapshotSchema = z.object({
+  rule: z.literal('campaign'),
+  /** 'entry': a daily close above the entry channel; 'add': a 12-hour close at least the add step above the last add */
+  kind: z.enum(['entry', 'add']),
+  /** Open time of the bar whose close gave the signal, epoch ms */
+  barTs: z.number().int(),
+  close: positiveDecimalString,
+  /** The entry channel's level (highest high of the bars before) */
+  entryLevel: positiveDecimalString,
+  /** The exit channel's level (lowest low of the bars before) */
+  exitLevel: positiveDecimalString,
+});
+export type SignalSnapshot = z.infer<typeof signalSnapshotSchema>;
+
 export const placeOrderRequestSchema = z
   .object({
     instId: instIdSchema,
@@ -55,6 +100,16 @@ export const placeOrderRequestSchema = z
      * mark price and executed at market. Refused on an order that closes a position.
      */
     slTriggerPx: positiveDecimalString.optional(),
+    /** Take-profits attached to an opening order (split take-profits, at most 5). Refused on an order that closes a position. */
+    takeProfits: z.array(takeProfitLegSchema).min(1).max(5).optional(),
+    /** With slTriggerPx and takeProfits: the stop-loss moves to the average entry price once the first take-profit has filled */
+    breakevenAfterTp1: z.boolean().optional(),
+    /** A trailing exit for the position this opening order creates, placed once the order has filled */
+    trailing: trailingExitSchema.optional(),
+    /** For the trade journal; 'manual' when omitted */
+    source: orderSourceSchema.optional(),
+    /** For the trade journal: the signal a 'signal' order follows */
+    signal: signalSnapshotSchema.optional(),
     clOrdId: clOrdIdSchema.optional(),
     /**
      * True when `clOrdId` was already sent in an earlier attempt whose outcome is unknown: the server looks the
@@ -65,6 +120,14 @@ export const placeOrderRequestSchema = z
   .refine((o) => o.ordType === 'market' || o.px !== undefined, {
     message: 'px is required for non-market orders',
     path: ['px'],
+  })
+  .refine((o) => o.takeProfits === undefined || o.takeProfits.reduce((sum, leg) => sum.plus(leg.fraction), D(0)).lte(1), {
+    message: 'the take-profit fractions add up to more than 1',
+    path: ['takeProfits'],
+  })
+  .refine((o) => o.signal === undefined || o.source === 'signal', {
+    message: 'signal is only sent with source "signal"',
+    path: ['signal'],
   });
 export type PlaceOrderRequest = z.infer<typeof placeOrderRequestSchema>;
 

@@ -8,6 +8,9 @@ import type { Deps } from './deps.js';
 import { AppError, ExchangeUnreachableError } from './errors.js';
 import { registerAccountRoutes } from './routes/account.js';
 import { registerCampaignRoutes } from './routes/campaign.js';
+import { registerCampaignSignalRoutes } from './routes/campaign-signals.js';
+import { registerExitRoutes } from './routes/exits.js';
+import { registerJournalRoutes } from './routes/journal.js';
 import { registerMarketRoutes } from './routes/market.js';
 import { registerSignalRoutes } from './routes/signals.js';
 import { registerTradingRoutes } from './routes/trading.js';
@@ -114,6 +117,9 @@ export async function buildServer(deps: Deps): Promise<FastifyInstance> {
   await registerAccountRoutes(app, deps);
   await registerSignalRoutes(app, deps);
   await registerCampaignRoutes(app, deps);
+  await registerCampaignSignalRoutes(app, deps);
+  await registerJournalRoutes(app, deps);
+  await registerExitRoutes(app, deps);
 
   return app;
 }

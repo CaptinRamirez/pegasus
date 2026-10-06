@@ -7,8 +7,13 @@ import { createLogger } from './logger.js';
 import { createOkxClients, OkxUnreachableAtStartError, reachOkxAtStart, scheduleClockSync, syncClock } from './okx/clients.js';
 import { buildServer } from './server.js';
 import { AccountService } from './services/account.js';
-import { CampaignService } from './services/campaign.js';
+import { CampaignService, disabledCampaignView } from './services/campaign.js';
 import { CampaignOrders } from './services/campaign-orders.js';
+import { CampaignSignalsService } from './services/campaign-signals.js';
+import { campaignOwns, ChannelTrailingService } from './services/channel-trailing.js';
+import { ExitFollowUp } from './services/exit-orders.js';
+import { ExitStateFile } from './services/exit-state.js';
+import { JournalService } from './services/journal.js';
 import { KillSwitchSweeper } from './services/kill-switch-sweeper.js';
 import { MarketDataService } from './services/market-data.js';
 import { OrderService } from './services/order-service.js';
@@ -55,13 +60,17 @@ async function main(): Promise<void> {
   }
   log.info({ instruments: [...market.instruments.values()].map((i) => `${i.instId} ctVal=${i.ctVal}${i.ctValCcy} lot=${i.lotSz} tick=${i.tickSz}`) }, 'instruments loaded');
 
-  const account = new AccountService(clients, store, log);
+  // The trailing stops are read only where the exits of this stage are offered (paper trading, the local mock).
+  const account = new AccountService(clients, store, log, { readTrailingStops: config.exits.enabled });
   const risk = new RiskEngine(config.risk, store, log);
   await risk.init();
-  const orders = new OrderService(clients, market, account, risk, store, log, { defaultTdMode: config.defaultTdMode, wsTrading: config.okx.wsTrading });
+  const orders = new OrderService(clients, market, account, risk, store, log, { defaultTdMode: config.defaultTdMode, wsTrading: config.okx.wsTrading, exits: config.exits.enabled });
   const signals = new SignalsService(clients, market, account, log, undefined, config.signalPhases);
   const hub = new Hub(config, market, account, risk, log);
-  const deps: Deps = { config, log, clients, store, market, account, risk, orders, signals, hub };
+  // The trade journal: every trade of the account, in its own file (JOURNAL_FILE); each change reaches the terminals.
+  const journal = new JournalService({ clients, market, account, onPlaced: (listener) => orders.onPlaced(listener), log: log.child({ component: 'journal' }) }, { file: config.journalFile });
+  journal.on('change', (update) => hub.broadcast({ type: 'journal', data: update }));
+  const deps: Deps = { config, log, clients, store, market, account, risk, orders, signals, hub, journal };
   // Paper only: loadConfig refuses CAMPAIGN_ENABLED=1 without the paper exchange.
   let campaign: CampaignService | null = null;
   if (config.campaign.enabled) {
@@ -77,6 +86,14 @@ async function main(): Promise<void> {
     campaign = service;
     log.info({ instruments: config.campaign.instruments, potStart: config.campaign.potStart, minStake: config.campaign.minStake, structure: config.campaign.structure, ledger: config.campaign.stateFile }, 'CAMPAIGN ENABLED on the paper exchange');
   }
+  // Exits of this stage (paper trading and the local mock): channel trailing and the trailing exits that follow an opening order, kept in TRAILING_STATE_FILE.
+  const exitState = new ExitStateFile(config.exits.stateFile);
+  const trailing = new ChannelTrailingService({ clients, account, orders, market, store, log }, { enabled: config.exits.enabled, state: exitState, isCampaignPosition: (p) => campaignOwns(deps.campaign, p) });
+  const exitFollowUp = new ExitFollowUp({ clients, account, orders, channel: trailing, store, log }, { enabled: config.exits.enabled, state: exitState });
+  deps.trailing = trailing;
+  deps.exitFollowUp = exitFollowUp;
+  // The campaign rule read per coin with a plan to follow each signal by hand (GET /api/campaign/signals).
+  deps.campaignSignals = new CampaignSignalsService({ config, clients, market, account, risk, journal, campaign: campaign ?? undefined, disabledView: () => disabledCampaignView(config.campaign), log });
 
   // Risk wiring: equity feeds the daily PnL / loss limit; exposure feeds the state shown in the UI.
   account.on('balance', (b) => risk.updateEquity(b.totalEq));
@@ -89,6 +106,11 @@ async function main(): Promise<void> {
   hub.wire();
   const app = await buildServer(deps);
   await market.start();
+  // Before the account starts: the journal hears every event of it (and reads what it missed while the API was down).
+  await journal.start();
+  // Before the account starts as well: the exits hear its order pushes; channel trailing waits for the account by itself.
+  exitFollowUp.start();
+  trailing.start();
   void account.startWithRetry();
   await app.listen({ host: config.server.host, port: config.server.port });
   log.info({ url: `http://${config.server.host}:${config.server.port}` }, 'pegasus api listening');
@@ -99,6 +121,9 @@ async function main(): Promise<void> {
     log.info({ signal }, 'shutting down');
     try {
       await campaign?.stop();
+      await journal.stop();
+      exitFollowUp.stop();
+      await trailing.stop();
       await hub.close();
       await app.close();
       await Promise.all([market.stop(), account.stop()]);

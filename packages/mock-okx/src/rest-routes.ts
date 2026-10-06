@@ -330,19 +330,22 @@ export class RestRouter {
     this.post('/api/v5/trade/amend-order', (_q, body) => acksResponse([m.amendRequest(body)], true));
     this.post('/api/v5/trade/amend-batch-orders', (_q, body) => batch(body, (item) => m.amendRequest(item)));
     this.post('/api/v5/trade/close-position', (_q, body) => m.closePosition(body));
-    // Algo orders: only the stop-losses generated from attachAlgoOrds exist here, all of type `conditional`.
+    // Algo orders: TP/SL orders (`conditional`, `oco`) and trailing stops (`move_order_stop`). OKX takes one type per
+    // call, except conditional and oco together.
     this.get('/api/v5/trade/orders-algo-pending', true, (q) => {
       const ordType = q.get('ordType');
       if (!ordType) return err('50014', 'Parameter ordType cannot be empty.');
+      const types = new Set(ordType.split(',').map((t) => t.trim()).filter((t) => t !== ''));
+      if (types.size > 1 && ![...types].every((t) => t === 'conditional' || t === 'oco')) return err('51000', 'Parameter ordType error');
       const instType = q.get('instType');
-      if (!ordType.split(',').includes('conditional') || (instType && instType !== 'SWAP')) return ok([]);
+      if (instType && instType !== 'SWAP') return ok([]);
       const algoId = q.get('algoId');
       // `after`: only the algo orders older than that algoId.
       const afterRaw = q.get('after') ?? '';
       const after = /^\d+$/.test(afterRaw) ? BigInt(afterRaw) : null;
       const rows = e
         .algoOrdersPending(q.get('instId') ?? undefined)
-        .filter((a) => (!algoId || a.algoId === algoId) && (after === null || BigInt(a.algoId) < after));
+        .filter((a) => types.has(a.ordType) && (!algoId || a.algoId === algoId) && (after === null || BigInt(a.algoId) < after));
       return ok(rows.slice(0, limitOf(q, 100, 100)));
     });
     this.post('/api/v5/trade/order-algo', (_q, body) => acksResponse([m.placeAlgoRequest(body)], true));

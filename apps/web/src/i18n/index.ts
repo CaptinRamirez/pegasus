@@ -80,9 +80,25 @@ export function labelOf(labels: Readonly<Record<string, string>>, value: string)
 export function errorText(e: unknown, t: Messages): string {
   if (isApiError(e)) {
     const known = t.apiErrors[e.code];
-    if (known !== undefined) return `${e.code}: ${known}（${e.message}）`;
+    if (known !== undefined) return t.errorWithMessage(e.code, known, e.message);
   }
   return errorMessage(e);
+}
+
+/**
+ * An error in words for the page's language: the codes of the exits and the journal from their details
+ * (errorWords), a risk rejection from its verdict, anything else as errorText.
+ */
+export function explainError(e: unknown, t: Messages): string {
+  if (isApiError(e)) {
+    const words = t.errorWords[e.code];
+    if (words !== undefined) return words(e.details ?? {});
+    if (e.code === 'RISK_REJECTED') {
+      const verdict = rejectionText(e, t);
+      if (verdict !== null) return verdict;
+    }
+  }
+  return errorText(e, t);
 }
 
 /** A risk rejection in the page's language, built from its code and details; the server's message when the dictionary has none. */

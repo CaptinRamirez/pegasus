@@ -1,5 +1,7 @@
 node_modules/
 dist/
+# the page built for the --campaign stack (scripts/start.mjs), apart from the one another stack serves
+dist-campaign/
 build/
 .env
 .env.*

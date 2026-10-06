@@ -44,7 +44,12 @@ Request bodies are validated with the zod schemas in `packages/shared/src/schema
 | GET | `/api/algo-orders` | – | `AlgoOrderList`: `{ orders: AlgoOrder[], ts }`, the stop-loss / take-profit algo orders read from OKX for this request (see "Stops" below) |
 | POST | `/api/algo-orders` | `PlaceStopRequest` (`{ instId, mgnMode, posSide?, slTriggerPx, sz? }`) | `201` `{ algoId, instId, slTriggerPx, sz }`: a stop-loss was placed for an open position (see "Stops") |
 | POST | `/api/algo-orders/amend` | `AmendAlgoOrderRequest` (`{ instId, algoId, slTriggerPx }`) | `{ algoId, instId, slTriggerPx, previous }`: the stop was moved from `previous` to `slTriggerPx` (as rounded) |
-| POST | `/api/algo-orders/cancel` | `CancelAlgoOrderRequest` (`{ instId, algoId }`) | `{ algoId, instId }` |
+| POST | `/api/algo-orders/cancel` | `CancelAlgoOrderRequest` (`{ instId, algoId }`) | `{ algoId, instId }` (a take-profit leg or a trailing stop as well) |
+| POST | `/api/positions/take-profits` | `PlaceTakeProfitsRequest` (`{ instId, mgnMode, posSide?, takeProfits: { triggerPx, fraction }[] }`) | `201` `PlaceTakeProfitsResult`: `{ instId, posSide, legs: { algoId, triggerPx, sz }[] }` — take-profit legs for an open position (see "Exit orders"; paper trading and the local mock only) |
+| POST | `/api/positions/trailing-stop` | `PlaceTrailingStopRequest` (`{ instId, mgnMode, posSide?, ratio, activePx?, sz? }`) | `201` `PlaceTrailingStopResult`: `{ algoId, instId, posSide, sz, callbackRatio, activePx }` — the exchange's trailing stop for an open position (see "Exit orders") |
+| POST | `/api/positions/channel-trailing` | `SetChannelTrailingRequest` (`{ instId, mgnMode, posSide?, bars }`) | `ChannelTrailingEntry`: channel trailing set for an open position, its stop placed or moved at once (see "Exit orders") |
+| POST | `/api/positions/channel-trailing/clear` | `ClearChannelTrailingRequest` (`{ instId, mgnMode, posSide? }`) | `{ instId, mgnMode, posSide, cleared }`; the stop stays where it is |
+| GET | `/api/trailing` | – | `TrailingView`: `{ enabled, entries: ChannelTrailingEntry[], pending: PendingTrailingExit[], nextCloseAt, ts }` |
 | GET | `/api/candles` | `CandlesQuery` | `Candle[]` ascending by `ts`; `6H`, `12H`, `1D` and `1W` are UTC-aligned (OKX `6Hutc` … `1Wutc`), also on the `candle` WS message |
 | GET | `/api/book` | `?instId` | `OrderBook` (top 50 each side) |
 | GET | `/api/ticker` | `?instId` | `Ticker` |
@@ -55,6 +60,9 @@ Request bodies are validated with the zod schemas in `packages/shared/src/schema
 | GET | `/api/campaign/log` | `?before&limit` (both optional; `limit` 1 to 100, default 20) | `CampaignLogPage`: `{ steps, total, next }`, the campaign's decision log newest first (see "Campaign") |
 | GET | `/api/campaign/replay` | – | `CampaignReplayView`: the replay beside the pot, its other structure, the pot's start value held in BTC and the reconciliation of the ledger with the replay, as last computed (see "The replay beside the pot"); `status: 'unavailable'` while there is no pot |
 | POST | `/api/campaign/replay` | – (a body, if any, is ignored) | `202` `CampaignReplayView` as it is now: a computation was started in the background (or one runs and another follows it); `200` with `status: 'unavailable'` when there is nothing to replay. The `campaign` message says when the new result is there |
+| GET | `/api/campaign/signals` | `?riskPct&equity` (both optional: `riskPct` a fraction below 1, default `0.01`; `equity` a positive decimal, default the account's total equity) | `CampaignSignalsResponse`: the campaign rule read per coin for every instrument of `CAMPAIGN_INSTRUMENTS`, an `entry` or an `add` with a plan to follow it by hand (see "Campaign signals"); answers while the campaign is disabled too |
+| GET | `/api/journal` | `?status&instId&source&before&limit` (all optional; `status` `open` or `closed`, `source` `manual`, `signal`, `campaign` or `external`, `before` a trade's `seq`, `limit` 1 to 200, default 50) | `JournalPage`: `{ status, reason, trades, total, next, serverTime }`, the trades of the trade journal newest first, without their fills and timeline (see "Trade journal") |
+| GET | `/api/journal/:id` | – | `JournalTrade`: one trade with its fills and its timeline; `404 TRADE_NOT_FOUND` for an id the journal does not have |
 
 Daily PnL, its baseline and what survives a restart. `RiskState.dailyPnl` is `currentEquity - dayStartEquity`.
 `dayStartEquity` is the first total equity observed in the current UTC day and `baselineTs` when that was (epoch ms,
@@ -214,6 +222,7 @@ interface OrderPreview {
   lever: string;           // leverage currently configured for the instrument/mode; '' for an exit (not looked up)
   slTriggerPx: string;     // normalised trigger of the attached stop-loss; '' when the order carries none
   stopLossQuote: string;   // quote-currency loss if the stop fills at its trigger with sz, measured from refPrice; '' without a stop
+  takeProfits?: { triggerPx: string; fraction: string; sz: string; profitQuote: string }[];   // the take-profit legs as sized (see "Exit orders"); absent without takeProfits
   risk: RiskCheckResult;   // ok=false means the order would be rejected
 }
 ```
@@ -265,7 +274,9 @@ market. Pegasus places no second order and does not watch the price itself.
 
 Stops (algo orders). An `AlgoOrder` is a take-profit / stop-loss order resting at OKX: an OKX algo order of type
 `conditional` (one-way) or `oco`, of a SWAP instrument, tracked by the server or not. That covers the stops generated from
-attached stops and the TP/SL orders placed on OKX itself; trigger, trailing, iceberg and TWAP orders are not read.
+attached stops and the TP/SL orders placed on OKX itself; trigger, iceberg and TWAP orders are not read. Where the exit
+orders of this stage are enabled (paper trading and the local mock, see "Exit orders") the list also holds the trailing
+stops (OKX `move_order_stop`, read with a call of their own: OKX lists them on their own only).
 
 ```ts
 interface AlgoOrder {
@@ -281,6 +292,14 @@ interface AlgoOrder {
   slTriggerPxType: 'last' | 'index' | 'mark' | '';
   slOrdPx: string;              // '-1': executed at market
   tpTriggerPx: string;          // '' when none
+  // present only where they apply; a one-way stop-loss carries none of them
+  ordType?: 'oco' | 'move_order_stop';   // absent for a one-way (conditional) order
+  tpTriggerPxType?: 'last' | 'index' | 'mark';   // with a take-profit
+  amendPxOnTriggerType?: true;  // the stop-loss of split take-profits that moves to the entry when the first take-profit triggers
+  callbackRatio?: string;       // trailing stop: '0.05' is 5%
+  callbackSpread?: string;      // trailing stop: as a price distance
+  activePx?: string;            // trailing stop: the price that activates it; absent when it trailed from its placement
+  moveTriggerPx?: string;       // trailing stop: the price it triggers at now ('' before it is active)
   cTime: number;
   uTime: number;
 }
@@ -332,8 +351,9 @@ interface AlgoOrderList { orders: AlgoOrder[]; ts: number }   // newest first; t
 - The three writes need credentials and the trade permission (`NOT_CONNECTED`, `READ_ONLY_KEY`), not the private
   stream, and are accepted while the kill switch is on. Each is logged and recorded as a risk event
   (`STOP_PLACED`, `STOP_AMENDED` with `from` and `to`, `STOP_CANCELED`).
-- Not offered: changing the size of a stop (cancel it and place a new one for the size wanted), take-profit
-  orders, and moving the stop of an entry that is still resting (cancel the entry and place it again).
+- Not offered: changing the size of a stop (cancel it and place a new one for the size wanted) and moving the stop
+  of an entry that is still resting (cancel the entry and place it again). Take-profits and trailing stops: see
+  "Exit orders" (paper trading and the local mock only).
 - `stopCoverage(position, algoOrders)` in `@pegasus/shared` sums the stops of a position (same instrument, margin
   mode and leg, on the closing side; a `closeFraction` stop counts that fraction of the position) and reports
   `none`, `partial`, `full` or `over`. The positions table shows it in its Stop column: the trigger prices, and a
@@ -343,6 +363,109 @@ Exits. An order that can only reduce exposure (reduce-only in net mode, the clos
 mode) skips the leverage, slippage and exposure rules, so it is neither refused with `LEVERAGE_UNAVAILABLE` nor with
 `NO_BOOK`: its preview carries `lever: ''` and, while the book is not synced, `estSlippagePct: ''` with `refPrice`
 taken from the ticker or mark price. It still needs a price (`NO_PRICE`) and still passes the price band.
+
+Exit orders: take-profits, the cost-price stop and trailing stops (paper trading and the local mock only). They are
+offered only where nothing can reach an OKX account: against the paper exchange (`PAPER_EXCHANGE_URL`) or a mock
+exchange on this machine (all four `OKX_*_URL` overrides on a loopback host); `AppConfig.exits.enabled` says which.
+Elsewhere (live trading, OKX demo trading) every request that uses them is refused with `403 EXITS_UNAVAILABLE` and
+nothing is sent; orders and stops without them work exactly as before. The OKX side is in docs/okx-api-notes.md 6.10.
+
+New fields of `PlaceOrderRequest` (`POST /api/orders`, `POST /api/orders/preview`), all optional:
+
+| field | |
+| --- | --- |
+| `takeProfits` | `{ triggerPx, fraction }[]`, 1 to 5 legs whose fractions add up to at most 1: take-profits attached to the opening order, mark-triggered, executed at market, created by the exchange once the order has **completely** filled |
+| `breakevenAfterTp1` | with `slTriggerPx` and two legs or more: the stop-loss moves to the order's average fill price when the first take-profit triggers (OKX's cost-price stop) |
+| `trailing` | `{ kind: 'callback', ratio, activePx? }` or `{ kind: 'channel', bars }` (2 to 100): a trailing exit for the position the order opens, placed once the order has filled (below) |
+| `source` | `'manual'` (default) or `'signal'`: for the trade journal; never sent to OKX |
+| `signal` | the `SignalSnapshot` a `'signal'` order follows: for the trade journal; never sent to OKX |
+
+- **Client order ids.** An order with `source: 'signal'` gets a server-made `clOrdId` starting `ps`
+  (`SIGNAL_CL_ORD_PREFIX`); one the page sends must start with `ps` too, and only a signal order's may: otherwise
+  `400 VALIDATION` (the page retries under its own id, so the server does not rewrite it). Manual orders keep `pg`,
+  the campaign's `pc`.
+- **The legs.** Each trigger is rounded to `tickSz` towards the entry (down for a long, up for a short: the smaller
+  profit). The legs are sized in whole lots of the order's size, every leg but the last at its fraction rounded down
+  and the **last one takes what the others leave**: OKX refuses attached take-profits whose sizes do not add up to the
+  order's (51083), so the legs always cover the whole order, also when the fractions add up to less than 1. A partial
+  take-profit with the rest left to a trailing stop is set on the open position instead (`POST /api/positions/take-profits`).
+  `OrderPreview.takeProfits` lists the legs as sized: `{ triggerPx, fraction, sz, profitQuote }[]` (`profitQuote`: the
+  quote-currency profit if the leg fills at its trigger, measured from `refPrice`); absent without `takeProfits`.
+- **What is sent.** One leg: one `attachAlgoOrds` object holding the take-profit and, with `slTriggerPx`, the stop-loss
+  (OKX makes it an `oco` order). Two legs or more: split take-profits, one object per leg (`tpTriggerPx`, `tpOrdPx: "-1"`,
+  `tpTriggerPxType: "mark"`, `sz`, `attachAlgoClOrdId` `tp1`…`tp5` + the tail of the `clOrdId`) and the stop-loss in an
+  object of its own, with `amendPxOnTriggerType: "1"` for `breakevenAfterTp1`.
+- **Refused before anything is sent:** an order that closes a position, or in net mode reduces the open net position
+  (`400 VALIDATION`, as for `slTriggerPx`); a leg that comes to less than `minSz` (`400 TP_LEG_TOO_SMALL`, `details`:
+  `{ leg, sz, minSz, orderSz }`); two legs with one trigger once rounded (`400 TP_TRIGGERS_NOT_DISTINCT`);
+  `breakevenAfterTp1` without `slTriggerPx` or with fewer than two legs (`400 BREAKEVEN_NEEDS_SPLIT_TP`); no live mark
+  price (`503 NO_PRICE`). The risk verdict (`preview.risk`, `422 RISK_REJECTED` on `POST /api/orders`) carries, once the
+  order itself passes: `TP_WRONG_SIDE` (a trigger not above both the reference price and the live mark for a long, not
+  below both for a short; `details`: `{ leg, triggerPx, entryPx, markPx }`), `CALLBACK_RATIO` (a `callback` ratio outside
+  0.1% to 20%, `CALLBACK_RATIO_MIN` / `CALLBACK_RATIO_MAX` in `@pegasus/shared`; OKX's own bounds are not published) and
+  `ACTIVE_PX_WRONG_SIDE` (an `activePx` not above both the mark and the last price for a long, not below both for a short).
+  The opening order itself is checked as any other: the kill switch refuses it.
+- **The trailing exit of an order** is remembered by its `clOrdId` (in `TRAILING_STATE_FILE`, so a restart keeps it) until
+  the order has filled, completely or partly and then cancelled; an order cancelled before any fill drops it. Then it
+  is placed for the position as it is: `callback` becomes the exchange's trailing stop for the whole position (as
+  `POST /api/positions/trailing-stop`, `algoClOrdId` `tr` + the tail of the order's `clOrdId`), `channel` sets channel
+  trailing for it (as `POST /api/positions/channel-trailing`, `source: 'order'`). A placement that fails for a passing
+  reason is tried again every 30 s, up to 10 times; one that is refused is dropped and logged as an error.
+  `TrailingView.pending` lists what waits.
+
+Exits for an open position. Each route only reduces the position, so the kill switch does not refuse it (as with
+`POST /api/algo-orders`); each needs credentials and the trade permission, not the private stream. The position is
+`instId`, `mgnMode` and, in long/short mode, `posSide` (required there) in the server's mirror: `400 VALIDATION` when
+there is none. A position of the campaign (an isolated one on an instrument with an open campaign) is refused with
+`409 CAMPAIGN_POSITION`: its exits are the rule's. What they place is listed in `GET /api/algo-orders` and cancelled with
+`POST /api/algo-orders/cancel`.
+
+- `POST /api/positions/take-profits`: one OKX `conditional` take-profit per leg, mark-triggered, executed at market, on
+  the closing side; in net mode with `reduceOnly` and `cxlOnClosePos` (the exchange cancels it with the position), in
+  long/short mode with the position's `posSide`. Each leg closes its fraction of the position in whole lots, the last
+  one what the others leave of the fractions' sum (so the legs may cover less than the position). Refused: a leg below
+  `minSz` (`TP_LEG_TOO_SMALL`), equal triggers (`TP_TRIGGERS_NOT_DISTINCT`), legs that with the take-profits already
+  resting for the position would close more than it holds (`400 TP_EXCEEDS_POSITION`, `details`: `{ existing,
+  requested, size }`), `TP_WRONG_SIDE` against the position's average price and the live mark (`422 RISK_REJECTED`). The
+  legs go out one after the other; when the exchange refuses one, the ones placed before it are cancelled and its
+  refusal is passed on (`EXCHANGE`). `algoClOrdId`: `tp1`…`tp5` + a generated id. Risk event `TAKE_PROFITS_PLACED`.
+- `POST /api/positions/trailing-stop`: the exchange's trailing stop (OKX `move_order_stop`) for `sz` contracts (whole
+  lots, at least `minSz`; the whole position by default), on the closing side, reduce-only in net mode, `posSide` in
+  long/short mode. It closes once the **last price** has come back `ratio` from its highest (lowest, for a short) since
+  it was activated: at `activePx` (rounded to the tick towards the price), or at once without one. Refused:
+  `CALLBACK_RATIO`, `ACTIVE_PX_WRONG_SIDE` (`422 RISK_REJECTED`), more than the position with the trailing stops already
+  resting (`400 TRAILING_EXCEEDS_POSITION`). OKX does not amend a trailing stop: cancel it and place a new one.
+  `algoClOrdId`: `tr` + a generated id. Risk event `TRAILING_STOP_PLACED`.
+- `POST /api/positions/channel-trailing` (`bars` 2 to 100): channel trailing for the position. The API keeps the
+  position's stop-loss at the lowest low (a long) or highest high (a short) of the last `bars` confirmed daily bars
+  (OKX `1Dutc`; `channelStopLevel` in `@pegasus/shared`, the exit line of the campaign rule with 10 bars) and moves it
+  after each 00:00 UTC daily close, never against the position: every stop of the position on the wrong side of the
+  level is amended to it (one the exchange will not amend is cancelled and placed again for its size), and what the
+  stops leave uncovered gets a stop at the level (`algoClOrdId` `ch` + a generated id); a stop already beyond the level
+  stays. The level of the last close is applied at once. The clock is looked at every minute; a close whose daily bar
+  is not confirmed yet is tried again at the next look. Closes missed while the API was not running are caught up with
+  at the first look after a start: the best of their levels is applied. A level the mark has already passed is not
+  applied (the stop would fire at once); the entry's `lastError` says so. The stop rests at the exchange; moving it needs
+  the API running. Every move is logged and recorded as a risk event (`CHANNEL_STOP_MOVED`). Setting it again for a
+  position replaces its `bars`.
+- `POST /api/positions/channel-trailing/clear`: ends channel trailing for the position (`cleared: false` when it was not
+  trailed); its stop stays where it is. Channel trailing also ends by itself when the position is closed or turns to
+  the other side.
+- `GET /api/trailing`: `TrailingView` (`@pegasus/shared`): `enabled`, `entries` (one `ChannelTrailingEntry` per position:
+  `instId`, `mgnMode`, `posSide`, `direction`, `bars`, `source` (`order` or `route`), `clOrdId`, `since`, `level` and
+  `levelClose` (the channel of the last close processed, and that close), `algoIds` (the stops it keeps), `lastMove`
+  (`{ at, close, algoId, action: 'placed' | 'amended' | 'replaced', from, to }`), `lastError` (`{ at, message }`, null once
+  a run completed)), `pending` (the trailing exits waiting for their order to fill), `nextCloseAt`, `ts`.
+- Leftovers. OKX keeps a trailing stop when its position is fully closed (it has no `cxlOnClosePos`), and the TP/SL
+  orders placed without `cxlOnClosePos` (Pegasus sends it in net mode only); they would act on the next position of that
+  side. Every algo order list read is looked through for the algo orders Pegasus placed (client ids `sl…`, `ch…`,
+  `tp1…`, `tr…`) that are older than 30 s and close no open position: they are cancelled, logged and recorded as a risk
+  event (`EXITS_OF_CLOSED_POSITION_CANCELED`). Orders Pegasus did not place are left alone.
+- Settings: `TRAILING_STATE_FILE` (default: next to `STATE_FILE`, named after it: `data/pegasus-state.paper.json` gives
+  `data/pegasus-state.paper.trailing.json`), the JSON file of the channel trailing entries and the pending trailing exits,
+  written whole after every change, read at start. A file that is not valid is kept aside as `<file>.corrupt` and never
+  written over: channel trailing does nothing (and refuses to be set: `503 TRAILING_STATE_UNREADABLE`) and the trailing
+  exits of new orders are kept in memory only, until it is repaired or moved away.
 
 Leverage. A preview reads the leverage through a 30 s cache; `POST /api/orders` always reads it fresh from OKX, so a
 change made on OKX itself is seen by the next order. A reply without a leverage row is `LEVERAGE_UNAVAILABLE`, never 1x.
@@ -484,6 +607,17 @@ OKX protocol. The contract of this document does not change: routes, messages an
   kill switch, the day baseline and the journal of the paper account are not mixed with a real account's. With
   `--campaign` the paper account is the campaign pot's own (`data/paper-campaign.json`) and the API's state file
   `data/pegasus-state.campaign.json` (see "Campaign").
+- The launcher gives every account its own trade journal (see "Trade journal"): `JOURNAL_FILE` is
+  `data/journal.paper.json` with `--paper`, `data/journal.mock.json` with `--mock` and `data/journal.campaign.json`
+  with `--campaign` (`data/journal.json`, the default, otherwise). `--campaign` also runs on ports of its own, API
+  8788, paper exchange 9201 and page 5175 (`CAMPAIGN_API_PORT`, `CAMPAIGN_PAPER_PORT` and `CAMPAIGN_WEB_PORT` in the
+  environment or `.env` move them; `API_PORT` and `PAPER_PORT` are the other stack's), with `WEB_ORIGINS`
+  `http://localhost:5175,http://127.0.0.1:5175`, its log files in `logs/campaign` and its page built into
+  `apps/web/dist-campaign`, so that it runs beside `pnpm start` or `pnpm start --paper`. Every page reaches the API
+  of its own stack same-origin, through the proxy of its page server (`scripts/vite.stack.config.mjs`: the web app's
+  `vite.config.ts` with the stack's ports); the API checks the page's `Origin` against its `WEB_ORIGINS` and the
+  token. Both APIs read `API_TOKEN` from the same `.env`; a page on another port keeps its own copy of the token, so
+  it asks for it once.
 - While `CAMPAIGN_ENABLED=1` the paper exchange trades the campaign's instruments (`CAMPAIGN_INSTRUMENTS`) besides its
   own (`PAPER_INSTRUMENTS`, the ten of the campaign by default) and `INSTRUMENTS`.
 - Order and fill times of events that were replayed are the times they happened at (the end of their candle),
@@ -722,6 +856,126 @@ gives their steps: open, margin-neutral add, reduce, close):
   `CAMPAIGN_BALANCE_UNKNOWN` (502); `CAMPAIGN_OPEN_UNCONFIRMED`, `CAMPAIGN_ORDER_UNKNOWN` (504); besides
   `RISK_REJECTED`, `EXCHANGE`, `SIZING`, `NO_BOOK` and `LEVERAGE_UNAVAILABLE`.
 
+Campaign signals (`apps/api/src/services/campaign-signals.ts`, the rules in `campaign-signals-plan.ts`; types in
+`packages/shared/src/campaign-signals.ts`). `GET /api/campaign/signals` reads the campaign rule of
+`packages/shared/src/campaign.ts` coin by coin for every instrument of `CAMPAIGN_INSTRUMENTS` (the ten of
+`@pegasus/shared` by default), in that order, whether the campaign is enabled or not, with the rule's parameters (the
+pot's own while a pot runs, the settings otherwise). Its texts are codes with their figures (`params`), translated
+by the page.
+
+- Bars: the exchange's confirmed UTC bars (OKX `1Dutc` and `12Hutc`; through the market data service for a tracked
+  instrument, the public candles otherwise), cached for 5 minutes and never across a 00:00 or 12:00 UTC close (15 s
+  while the bar that closed there is not confirmed yet). A bar that is not confirmed is never read. The mark price is
+  the live stream's, else OKX's public mark price (cached 10 s).
+- Per coin (`CampaignSignalRow`): the last confirmed daily bar (`daily`: `barTs` its open time, the campaign's
+  `signalTs`; `closeTs`; `close`) and 12-hour bar (`halfDay`); `levels`: `entry`, the highest high of the
+  `entryChannel` (20) daily bars before the last one, and `exit`, the lowest low of the `exitChannel` (10) bars before
+  it (what the last close was measured against), `nextEntry` and `nextExit`, the same channels ending with the last
+  bar (what the next daily close is measured against); `markPx`; `entryDistancePct`, `nextEntry / markPx - 1` (the rise
+  to the level the next close must beat; negative above it); `tracked` (an order needs the instrument tracked).
+- `state`, by priority. With a long held on the coin (any margin mode; `holding` gives its contracts, average price,
+  margin, leverage set, liquidation price, `trailingLine` = `nextExit`, the add reference and `addTrigger` = add
+  reference x (1 + `addStep`)): `exit` when the last daily close was below `exit`, else `add` when the last
+  confirmed 12-hour close, one that closed after the last opening fill, reached `addTrigger` (never in the `noadd`
+  structure), else `holding`. The add reference is the average price of the last order that opened or added to the
+  journal's trade of that long (`addRefSource: 'journal'`, `addRefTs` its first fill), else the position's average
+  price (`'position'`). Without one: `entry` when the last daily close was above `entry`, else `near` when the mark is
+  at most 3% below `nextEntry` or above it, else `none`. `unavailable` when the bars could not be read or there are
+  fewer than 21 confirmed daily bars.
+- `reasons` (codes and their `params`): `CLOSE_ABOVE_ENTRY` { close, level }, `NEAR_ENTRY` { markPx, level,
+  distancePct, nearPct }, `MARK_ABOVE_ENTRY` { markPx, level }, `BELOW_ENTRY` { markPx, level, distancePct },
+  `HOLDING` { contracts, trailingLine, addTrigger }, `CLOSE_BELOW_EXIT` { close, level }, `ADD_TRIGGER_REACHED`
+  { close, trigger, addRef, barTs }, `ADDS_OFF` {}, `ADD_REF_FROM_POSITION` { avgPx }, `SHORT_HELD` { contracts } (a
+  short on the coin: the rule is long only), `NOT_ENOUGH_BARS` { have, need }, `BARS_UNAVAILABLE` { message },
+  `NO_MARK_PRICE` {}.
+- `signal`: for `entry` and `add`, the `SignalSnapshot` to send as `PlaceOrderRequest.signal` with `source: 'signal'`
+  (`kind`, `barTs` the bar whose close gave it, `close`, `entryLevel`, `exitLevel`).
+- `plan` (`CampaignFollowPlan`), for `entry` and `add`: an isolated market buy at about the mark (`entryPx`), its stop
+  `stopPx` at the exit line `nextExit` (what the next daily close is measured against, and where the channel
+  trailing exit keeps the stop), `trailing` `{ kind: 'channel', bars: exitChannel }` and `takeProfits` `[]` (the rule
+  exits on the channel only). Sized so that a fill at `entryPx` stopped at `stopPx` loses `riskTarget` = equity x
+  `riskPct`: `contracts` in whole lots rounded down, at least the minimum order (`riskAmount` is what they risk),
+  `coin`, `notional`, `margin` = notional / leverage. `leverage` for an entry: the highest whole number up to the
+  campaign's leverage (10), `RISK_MAX_LEVERAGE` and the instrument's maximum that keeps the estimated isolated
+  liquidation price (`isolatedLongLiquidationPrice` with `campaignMaintenanceRate`: the first tier's maintenance rate
+  plus the taker fee, `maintenanceRate`) at or below `stopPx` x (1 - 0.01); `liqPx` is that estimate. An add posts at
+  the position's own leverage setting and `after` estimates the position after it (contracts, average, margin and
+  liquidation price of an isolated position). Linear contracts only. Without equity the size fields are null.
+- `warnings` (codes and their `params`): `STOP_NOT_BELOW_ENTRY` { stopPx, entryPx } (no size), `STOP_TOO_WIDE` /
+  `STOP_TOO_NARROW` { stopDistancePct, limit } (more than 20% / less than 2%), `BELOW_MIN_ORDER` { sized, minSz,
+  riskAmount }, `OVER_ORDER_NOTIONAL` { notional, limit }, `OVER_POSITION_NOTIONAL` { projected, limit },
+  `OVER_TOTAL_NOTIONAL` { projected, limit } (the risk limits, counted on the positions held now: the risk engine would
+  refuse the order), `SIGNAL_STALE` { barTs, closedAt, ageMs } (the signal's bar closed more than one bar ago),
+  `PRICE_FAR_ABOVE_SIGNAL` { markPx, close, risePct, limit } (more than 5% above the signal's close),
+  `EQUITY_UNKNOWN` {}, `LINEAR_ONLY` {}, `LEVERAGE_REDUCED` { leverage, maxLeverage }, `LIQUIDATION_NEAR_STOP` { liqPx,
+  stopPx } (an add), `NOT_TRACKED` {} (an order on it is refused with `UNKNOWN_INSTRUMENT` until it is in
+  `INSTRUMENTS`), `CAMPAIGN_ACCOUNT` {}, `KILL_SWITCH` {}.
+- The response: `{ generatedAt, params, thresholds, riskPct, equity, equitySource, campaign, rows }`. `thresholds`:
+  `{ nearPct: '0.03', stopWidePct: '0.2', stopNarrowPct: '0.02', farAbovePct: '0.05', liqBufferPct: '0.01' }`.
+  `equitySource` is `request`, `account` or null. `campaign`: `{ enabled, status, ownAccount }`; `ownAccount` is true
+  while the campaign service runs on this API (`CAMPAIGN_ENABLED=1`, `pnpm start --campaign`): the positions on its
+  coins are then the pot's, following a signal there would disturb the pot, and every plan warns `CAMPAIGN_ACCOUNT`.
+
+Trade journal (`apps/api/src/services/journal.ts`, the bookkeeping and its rules in `journal-book.ts`, the file in
+`journal-file.ts`; types in `packages/shared/src/journal.ts`). The API records every trade of the account, whoever
+placed it. A trade is one position's life on one instrument, margin mode and position leg (net in net mode, long or
+short in long/short mode), from flat to flat: the opening fills, the adds and partial closes, and the final close or
+a liquidation. A net-mode order larger than the position closes the trade and opens the next one, the other way.
+
+- `source`: `campaign` (client order id `pc`), `signal` or `manual` (an order Pegasus placed:
+  `PlaceOrderRequest.source`, `manual` when absent; for an order whose request the journal has not seen, the client
+  order id: `ps` signal, `pg` manual, which the terminal's own ids start with), `external` (anything else, and a
+  position the journal found open without having seen it open: `adopted`).
+- `plan`: the opening order's `slTriggerPx` (as rounded), `takeProfits`, `breakevenAfterTp1`, `trailing` and `signal`
+  (`PlaceOrderRequest.signal`, which only goes with `source: 'signal'`); null for the campaign's orders and the ones
+  Pegasus did not place.
+- `entry`: the average price of all the opening fills, their contracts, base coin and notional, the largest size
+  (`maxContracts`), the margin the exchange reported while the position held only its opening order, the leverage the
+  position ran at (the opening order's notional over that margin, else the leverage set) and the margin mode.
+- `exits`, one per closing order, oldest first: `{ ts, reason, leg, ordId, clOrdId, algoId, px, contracts, coin, pnl,
+  fee }`. `reason`: `liquidation` and `adl` (the order's category); `campaign` (`pc`); `manual` (an order Pegasus
+  placed: the ticket, a close button, a signal followed); otherwise the algo orders last listed on the position are
+  matched by price, the fill's own and the mark price when it filled (OKX's `fillMarkPx`, read from
+  `GET /api/v5/trade/fills`: a stop triggers on the mark): a stop-loss whose trigger the price reached (within 1%),
+  `stop`, or `trailing` when Pegasus's channel trailing placed it (client id `ch`) or the plan has a channel trailing
+  exit and the stop was not the opening order's or was moved since; a take-profit, `take_profit` with its `leg` (the
+  one its client id names, `tp<n>`, else the plan's by the nearest trigger); the exchange's trailing stop
+  (`move_order_stop`), `trailing`; no match, `trailing` when the plan has a callback trailing exit, else
+  `external`. `closeReason` is the reason of the exit that took the position to flat; `unknown` when the position was
+  gone and the exchange's fills did not say how (no exit is recorded then). An algo order placed and triggered between
+  two reads of the list was never seen: its close is `external`.
+- Figures: `realisedPnl` (the exits', from the position's running average: an add after a partial close moves it, a
+  close does not), `fees` (all fills', positive when paid), `funding` (the position's accumulated `fundingFee` as the
+  exchange last reported it while the position was open, read every 5 minutes; null when it reports none),
+  `netPnl` = realisedPnl - fees + funding, `exitPx`, `initialStop` (the plan's stop, else the first stop-loss listed
+  on the position before any of it was closed), `initialRisk` (the opening order's contracts from their average price
+  to the initial stop), `rMultiple` (netPnl / initialRisk once closed), `durationMs` (once closed), `updatedAt`.
+- `timeline` (`GET /api/journal/:id`), oldest first: `order_placed` (with `source` and the `plan` of an order Pegasus
+  placed), `order_cancelled`, `fill` (`role` `open`, `add`, `reduce` or `close`, `px`, `contracts`, `fee`, and `pnl`
+  and `reason` for a close), `stop_` / `tp_` / `trailing_` `placed`, `moved` (`fromPx` to `px`), `triggered` and
+  `cancelled` (code `POSITION_CLOSED` when the position was closed by then), `liquidation`, `adopted`
+  (`POSITION_ADOPTED`) and `reconciled` (`POSITION_GONE`, `SIZE_CORRECTED`). The price of an exchange trailing stop
+  follows the market and is not logged as a move. `fills` lists every fill with its `role` and the size after it.
+- The file `JOURNAL_FILE` (default `data/journal.json` under the repository root unless the path is absolute; the
+  launcher gives every account its own, see "Paper trading") holds it whichever store the API uses: JSON with a schema
+  version (`version: 1`), written whole after every change through a temporary file and a rename, read at start. The
+  2,000 newest closed trades are kept (all open ones). A file that cannot be read or is not valid is never written
+  over: the journal is `blocked` (`JOURNAL_UNREADABLE`, naming the file), records nothing, and a copy is kept as
+  `<file>.corrupt`.
+- Start. While `starting` (`JOURNAL_STARTING`) what the account reports is held back; the exchange's fills since the
+  newest one the file recorded (less 5 minutes) are read (`GET /api/v5/trade/fills`, the last three days on OKX, the
+  paper exchange's newest 100) and applied in the order they happened, with their orders, so a trade closed while the
+  API was not running (a stop the paper exchange's replay triggered) is closed too; then the journal is `ready`. A
+  failed read is tried again every 15 s. A new file reads no history (the exchange's fills before it cannot say where
+  a position started): the positions open then are adopted. `disabled` (`JOURNAL_DISABLED`): no account (no API key).
+- Every minute the open trades are compared with the account's positions, a leg only once neither has changed for
+  10 s; a difference is first looked for in the exchange's fills (a push can be lost), and one that remains is settled
+  from the position: closed `unknown` (`POSITION_GONE`), the exchange's size (`SIZE_CORRECTED`), or adopted (its
+  `source` from the client order id of the newest fill that opened its leg).
+- `JournalPage`: `trades` newest first (highest `seq` first), at most `limit`, older than the trade `before`; `next`
+  is the `before` of the next page, null at the end; `total` counts the trades that match the filter. A trade's `id`
+  is `<seq>-<instId>`.
+
 Error codes returned by the API:
 
 | code | meaning |
@@ -729,10 +983,10 @@ Error codes returned by the API:
 | `UNAUTHORIZED` | missing/invalid token |
 | `FORBIDDEN_HOST` | the `Host` header does not name this machine (403) |
 | `FORBIDDEN_ORIGIN` | the `Origin` header is not one of `WEB_ORIGINS` (403) |
-| `VALIDATION` | request body failed schema validation (`details.issues`); or an attached stop-loss was refused: on a closing order, on a net-mode order against the open net position, or on the wrong side of the order price or the mark price (`details`: `slTriggerPx`, `refPrice`, `markPx`) |
+| `VALIDATION` | request body failed schema validation (`details.issues`); or an attached stop-loss was refused: on a closing order, on a net-mode order against the open net position, or on the wrong side of the order price or the mark price (`details`: `slTriggerPx`, `refPrice`, `markPx`); take-profits or a trailing exit on such an order; a `clOrdId` whose `ps` prefix does not fit the order's `source`; an exit route without an open position |
 | `UNKNOWN_INSTRUMENT` | instId not tracked |
 | `SIZING` | size/price could not be normalised (`details.code` = `SizingError.code`) |
-| `RISK_REJECTED` | risk engine rejected (`details` = `RiskCheckResult`). While the kill switch is on only orders that reduce exposure (reduce-only in net mode, the closing direction of a leg in long/short mode) are accepted |
+| `RISK_REJECTED` | risk engine rejected (`details` = `RiskCheckResult`). While the kill switch is on only orders that reduce exposure (reduce-only in net mode, the closing direction of a leg in long/short mode) are accepted, and the exits of an open position. The exit rules add `details.code` `TP_WRONG_SIDE`, `CALLBACK_RATIO` and `ACTIVE_PX_WRONG_SIDE` (see "Exit orders") |
 | `EXCHANGE` | OKX returned an error (`details.okxCode`, `details.okxMsg`) |
 | `EXCHANGE_UNREACHABLE` | OKX could not be reached (502) or did not answer in time (504, `details.timedOut` = true); after a timeout the request may or may not have been processed |
 | `NOT_CONNECTED` | no API key configured, the account config (position mode) not loaded yet, or, for `POST /api/orders` only, the private stream not ready (503) |
@@ -740,12 +994,21 @@ Error codes returned by the API:
 | `DAILY_LOSS_ACTIVE` | the kill switch was not released because the daily loss limit is still breached; repeat with `rebase: true` to release and restart the baseline (409, `details`: `dailyPnl`, `limit`, `equity`) |
 | `NO_PRICE` | no reference price for the instrument yet, or its market data is stale (503); also an order with an attached stop-loss, or a move of a mark-triggered stop, while there is no live mark price |
 | `ALGO_NOT_FOUND` | `POST /api/algo-orders/amend`: no resting algo order with that `algoId` and `instId` in a fresh read of the exchange (404) |
+| `EXITS_UNAVAILABLE` | take-profits, the cost-price stop, trailing exits and the routes of "Exit orders" outside paper trading and the local mock; nothing was sent (403) |
+| `TP_LEG_TOO_SMALL` | a take-profit leg comes to less than the instrument's `minSz` (400, `details`: `{ leg, sz, minSz, orderSz }` or `{ leg, sz, minSz, size }`) |
+| `TP_TRIGGERS_NOT_DISTINCT` | two take-profit legs have the same trigger once rounded to the tick (400, `details.triggers`) |
+| `BREAKEVEN_NEEDS_SPLIT_TP` | `breakevenAfterTp1` without `slTriggerPx` or with fewer than two take-profit legs (400) |
+| `TP_EXCEEDS_POSITION` | `POST /api/positions/take-profits`: with the take-profits already resting the legs would close more than the position (400, `details`: `{ existing, requested, size }`) |
+| `TRAILING_EXCEEDS_POSITION` | `POST /api/positions/trailing-stop`: with the trailing stops already resting it would close more than the position (400, `details`: `{ existing, requested, size }`) |
+| `CAMPAIGN_POSITION` | an exit route or channel trailing for a position of the campaign, whose exits are the rule's (409) |
+| `TRAILING_STATE_UNREADABLE` | `POST /api/positions/channel-trailing` while `TRAILING_STATE_FILE` cannot be read or is not valid (503) |
 | `NO_BOOK` | opening market order refused because the order book is not synced or is stale, so slippage cannot be estimated (503) |
 | `NO_DATA` | `/api/ticker` or `/api/book` has nothing yet for the instrument, or the book is stale (503) |
 | `LEVERAGE_UNAVAILABLE` | the leverage lookup failed or returned nothing; an opening order is refused rather than checked against an unknown leverage (503) |
 | `CAMPAIGN_…` | the campaign's order operations and the execution errors of its ledger; no route returns them, they are in `GET /api/campaign` `errors` (see "Campaign") |
 | `ORDER_STATUS_UNKNOWN` | the exchange did not acknowledge the order (no answer, or OKX's own timeout codes `50004` / `51149`) and it could not be found by `clOrdId`, or a retry under an already used `clOrdId` could not be looked up and was not sent; the order may have filled or still be live, check positions, fills and open orders before retrying (504) |
 | `NOT_FOUND` | unknown route (404) |
+| `TRADE_NOT_FOUND` | `GET /api/journal/:id`: the journal has no trade with that id (404, `details.id`) |
 | `INTERNAL` | anything else (500) |
 
 ## WebSocket `/ws?token=<API_TOKEN>`
@@ -781,3 +1044,7 @@ Protocol types are in `packages/shared/src/ws-protocol.ts`. The upgrade request 
 6. The client may send `{ type: 'ping' }` (the terminal does every 15 s); the server answers `pong`.
    Liveness is checked with WebSocket protocol pings: the server pings every client every 15 s and
    terminates one that did not answer the previous ping. Browsers answer those on their own, also for a hidden tab.
+7. `{ type: 'journal', data: JournalUpdate }` after every change of the trade journal (see "Trade journal"), to every
+   authenticated client: `{ status, reason, trades, serverTime }`, `trades` the summaries of the trades that changed
+   (newest first; empty when only the status changed). Nothing is sent on connect: a page reads `GET /api/journal`
+   and keeps each trade's newest version by `updatedAt`. It is a member of `ServerMessage` (`JournalMessage`).

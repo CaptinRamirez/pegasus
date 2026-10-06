@@ -292,20 +292,39 @@ export interface OkxFill {
 
 export type OkxTriggerPxType = 'last' | 'index' | 'mark';
 
-/** A take-profit / stop-loss attached to an order (`attachAlgoOrds` of the place-order request and of the order object). */
+/**
+ * A take-profit / stop-loss attached to an order (`attachAlgoOrds` of the place-order request and of the order object).
+ *
+ * One object holds a take-profit, a stop-loss or both, for the whole filled size. Split take-profits are several
+ * objects: one per take-profit leg, each with its own `sz` (required, and the legs' sizes must add up to the order's
+ * size: OKX 51083), and at most one stop-loss object without `sz` (51084); in that form an object is one-way, a
+ * take-profit or a stop-loss (51076). docs/okx-api-notes.md 6.1.
+ */
 export interface OkxAttachAlgoOrd {
   /** Client id of the attached algo order, up to 32 alphanumeric characters */
   attachAlgoClOrdId?: string;
+  /** Order object only: the algo id the exchange gave the attached order */
+  attachAlgoId?: string;
   tpTriggerPx?: string;
+  /** '-1' executes the take-profit at market; every leg of split take-profits must be '-1' (51082) */
   tpOrdPx?: string;
   slTriggerPx?: string;
   /** '-1' executes the stop at market */
   slOrdPx?: string;
+  /** OKX defaults to 'last'; the legs of split take-profits must share one (51080) */
   tpTriggerPxType?: OkxTriggerPxType;
   /** OKX defaults to 'last' */
   slTriggerPxType?: OkxTriggerPxType;
+  /** Contracts of one take-profit leg of split take-profits; never sent for a stop-loss */
   sz?: string;
+  /** '1' on the stop-loss of split take-profits: the cost-price stop, moved to the average entry price when the first take-profit triggers (needs two legs or more: 51085) */
   amendPxOnTriggerType?: '0' | '1';
+  /** Trailing stop attached to the order (OKX 2026-04-13): callback ratio, e.g. '0.05' for 5%. Not sent by Pegasus */
+  callbackRatio?: string;
+  /** Trailing stop attached to the order: callback as a price distance. Not sent by Pegasus */
+  callbackSpread?: string;
+  /** Trailing stop attached to the order: activation price. Not sent by Pegasus */
+  activePx?: string;
   /** Order object only: set when the exchange could not create the attached order; '' or '0' otherwise */
   failCode?: string;
   /** Order object only: why it could not be created */
@@ -356,8 +375,16 @@ export interface OkxAmendOrderParams {
 export type OkxAlgoOrderState = 'live' | 'pause' | 'partially_effective' | 'effective' | 'canceled' | 'order_failed' | 'partially_failed';
 
 /**
- * A take-profit / stop-loss algo order (`conditional`: one-way, `oco`: both) of the algo order list. The stop
- * attached to an order becomes one of these once that order is completely filled. Only the fields the terminal reads.
+ * The algo order types Pegasus uses: `conditional` (one-way: a take-profit or a stop-loss), `oco` (both, the first to
+ * trigger cancels the other) and `move_order_stop` (a trailing stop). The algo order list takes `conditional,oco`
+ * together but `move_order_stop` only on its own.
+ */
+export type OkxAlgoOrdType = 'conditional' | 'oco' | 'move_order_stop';
+
+/**
+ * An algo order of the algo order list: a take-profit / stop-loss (`conditional`: one-way, `oco`: both) or a
+ * trailing stop (`move_order_stop`). The take-profits and the stop attached to an order become `conditional` /
+ * `oco` orders once that order is completely filled. Only the fields the terminal reads.
  */
 export interface OkxAlgoOrder {
   instType: OkxInstType;
@@ -383,27 +410,54 @@ export interface OkxAlgoOrder {
   slTriggerPxType: string;
   /** '-1' executes at market */
   slOrdPx: string;
+  /** Trailing stop: callback ratio ('0.05' is 5%); '' otherwise */
+  callbackRatio?: string;
+  /** Trailing stop: callback as a price distance; '' otherwise */
+  callbackSpread?: string;
+  /** Trailing stop: the price that activates it; '' when it was active from its placement */
+  activePx?: string;
+  /** Trailing stop: the price it triggers at now (moves with the market); '' before it is active */
+  moveTriggerPx?: string;
+  /** '1' on the stop-loss of split take-profits whose trigger moves to the entry price when the first take-profit triggers */
+  amendPxOnTriggerType?: string;
   cTime: string;
   uTime: string;
 }
 
-/** A stop-loss placed on its own for an open position (`ordType` conditional). */
+/**
+ * An algo order placed on its own for an open position (POST /api/v5/trade/order-algo):
+ * - `conditional`: one-way, a stop-loss (`sl…`) or a take-profit (`tp…`); with both, OKX performs the stop-loss only;
+ * - `oco`: both, the first to trigger cancels the other;
+ * - `move_order_stop`: a trailing stop, with `callbackRatio` or `callbackSpread` and an optional `activePx`.
+ * `sz` or `closeFraction` ('1', conditional and oco only) is required. Fields that do not belong to the type are not sent.
+ */
 export interface OkxPlaceAlgoParams {
   instId: string;
   tdMode: OkxTdMode;
   /** Side of the closing order: sell for a long, buy for a short */
   side: OkxSide;
-  ordType: 'conditional';
-  sz: string;
-  slTriggerPx: string;
+  ordType: OkxAlgoOrdType;
+  sz?: string;
+  /** '1' closes the whole position whatever its size then; conditional and oco only, reduce-only in net mode */
+  closeFraction?: string;
+  slTriggerPx?: string;
   /** '-1' executes at market */
-  slOrdPx: string;
-  slTriggerPxType: OkxTriggerPxType;
+  slOrdPx?: string;
+  slTriggerPxType?: OkxTriggerPxType;
+  tpTriggerPx?: string;
+  /** '-1' executes at market */
+  tpOrdPx?: string;
+  tpTriggerPxType?: OkxTriggerPxType;
+  /** Trailing stop: '0.05' is 5%; either this or callbackSpread */
+  callbackRatio?: string;
+  callbackSpread?: string;
+  /** Trailing stop: it starts trailing once the price reaches this; at once when absent */
+  activePx?: string;
   /** Long/short mode only */
   posSide?: OkxPosSide;
   /** Net mode only */
   reduceOnly?: boolean;
-  /** Cancel the stop when its position is fully closed; OKX requires reduceOnly with it */
+  /** Cancel the TP/SL order (conditional, oco) when its position is fully closed; OKX requires reduceOnly with it */
   cxlOnClosePos?: boolean;
   algoClOrdId?: string;
 }
@@ -414,7 +468,7 @@ export interface OkxCancelAlgoParams {
   algoClOrdId?: string;
 }
 
-/** Amend of a TP/SL algo order; only the fields that change are sent. */
+/** Amend of a TP/SL algo order (conditional, oco; not a trailing stop); only the fields that change are sent. */
 export interface OkxAmendAlgoParams {
   instId: string;
   algoId?: string;
@@ -423,6 +477,9 @@ export interface OkxAmendAlgoParams {
   newSlTriggerPx?: string;
   newSlOrdPx?: string;
   newSlTriggerPxType?: OkxTriggerPxType;
+  newTpTriggerPx?: string;
+  newTpOrdPx?: string;
+  newTpTriggerPxType?: OkxTriggerPxType;
   cxlOnFail?: boolean;
   reqId?: string;
 }

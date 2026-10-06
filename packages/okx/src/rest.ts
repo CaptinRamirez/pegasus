@@ -315,13 +315,17 @@ export class OkxRestClient {
 
   /**
    * Untriggered algo orders, newest first, up to 100 per call; `after` pages to the ones older than that algoId.
-   * `ordType` is required; `conditional,oco` (the two TP/SL types) is the only combination OKX accepts in one call.
+   * `ordType` is required; `conditional,oco` (the two TP/SL types) is the only combination OKX accepts in one call,
+   * the trailing stops (`move_order_stop`) are read on their own.
    */
   getAlgoOrdersPending(params: { ordType: string; instType?: OkxInstType; instId?: string; algoId?: string; after?: string; limit?: number }): Promise<OkxAlgoOrder[]> {
     return this.getData<OkxAlgoOrder>('/api/v5/trade/orders-algo-pending', params, true);
   }
 
-  /** Places a TP/SL algo order of its own (not attached to an order). */
+  /**
+   * Places an algo order of its own (not attached to an order): a TP/SL (`conditional`, `oco`) or a trailing stop
+   * (`move_order_stop`). Never retried: like an order, a lost answer may hide an order that was placed.
+   */
   async placeAlgoOrder(params: OkxPlaceAlgoParams): Promise<OkxAlgoAck> {
     const [ack] = await this.postData<OkxAlgoAck>('/api/v5/trade/order-algo', params);
     if (!ack) throw new OkxApiError('EMPTY', 'no algo order ack returned', '/api/v5/trade/order-algo');
@@ -337,7 +341,16 @@ export class OkxRestClient {
     return ack;
   }
 
-  /** Amends an untriggered TP/SL or trigger algo order. */
+  /**
+   * Cancels up to 10 untriggered algo orders in one call. Per-item results are returned; items with sCode != '0'
+   * were not cancelled (never throws on a partial failure).
+   */
+  cancelAlgoOrders(params: OkxCancelAlgoParams[]): Promise<OkxAlgoAck[]> {
+    if (params.length === 0 || params.length > 10) throw new OkxApiError('51000', `cancel-algos takes 1 to 10 orders, got ${params.length}`, '/api/v5/trade/cancel-algos');
+    return this.postData<OkxAlgoAck>('/api/v5/trade/cancel-algos', params, true);
+  }
+
+  /** Amends an untriggered TP/SL (conditional, oco) or trigger algo order; OKX does not amend a trailing stop this way. */
   async amendAlgoOrder(params: OkxAmendAlgoParams): Promise<OkxAlgoAck> {
     const [ack] = await this.postData<OkxAlgoAck>('/api/v5/trade/amend-algos', params);
     if (!ack) throw new OkxApiError('EMPTY', 'no amend ack returned', '/api/v5/trade/amend-algos');

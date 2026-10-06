@@ -1,6 +1,6 @@
-import { stopUnconfirmedAfterCancel, type AlgoOrderList, type CampaignView, type Candle, type Fill, type HelloPayload, type Localized, type Order, type RiskState, type ServerMessage, type Trade } from '@pegasus/shared';
+import { stopUnconfirmedAfterCancel, type AlgoOrderList, type CampaignView, type Candle, type Fill, type HelloPayload, type JournalTradeSummary, type JournalUpdate, type Localized, type Order, type RiskState, type ServerMessage, type Trade } from '@pegasus/shared';
 import type { WsStatus } from '../lib/ws';
-import { LIMITS, emptyMarket, type MarketData, type TerminalState, type Toast, type ToastKind } from './types';
+import { LIMITS, emptyMarket, type MarketData, type TerminalState, type Toast, type ToastKind, type ToastLink } from './types';
 
 /**
  * Pure reducers: each returns the slice of state that changes for a server
@@ -45,6 +45,8 @@ export function applyServerMessage(state: TerminalState, msg: ServerMessage): Pa
       return pushToast(state, 'error', `${msg.data.code}: ${msg.data.message}`);
     case 'campaign':
       return applyCampaign(state, msg.data);
+    case 'journal':
+      return applyJournal(state, msg.data);
     case 'pong':
       return {};
   }
@@ -58,6 +60,27 @@ export function applyServerMessage(state: TerminalState, msg: ServerMessage): Pa
  */
 export function applyCampaign(state: TerminalState, view: CampaignView): Partial<TerminalState> {
   return state.campaign !== null && state.campaign.serverTime > view.serverTime ? {} : { campaign: view };
+}
+
+/**
+ * The `journal` message: the journal's status, and the trades it carries merged by id, each kept in its newest
+ * version (`updatedAt`); an older message (by the server's time) changes nothing. At most LIMITS.journalTrades trades
+ * are kept, the most recently changed.
+ */
+export function applyJournal(state: TerminalState, update: JournalUpdate): Partial<TerminalState> {
+  const prev = state.journal;
+  if (prev !== null && prev.serverTime > update.serverTime) return {};
+  const trades: Record<string, JournalTradeSummary> = { ...(prev?.trades ?? {}) };
+  for (const t of update.trades) {
+    const known = trades[t.id];
+    if (known === undefined || known.updatedAt <= t.updatedAt) trades[t.id] = t;
+  }
+  const ids = Object.keys(trades);
+  if (ids.length > LIMITS.journalTrades) {
+    const dropped = ids.sort((a, b) => (trades[a]?.updatedAt ?? 0) - (trades[b]?.updatedAt ?? 0)).slice(0, ids.length - LIMITS.journalTrades);
+    for (const id of dropped) delete trades[id];
+  }
+  return { journal: { status: update.status, reason: update.reason, trades, serverTime: update.serverTime } };
 }
 
 /** Receive times kept next to the message's own changes: every message proves the server is alive. */
@@ -247,10 +270,11 @@ export function mergeFills(fills: Fill[], incoming: Fill[]): Fill[] {
  * lost-stop notice) is outside the cap: it leaves only when the trader clicks it away. A message given in
  * both languages is kept in both, so the toast follows a later switch of the language.
  */
-export function pushToast(state: TerminalState, kind: ToastKind, message: string | Localized, sticky = false): Partial<TerminalState> {
+export function pushToast(state: TerminalState, kind: ToastKind, message: string | Localized, sticky = false, link?: ToastLink): Partial<TerminalState> {
   const toast: Toast = { id: state.nextToastId, kind, message: typeof message === 'string' ? message : message.en, ts: Date.now() };
   if (typeof message !== 'string') toast.zh = message.zh;
   if (sticky) toast.sticky = true;
+  if (link !== undefined) toast.link = link;
   const all = [...state.toasts, toast];
   const droppable = all.filter((t) => t.sticky !== true);
   const dropped = new Set(droppable.slice(0, Math.max(0, droppable.length - LIMITS.toasts)).map((t) => t.id));

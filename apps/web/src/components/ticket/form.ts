@@ -10,6 +10,7 @@ import {
   type TdMode,
 } from '@pegasus/shared';
 import type { Messages } from '../../i18n';
+import { buildExitFields, defaultExitForm, type ExitForm, type ExitFormError } from '../../lib/exits';
 
 export interface TicketForm {
   side: Side;
@@ -24,6 +25,10 @@ export interface TicketForm {
   tdMode: TdMode;
   /** The unit the form had before a pre-fill replaced it, restored when the instrument next changes; null when there is nothing to restore */
   restoreUnit: SizeUnit | null;
+  /** Take-profits and trailing exit of an opening order; sent only while `exitsOn` */
+  exits: ExitForm;
+  /** The exits section is open: its take-profits and trailing are part of the order */
+  exitsOn: boolean;
 }
 
 export type Intent = 'Open long' | 'Open short' | 'Close long' | 'Close short';
@@ -42,6 +47,8 @@ export function defaultForm(): TicketForm {
     reduceOnly: false,
     tdMode: 'cross',
     restoreUnit: null,
+    exits: defaultExitForm(),
+    exitsOn: false,
   };
 }
 
@@ -83,7 +90,7 @@ export function intentOf(side: Side, posSide: PosSide | undefined): Intent | nul
  * complete/valid. Validation uses the shared zod schema so only requests the
  * server would accept are previewed or submitted.
  */
-export function buildRequest(form: TicketForm, instId: string | null, posMode: PosMode | null): PlaceOrderRequest | null {
+export function buildRequest(form: TicketForm, instId: string | null, posMode: PosMode | null, exits?: ExitInput): PlaceOrderRequest | null {
   if (instId === null) return null;
   const candidate: Record<string, unknown> = {
     instId,
@@ -98,14 +105,45 @@ export function buildRequest(form: TicketForm, instId: string | null, posMode: P
   if (posMode === 'long_short_mode') candidate['posSide'] = derivePosSide(form.side, form.reduceOnly);
   // Only an opening order carries a stop; the server refuses one on a closing order.
   if (!form.reduceOnly && form.slTriggerPx.trim() !== '') candidate['slTriggerPx'] = form.slTriggerPx.trim();
+  // The same for take-profits and a trailing exit; an exit part that is not complete leaves the form incomplete.
+  if (!form.reduceOnly && form.exitsOn && exits !== undefined) {
+    const built = exitFieldsOf(form, exits);
+    if (!built.ok) return null;
+    Object.assign(candidate, built.fields);
+  }
+  candidate['source'] = 'manual';
   const parsed = placeOrderRequestSchema.safeParse(candidate);
   return parsed.success ? parsed.data : null;
 }
 
-/** Client order id (alphanumeric, at most 32 chars); 'pgw' tells a web-generated id from the server's own 'pg' ones. */
-export function newClOrdId(now = Date.now()): string {
+/** What the exit part of the ticket needs besides the form: the entry R multiples are measured from, and the instrument. */
+export interface ExitInput {
+  /** The limit price, or the last price for a market order; null when unknown */
+  entry: string | null;
+  inst: Instrument | null;
+}
+
+/** The exit fields of the ticket's opening order, or why it has none yet. */
+export function exitFieldsOf(form: TicketForm, input: ExitInput): ReturnType<typeof buildExitFields> {
+  const stop = form.slTriggerPx.trim();
+  return buildExitFields(form.exits, {
+    direction: form.side === 'buy' ? 'long' : 'short',
+    entry: input.entry,
+    stop: stop === '' ? null : stop,
+    inst: input.inst,
+    whole: true,
+  });
+}
+
+export type { ExitFormError };
+
+/** Client order id prefixes of the page: 'pgw' an order of the ticket (manual), 'psw' a followed signal (the API wants 'ps'). */
+export type ClOrdIdPrefix = 'pgw' | 'psw';
+
+/** Client order id (alphanumeric, at most 32 chars); the prefix tells a web-generated id from the server's own 'pg' / 'ps' ones. */
+export function newClOrdId(prefix: ClOrdIdPrefix = 'pgw', now = Date.now()): string {
   const random = crypto.getRandomValues(new Uint8Array(4));
-  return `pgw${now.toString(36)}${[...random].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
+  return `${prefix}${now.toString(36)}${[...random].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
 }
 
 export function describeRequest(req: PlaceOrderRequest, t: Messages): string {

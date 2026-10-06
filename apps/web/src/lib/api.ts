@@ -8,7 +8,10 @@ import type {
   CancelAllRequest,
   CampaignLogPage,
   CampaignReplayView,
+  CampaignSignalsResponse,
   CampaignView,
+  ChannelTrailingEntry,
+  ClearChannelTrailingRequest,
   CancelOrderRequest,
   CandlesQuery,
   ClosePositionRequest,
@@ -16,6 +19,8 @@ import type {
   Fill,
   FillsQuery,
   Instrument,
+  JournalPage,
+  JournalTrade,
   KillSwitchRequest,
   Lang,
   OrdType,
@@ -25,18 +30,38 @@ import type {
   OrdersHistoryQuery,
   PlaceOrderRequest,
   PlaceStopRequest,
+  PlaceTakeProfitsRequest,
+  PlaceTakeProfitsResult,
+  PlaceTrailingStopRequest,
+  PlaceTrailingStopResult,
   PosSide,
   Position,
   RiskCheckResult,
   RiskConfig,
   RiskState,
+  SetChannelTrailingRequest,
   SetLeverageRequest,
   Side,
   SignalsResponse,
   TdMode,
   Ticker,
+  TradeSource,
+  TradeStatus,
+  TrailingView,
 } from '@pegasus/shared';
-import { http } from './http';
+import { ApiError, http } from './http';
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null;
+
+/**
+ * A reply of the right shape, or a failure: an API that does not know the route, or something else answering it, must
+ * not put another object on screen.
+ */
+async function shaped<T>(reply: Promise<unknown>, valid: (v: Record<string, unknown>) => boolean, what: string): Promise<T> {
+  const v = await reply;
+  if (!isObject(v) || !valid(v)) throw new ApiError('INTERNAL', `the API's answer is not ${what}`, undefined, 200);
+  return v as T;
+}
 
 export type { OrderPreview };
 
@@ -81,6 +106,29 @@ export type SignalsQuery = {
   lang?: Lang;
 };
 
+/** GET /api/campaign/signals: `riskPct` a fraction below 1 (the server's default 0.01); `equity` the account's total equity when absent. */
+export type CampaignSignalsQuery = {
+  riskPct?: string;
+  equity?: string;
+};
+
+/** GET /api/journal: every filter optional; `before` is the `next` of the page before (a trade's seq); `limit` 1 to 200, default 50. */
+export type JournalQuery = {
+  status?: TradeStatus;
+  instId?: string;
+  source?: TradeSource;
+  before?: number;
+  limit?: number;
+};
+
+/** POST /api/positions/channel-trailing/clear */
+export interface ClearChannelTrailingResult {
+  instId: string;
+  mgnMode: TdMode;
+  posSide: PosSide;
+  cleared: boolean;
+}
+
 /** GET /api/campaign/log: `before` is the `next` of the page before (a step's seq); the server's limit is 1 to 100. */
 export type CampaignLogQuery = {
   before?: number;
@@ -124,4 +172,18 @@ export const api = {
   campaignLog: (query: CampaignLogQuery = {}) => http<CampaignLogPage>('/api/campaign/log', { query }),
   /** The replay beside the pot; an API without the route answers NOT_FOUND (404). */
   campaignReplay: () => http<CampaignReplayView>('/api/campaign/replay'),
+  /** The campaign rule read per coin, each entry or add with a plan to follow it by hand. */
+  campaignSignals: (query: CampaignSignalsQuery = {}) =>
+    shaped<CampaignSignalsResponse>(http<unknown>('/api/campaign/signals', { query }), (v) => Array.isArray(v['rows']) && isObject(v['params']) && isObject(v['campaign']), 'a signals report'),
+  /** The trade journal, newest first, without fills and timeline. */
+  journal: (query: JournalQuery = {}) => shaped<JournalPage>(http<unknown>('/api/journal', { query }), (v) => Array.isArray(v['trades']) && typeof v['status'] === 'string', 'a journal page'),
+  /** One trade with its fills and timeline; TRADE_NOT_FOUND (404) for an id the journal does not have. */
+  journalTrade: (id: string) =>
+    shaped<JournalTrade>(http<unknown>(`/api/journal/${encodeURIComponent(id)}`), (v) => typeof v['id'] === 'string' && Array.isArray(v['timeline']) && Array.isArray(v['fills']), 'a trade'),
+  /** Channel trailing and whether exits are offered at all (403 EXITS_UNAVAILABLE where they are not). */
+  trailing: () => shaped<TrailingView>(http<unknown>('/api/trailing'), (v) => typeof v['enabled'] === 'boolean' && Array.isArray(v['entries']), 'the trailing view'),
+  placeTakeProfits: (body: PlaceTakeProfitsRequest) => http<PlaceTakeProfitsResult>('/api/positions/take-profits', { body }),
+  placeTrailingStop: (body: PlaceTrailingStopRequest) => http<PlaceTrailingStopResult>('/api/positions/trailing-stop', { body }),
+  setChannelTrailing: (body: SetChannelTrailingRequest) => http<ChannelTrailingEntry>('/api/positions/channel-trailing', { body }),
+  clearChannelTrailing: (body: ClearChannelTrailingRequest) => http<ClearChannelTrailingResult>('/api/positions/channel-trailing/clear', { body }),
 };

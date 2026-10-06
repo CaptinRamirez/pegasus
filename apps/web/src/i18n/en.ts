@@ -1,7 +1,24 @@
-import type { CancelSweepState, Order, PlaceOrderRequest, PosSide, Side, TrendParams } from '@pegasus/shared';
+import type {
+  CampaignPlanWarningCode,
+  CampaignSignalReasonCode,
+  CampaignSignalState,
+  CancelSweepState,
+  JournalEventKind,
+  JournalStatus,
+  Order,
+  PlaceOrderRequest,
+  PosSide,
+  Side,
+  TradeExitReason,
+  TradeFillRole,
+  TradeSource,
+  TradeStatus,
+} from '@pegasus/shared';
 import type { Intent } from '../components/ticket/form';
 import { pad2, splitDuration } from '../lib/campaign';
+import type { ExitFormError, TpMode, TrailingMode } from '../lib/exits';
 import { fmtAgeCoarse } from '../lib/format';
+import type { CodeText, FollowBlock } from '../lib/signals';
 
 /** The rule of the campaign in one line, its figures formatted. */
 export interface CampaignRuleText {
@@ -24,8 +41,57 @@ export interface CampaignRuleText {
 /** Diagnostic values of a risk rejection (RiskCheckResult.details). */
 export type RiskDetails = Record<string, unknown>;
 
-const OTHER_LOT_TITLE =
-  "A position or an entry order on this side is already open. Each daily cut trades its own lot: apply this row only if what is open is the other cut's lot and this cut's own lot is not in yet. Pegasus does not track which lot belongs to which cut.";
+/** What the sentences of a coin's signal know besides the figures of its codes. */
+export interface SignalContext {
+  /** The base coin, "BTC" */
+  coin: string;
+  entryChannel: number;
+  exitChannel: number;
+  /** The add step as a percentage, "50.00%" */
+  addStep: string;
+}
+
+/** The confirmation sheet's order in one sentence; the figures are formatted, '' where there is none. */
+export interface FollowSummaryText {
+  contracts: string;
+  /** Base coin with its unit, "0.03 BTC" */
+  coin: string;
+  instId: string;
+  /** '' at market */
+  limitPx: string;
+  /** The margin mode in the page's language */
+  mgnMode: string;
+  leverage: string;
+  stop: string;
+  stopPct: string;
+  risk: string;
+  riskPct: string;
+  /** The exit plan in words */
+  exits: string;
+}
+
+/** A journal event's fields, formatted and in the page's language; '' for one the event does not carry. */
+export interface EventText {
+  side: string;
+  contracts: string;
+  px: string;
+  fromPx: string;
+  fee: string;
+  pnl: string;
+  role: string;
+  reason: string;
+  leg: string;
+  source: string;
+  code: string;
+  /** The exit plan of an order Pegasus placed, in words */
+  plan: string;
+}
+
+/** A value of the details of an error as text; '' when the server did not send it. */
+const val = (d: RiskDetails, key: string): string => {
+  const v = d[key];
+  return typeof v === 'string' || typeof v === 'number' ? String(v) : Array.isArray(v) ? v.join(', ') : '';
+};
 
 /**
  * Every text of the terminal in English. The shape of this object is the contract of a dictionary:
@@ -57,6 +123,19 @@ export const en = {
     stop: 'Stop',
     priceStopped: 'Price stopped updating',
     na: 'n/a',
+    /** A time in UTC with the browser's local time beside it */
+    utcLocal: (utc: string, local: string) => `${utc} · ${local} local`,
+    ageCoarse: (ms: number) => fmtAgeCoarse(ms),
+    /** A holding time: "3 d 4 h", "5 h 12 min", "12 min" */
+    duration: (ms: number) => {
+      const min = Math.max(0, Math.floor(ms / 60_000));
+      const d = Math.floor(min / 1440);
+      const h = Math.floor((min % 1440) / 60);
+      const m = min % 60;
+      return d > 0 ? `${d} d ${h} h` : h > 0 ? `${h} h ${m} min` : `${m} min`;
+    },
+    ct: (v: string) => `${v} ct`,
+    close: 'Close',
   },
 
   /** Values the exchange and the server name in English, as the tables show them. */
@@ -108,7 +187,7 @@ export const en = {
     tokenRejected: 'Token rejected by the server',
   },
 
-  toasts: { dismiss: 'Click to dismiss' },
+  toasts: { dismiss: 'Click to dismiss', openJournal: 'Open in the journal' },
 
   instruments: { title: 'Instruments' },
 
@@ -145,13 +224,15 @@ export const en = {
 
   tabs: {
     campaign: 'Campaign',
+    signals: 'Signals',
+    signalsTitle: 'The campaign rule read coin by coin: follow a signal, or open by hand',
+    journal: 'Journal',
+    journalTitle: 'Every position opened: its plan, fills, exits and timeline',
     positions: 'Positions',
     orders: 'Open orders',
     stops: 'Stops',
     history: 'History',
     fills: 'Fills',
-    signals: 'Signals (archived)',
-    signalsTitle: 'The archived 55-day breakout framework (docs/archive/strategy-breakout.md). The current framework is the campaign rule.',
   },
 
   account: {
@@ -360,120 +441,450 @@ export const en = {
     riskOk: 'Risk check passed',
   },
 
+  /** The SIGNALS tab: the campaign rule read coin by coin (GET /api/campaign/signals). */
   signals: {
-    archived: 'Archived: the 55-day breakout framework, docs/archive/strategy-breakout.md. The current framework is the campaign rule (CAMPAIGN tab).',
-    ticketFilled: (side: Side, contracts: string, instId: string, px: string, cut: string | null, noStop: boolean) =>
-      `Ticket filled: ${side} ${contracts} contracts ${instId} @ ${px}${cut === null ? '' : ` (${cut} cut)`}${
-        noStop ? '. NO stop was carried into the ticket (the plan has no positive stop price): set the stop yourself' : ''
-      }`,
+    loading: 'Loading the signals…',
+    what: 'the signals',
     refreshing: 'Refreshing…',
-    riskTitle: (cuts: number) =>
-      `Risk per trade as a fraction of equity. The framework uses 0.5% for the first three months and 0.75% afterwards.${
-        cuts > 1 ? ` It is the risk of one unit, shared equally between the ${cuts} daily cuts.` : ''
-      }`,
-    risk: 'risk',
-    barClosedTitle:
-      'The most recent daily candle the signals are computed from; every cut has its own (see the rows). Shown in the warning colour when a newer bar should already exist for one of the rows.',
-    barClosed: (time: string, ageMs: number) => `bar closed ${time}, ${fmtAgeCoarse(ageMs)} ago`,
-    updated: 'updated',
-    equity: 'equity',
-    lotTitle: (riskPct: string, capPct: string) => `One cut's lot: risk ${riskPct} of equity, notional cap ${capPct}. The lots of an instrument together are one unit.`,
-    perUnit: (riskPct: string, capPct: string, cuts: number) => `risk ${riskPct} of equity per unit · notional cap ${capPct} · each cut sized at 1/${cuts} of a unit`,
-    perTrade: (riskPct: string, capPct: string) => `risk ${riskPct} of equity per trade · notional cap ${capPct}`,
-    /** The rules in one line; `cuts` are the close times of the daily cuts, `utcDaily` a single cut at 00:00 UTC. */
-    summary: (cuts: string[], utcDaily: boolean, p: TrendParams, shortsOff: boolean) =>
-      `${cuts.length > 1 ? `daily closes at ${cuts.join(' and ')}` : utcDaily ? 'UTC daily close' : `daily close at ${cuts[0] ?? ''}`} · ${p.entryChannel}d breakout · MA${p.trendMaPeriod} · ${p.atrStopMultiple}×ATR(${p.atrPeriod}) stop${
-        shortsOff ? ' · shorts off' : ''
-      } · auto-refresh 5m`,
-    unavailable: 'Signals unavailable',
-    loading: 'Loading signals…',
-    noInstruments: 'No instruments to report on',
-    outdated: (time: string) => `Signals not updated since ${time}. The table below may be out of date; Apply is disabled.`,
-    regime: 'Regime',
-    close: 'Close',
-    distAtr: 'dist (ATR)',
-    atrPct: 'ATR %',
-    dHigh: (n: number) => `${n}d high`,
-    dLow: (n: number) => `${n}d low`,
-    exitTitle: 'The exit channel the last close was tested against. The level for the next session is in the expanded row.',
-    erTitle: (n: number) => `Efficiency ratio over ${n} days: |net move| / path length`,
-    volRatio: 'Vol ratio',
-    volRatioTitle: (short: number, long: number) => `${short}d / ${long}d realised vol`,
-    funding3d: 'Funding 3d',
-    annualised: 'annualised',
-    book: 'Book',
-    bookTitle: 'Depth imbalance (bid − ask) / (bid + ask) over the visible book; execution context only, not a direction signal',
-    spreadDepth: 'spread · depth',
-    oi: 'OI',
-    oiTitle: 'Open interest of the instrument: current level; change over the last 10 completed UTC days (over the last completed day), measured in coin',
-    oiSub: '10d chg (1d)',
-    signals: 'Signals',
-    stopLong: 'Stop long',
-    stopShort: 'stop short',
-    stopPct: 'Stop %',
-    contractsTitle: (shortsOff: boolean): string =>
-      shortsOff ? 'Size of a new long. Short entries are switched off (allowShort = false).' : 'Size of a new long; the sub line is the size of a new short (shorts are sized at half)',
-    contractsLong: 'Contracts long',
-    short: 'short',
-    coinLong: 'Coin long',
-    notionalTitle: 'Notional of the contracts shown, after rounding down to whole lots',
-    notionalLong: 'Notional long',
-    riskLong: 'Risk long',
+    risk: 'Risk per trade',
+    riskTitle: 'What one followed signal loses at its stop, as a share of the equity. It sizes every plan on this tab.',
+    equity: 'Equity',
+    updated: 'Updated',
+    rule: (r: { entryChannel: number; exitChannel: number; addStep: string; adds: boolean; leverage: string }) =>
+      `Campaign rule: long on a daily close above the ${r.entryChannel}-day high, exit on a daily close below the ${r.exitChannel}-day low${
+        r.adds ? `, add at every +${r.addStep} (12-hour close)` : ', no adds'
+      }; isolated, up to ${r.leverage}×.`,
+    coins: 'Coins',
+    colCoin: 'Coin',
+    colState: 'State',
+    colMark: 'Mark',
+    colToEntry: 'To entry',
+    toEntryTitle: 'How far the price must rise for the next daily close to beat the entry level',
+    above: 'above',
+    broken: 'broken',
+    empty: 'No coin to read',
+    outdated: (time: string) => `Not updated since ${time}: the figures below may be out of date.`,
+    state: { entry: 'Entry', add: 'Add', exit: 'Exit', holding: 'Holding', near: 'Near', none: 'No signal', unavailable: 'N/A' } satisfies Record<CampaignSignalState, string>,
+    headline: {
+      entry: 'Entry signal: open a long',
+      add: 'Add signal: add to the long',
+      exit: 'Exit signal: close the long',
+      holding: 'Holding a long: nothing to do',
+      near: 'Near an entry: no signal yet',
+      none: 'No signal',
+      unavailable: 'Cannot be read',
+    } satisfies Record<CampaignSignalState, string>,
+    /** One sentence per reason code, from its figures */
+    reason: {
+      CLOSE_ABOVE_ENTRY: (p: CodeText, c: SignalContext) => `${c.coin} closed the day above its ${c.entryChannel}-day high ${p.level} (close ${p.close}).`,
+      NEAR_ENTRY: (p: CodeText, c: SignalContext) =>
+        `${c.coin} at ${p.markPx} is ${p.distancePct} below its ${c.entryChannel}-day high ${p.level}: a daily close above it is an entry.`,
+      MARK_ABOVE_ENTRY: (p: CodeText, c: SignalContext) =>
+        `${c.coin} at ${p.markPx} is above its ${c.entryChannel}-day high ${p.level}; the entry needs a daily close above it (00:00 UTC).`,
+      BELOW_ENTRY: (p: CodeText, c: SignalContext) => `${c.coin} at ${p.markPx} is ${p.distancePct} below its ${c.entryChannel}-day high ${p.level}.`,
+      HOLDING: (p: CodeText, c: SignalContext) =>
+        `A long of ${p.contracts} contracts is held. Exit line (${c.exitChannel}-day low): ${p.trailingLine}${p.addTrigger === '' ? '' : `; next add at a 12-hour close of ${p.addTrigger} or more`}.`,
+      CLOSE_BELOW_EXIT: (p: CodeText, c: SignalContext) => `${c.coin} closed the day below its ${c.exitChannel}-day low ${p.level} (close ${p.close}): the rule closes the long.`,
+      ADD_TRIGGER_REACHED: (p: CodeText, c: SignalContext) =>
+        `The 12-hour close ${p.close} (${p.barClose}) reached the add trigger ${p.trigger}: +${c.addStep} over the last entry ${p.addRef}.`,
+      ADDS_OFF: () => 'Adds are off (no-add structure).',
+      ADD_REF_FROM_POSITION: (p: CodeText) => `The journal has no opening fill of this long: the add is measured from its average price ${p.avgPx}.`,
+      SHORT_HELD: (p: CodeText) => `A short of ${p.contracts} contracts is held on this coin; the rule is long only and does not count it.`,
+      NOT_ENOUGH_BARS: (p: CodeText) => `Only ${p.have} confirmed daily bars; the channels need ${p.need}.`,
+      BARS_UNAVAILABLE: (p: CodeText) => `The daily bars could not be read (${p.message}).`,
+      NO_MARK_PRICE: () => 'No mark price: no distance and no plan.',
+    } satisfies Record<CampaignSignalReasonCode, (p: CodeText, c: SignalContext) => string>,
+    /** The sentences of a coin's state as one text */
+    joinSentences: (parts: string[]) => parts.join(' '),
+    ruleLine: (c: SignalContext, exitLine: string) => `Rule: long; exit on a daily close below the ${c.exitChannel}-day low ${exitLine}.`,
+    exitAdvice: 'Close the long in the Positions tab, or let its stop at the exit line close it.',
+    signalAt: { entry: 'Daily close', add: '12-hour close' },
+    signalTime: 'Signal',
+    nowVsSignal: 'Now vs signal close',
+    noSignalTime: 'no signal',
+    lastClose: 'Last daily close',
+    nextClose: 'Next daily close',
+    levels: 'Key levels',
+    entryLevel: (n: number) => `Entry: ${n}-day high`,
+    entryLevelTitle: 'The highest high of the last daily bars: the next daily close must close above it for an entry',
+    entryLevelBroken: (n: number) => `Entry: ${n}-day high (broken)`,
+    entryLevelBrokenTitle: 'The line the last daily close broke: that close gave this entry signal',
+    entryBrokenBy: (close: string) => `closed at ${close}, above it`,
+    exitLevel: (n: number) => `Exit line: ${n}-day low`,
+    exitLevelTitle: 'The trailing line: a daily close below it ends the long; the channel trailing stop is kept at it',
+    addLevel: 'Next add',
+    addLevelTitle: 'A 12-hour close at or above it is an add signal',
+    addAfterEntry: 'after an entry at the mark',
+    addsOff: 'adds off',
+    chartLine: { entry: (n: number) => `${n}-day high`, exit: (n: number) => `${n}-day low` },
+    chartUntracked: 'No chart: this server does not track the coin.',
+    chartFailed: 'The daily bars could not be loaded.',
+    plan: { entry: 'Plan to follow the entry', add: 'Plan to follow the add' },
+    noPlan: 'No plan: only an entry or an add signal has one.',
+    groupPrice: 'Price',
+    groupSize: 'Position',
+    groupRisk: 'Risk',
+    groupExit: 'Exit',
+    entryPx: 'Entry (mark now)',
+    stopPx: 'Stop (exit line)',
+    stopDistance: 'Stop distance',
+    contracts: 'Contracts',
+    coin: 'Coin',
+    notional: 'Notional',
+    leverage: 'Leverage',
+    margin: 'Margin',
+    liqPx: 'Liquidation (est.)',
+    atRisk: 'At risk',
+    ofEquity: 'Of equity',
+    riskTarget: 'Target',
+    noSize: 'no size',
+    trailingChannel: (bars: number) => `Trailing stop at the ${bars}-day low, moved after every daily close`,
+    noTakeProfit: 'No take-profit: the rule exits on the channel only',
+    afterAdd: 'After the add',
+    afterAddLine: (contracts: string, avgPx: string, liqPx: string) => `${contracts} contracts, average ${avgPx}, liquidation ${liqPx}`,
+    warnings: 'Warnings',
+    warning: {
+      STOP_NOT_BELOW_ENTRY: (p: CodeText) => `The price ${p.entryPx} is at or below the exit line ${p.stopPx}: there is no stop to size with, so the plan has no size.`,
+      STOP_TOO_WIDE: (p: CodeText) => `The stop is ${p.stopDistancePct} below the entry, wider than ${p.limit}: the position is small for its risk.`,
+      STOP_TOO_NARROW: (p: CodeText) => `The stop is only ${p.stopDistancePct} below the entry, closer than ${p.limit}: noise can stop it out, and the position is large.`,
+      BELOW_MIN_ORDER: (p: CodeText) => `The risk buys only ${p.sized} contracts, below the minimum order of ${p.minSz}: the plan holds the minimum, which risks ${p.riskAmount} USDT.`,
+      OVER_ORDER_NOTIONAL: (p: CodeText) => `The order's notional ${p.notional} USDT is over the per-order limit of ${p.limit}: the risk engine refuses it. Use fewer contracts.`,
+      OVER_POSITION_NOTIONAL: (p: CodeText) => `With this order the coin's positions come to ${p.projected} USDT, over the per-coin limit of ${p.limit}: the risk engine refuses it.`,
+      OVER_TOTAL_NOTIONAL: (p: CodeText) => `With this order all positions come to ${p.projected} USDT, over the total limit of ${p.limit}: the risk engine refuses it.`,
+      SIGNAL_STALE: (p: CodeText) => `The bar of the signal closed at ${p.closedAt}, more than a bar ago: a newer bar is not confirmed yet. Check before following.`,
+      PRICE_FAR_ABOVE_SIGNAL: (p: CodeText) => `The price ${p.markPx} is already ${p.risePct} above the signal's close ${p.close} (more than ${p.limit}): a late entry, with the stop further away.`,
+      EQUITY_UNKNOWN: () => 'No equity to size with: the plan has no size.',
+      LINEAR_ONLY: () => 'Plans are for USDT-margined (linear) swaps only: this one has no size.',
+      LEVERAGE_REDUCED: (p: CodeText) => `Leverage ${p.leverage}× instead of ${p.maxLeverage}×, so that the liquidation stays below the stop.`,
+      LIQUIDATION_NEAR_STOP: (p: CodeText) => `After the add the estimated liquidation ${p.liqPx} is not safely below the stop ${p.stopPx}.`,
+      NOT_TRACKED: () => 'This server does not track the coin: an order on it is refused. Add it to INSTRUMENTS.',
+      CAMPAIGN_ACCOUNT: () => "The campaign pot runs on this account: its positions are the pot's, and an order here disturbs it.",
+      KILL_SWITCH: () => 'The kill switch is on: trading is halted.',
+    } satisfies Record<CampaignPlanWarningCode, (p: CodeText) => string>,
+    follow: 'Follow signal',
+    followTitle: 'Opens a confirmation sheet with every parameter filled in; nothing is sent until you confirm there',
+    manual: 'Open manually',
+    manualTitle: 'Puts the coin and Buy / Long into the order ticket and moves the focus there; nothing else is filled in',
+    manualUntracked: 'The order ticket offers the tracked coins only.',
+    /** Why the follow button is disabled */
+    block: {
+      NOT_ACTIONABLE: 'Only an entry or an add signal can be followed.',
+      CAMPAIGN_ACCOUNT: 'The campaign pot trades this account by itself: following a signal here would disturb it.',
+      KILL_SWITCH: 'The kill switch is on: opening orders are refused.',
+      TRADING_BLOCKED: 'Trading from Pegasus is disabled (see the order ticket).',
+      NOT_TRACKED: 'This server does not track the coin: an order on it is refused.',
+      NO_PLAN: 'There is no plan to follow.',
+      NO_SIZE: 'The plan has no size (see the warnings).',
+      EXITS_UNAVAILABLE: "Exits are not offered here: the plan's channel trailing stop cannot be placed. Open manually, with a stop.",
+      EXITS_UNKNOWN: 'Whether exits are offered here could not be checked yet.',
+    } satisfies Record<FollowBlock, string>,
+    banner: {
+      campaignAccount: (paperUrl: string) =>
+        `This stack runs the campaign pot on its own paper account: the positions are the pot's and it trades them by itself. Following signals is disabled here; follow them on the paper stack (${paperUrl}).`,
+      killSwitch: 'The kill switch is on: opening orders are refused, so no signal can be followed.',
+      exitsUnavailable: 'Take-profit and trailing exits are offered in paper trading and against the local mock only. A followed signal needs its trailing stop, so following is disabled here.',
+    },
   },
 
-  row: {
-    inPositionTitle: 'A position on this side is already open. Adding to an open position (pyramiding) is not part of the framework yet.',
-    entryPendingTitle: 'An entry order on this side is already open and not filled yet. Cancel it or let it fill before applying the signal again, or the position would be doubled.',
-    otherLotTitle: OTHER_LOT_TITLE,
-    unitFullTitle: 'The position and the entry orders on this side already amount to the lots of all the daily cuts (one unit). Adding more (pyramiding) is not part of the framework yet.',
-    outdatedTitle: 'The signals could not be refreshed, so this row may be out of date. Refresh before applying it.',
-    fundingUncheckedTitle: 'The funding history was unavailable, so the funding gate was skipped for this entry. Check the funding rate on OKX before acting.',
-    latestCutTitle: 'The daily bar of this cut closed most recently: this is the row to act on now.',
-    shortsOffTitle: 'Short entries are switched off (allowShort = false). The short exit and the stop of an open short are still shown.',
-    capped: 'capped',
-    noEquity: 'no equity',
-    shortOff: 'short off',
-    bookTitle: (levels: number) => `Visible depth over ${levels} levels; execution context only, not a direction signal.`,
-    oiUnit: { usd: 'USD', contracts: 'contracts' },
-    oiTitleLive: (unit: string) => `Live open interest of this instrument in ${unit}. Its daily history is unavailable right now, so the 1-day and 10-day changes cannot be shown.`,
-    oiTitleHistory: (unit: string, points: number) =>
-      `Open interest of this instrument in ${unit}: the level is today's value so far. The changes compare completed UTC days (OKX daily history, ${points} days): the last completed day against 10 days before it (against the day before it), measured in coin, so a price move alone does not count.`,
-    liveNoHistory: 'live · no history',
-    structureLabel: 'structure:',
-    bookNa: 'book n/a',
-    bookLine: (imbalance: string, spread: string, depth: string) => `book imbalance ${imbalance}, spread ${spread}, depth ${depth}`,
-    oiNa: 'OI n/a',
-    oiLive: (level: string) => `OI ${level} (live level; history and changes unavailable)`,
-    oiLine: (level: string, change1d: string, change10d: string, percentile: string) => `OI ${level}, 1d ${change1d}, 10d ${change10d}, pct ${percentile}`,
-    latestClose: ' · latest close',
-    volTitle: (short: number, volShort: string, long: number, volLong: string) => `${short}d vol ${volShort} / ${long}d vol ${volLong} (annualised)`,
-    perAnnum: (pct: string) => `${pct} p.a.`,
-    fundingUnchecked: 'funding unchecked',
-    inPosition: 'in position',
-    entryPending: 'entry pending',
-    sizeAdjust: (multiplier: string, adjustments: string[]) => `size ×${multiplier}: ${adjustments.join(', ')}`,
-    noEquityTitle: 'No equity: sizing unavailable',
-    /** `otherLot`: something is already open on the side, which may be the lot of another cut */
-    fillTicketTitle: (side: Side, contracts: string, close: string, otherLot: boolean) => `Fill the ticket: ${side} ${contracts} contracts @ ${close}${otherLot ? `. ${OTHER_LOT_TITLE}` : ''}`,
-    apply: 'Apply',
-    sizingNoEquity: 'sizing: no equity available (sign in with a funded account or pass ?equity)',
-    sizingLong: 'sizing long:',
-    sizingShort: 'sizing short:',
-    sizingShortOff: 'sizing short: off (short entries are switched off, allowShort = false)',
-    nextSession: (exitChannel: number, longStop: string, shortStop: string) =>
-      `next session (the ${exitChannel}-day channel including the last bar): trail a long's exchange stop to ${longStop}, a short's to ${shortStop}; only ever move a stop in the position's favour`,
-    barClosed: (time: string) => `bar closed ${time}`,
-    dataFetched: (time: string) => ` · exchange data fetched ${time}`,
-    longEntry: 'LONG ENTRY',
-    shortEntry: 'SHORT ENTRY',
-    longExit: 'LONG EXIT',
-    shortExit: 'SHORT EXIT',
+  /** The confirmation sheet of a followed signal. */
+  follow: {
+    title: { entry: 'Follow the entry signal', add: 'Follow the add signal' },
+    signalLine: (when: string, close: string, level: string, kind: 'entry' | 'add', n: number) =>
+      kind === 'entry' ? `${when}: daily close ${close} above the ${n}-day high ${level}` : `${when}: 12-hour close ${close} at or above the add trigger ${level}`,
+    order: 'Order',
+    ordType: 'Type',
+    limitPx: 'Limit price',
+    mgnMode: 'Margin mode',
+    leverage: 'Leverage',
+    leverageHint: (plan: string, max: string | null) => `plan ${plan}×${max === null ? '' : ` · limit ${max}×`}`,
+    leverageFrom: (from: string, to: string) => `Leverage is set from ${from}× to ${to}× before the order is sent.`,
+    size: 'Size',
+    contracts: 'Contracts',
+    riskPct: 'Risk % of equity',
+    recompute: 'Size from risk',
+    recomputeTitle: 'Contracts that lose this share of the equity from the entry to the stop, whole lots rounded down, at least the minimum order',
+    belowMin: (minSz: string) => `the risk buys less than the minimum order: ${minSz} contracts`,
+    stop: 'Stop (mark trigger)',
+    stopBelow: (pct: string) => `${pct} below the entry`,
+    stopNotBelow: 'not below the entry',
+    exitPlan: 'Exit plan',
+    check: 'Live check',
+    checking: 'Checking…',
+    enterValues: 'Complete the order to check it',
+    refPrice: 'Ref price',
+    notional: 'Notional',
+    estSlippage: 'Est. slippage',
+    marginAt: (lev: string) => `Margin at ${lev}×`,
+    fee: (rate: string) => `Fee (taker ${rate}, est.)`,
+    liqPx: 'Liquidation (est.)',
+    lossAtStop: 'Loss at stop',
+    ofEquity: (pct: string) => `${pct} of equity`,
+    tpLegs: 'Take-profit legs',
+    tpLeg: (n: number) => `TP${n}`,
+    tpContracts: 'Contracts',
+    tpProfit: 'Profit',
+    riskOk: 'Risk check passed',
+    leverageWillPass: (to: string) => `Passes once the leverage is set to ${to}×.`,
+    summaryTitle: 'In one sentence',
+    summary: (s: FollowSummaryText) =>
+      `Buy ${s.contracts} contracts (${s.coin}) of ${s.instId} ${s.limitPx === '' ? 'at market' : `at limit ${s.limitPx}`}, ${s.mgnMode} ${s.leverage}×; stop ${s.stop}${
+        s.stopPct === '' ? '' : ` (${s.stopPct} below)`
+      }, at risk ${s.risk} USDT${s.riskPct === '' ? '' : ` (${s.riskPct} of equity)`}; ${s.exits}.`,
+    confirm: 'Confirm order',
+    sending: 'Sending…',
+    settingLeverage: 'Setting the leverage…',
+    cancel: 'Cancel',
+    closeTitle: 'Close without sending anything',
+    placed: (contracts: string, instId: string, state: string) => `Signal followed: buy ${contracts} contracts of ${instId} (${state}).`,
+    leverageFailed: (err: string) => `The leverage could not be set, so no order was sent: ${err}`,
+    incomplete: 'Complete the form',
+  },
+
+  /** Take-profits and trailing stops: the editor of an order's exit plan and the exits of an open position. */
+  exits: {
+    section: 'Take-profit & trailing',
+    sectionTitle: 'Exits attached to the order: take-profits, the cost-price stop and a trailing stop',
+    unavailable: 'Take-profit and trailing exits are offered in paper trading and against the local mock only.',
+    unknown: 'Whether exits are offered here could not be checked.',
+    tp: 'Take-profit',
+    tpMode: { none: 'None', single: 'Single', ladder: 'Ladder' } satisfies Record<TpMode, string>,
+    basis: { price: 'Price', r: 'R' },
+    basisTitle: 'R: multiples of the distance from the entry to the stop',
+    value: 'Price or R',
+    atPrice: (px: string) => `= ${px}`,
+    asR: (r: string) => `${r}R`,
+    pctOfSize: '% of size',
+    pctOfPosition: '% of position',
+    rest: 'rest',
+    addLeg: '+ leg',
+    removeLeg: 'Remove leg',
+    breakeven: 'After the first take-profit, move the stop to the entry price',
+    breakevenNeeds: 'needs a stop and two legs or more',
+    wholeOrderHint:
+      'On an opening order the legs cover the whole order: the last one takes what the others leave. To take profit on part and let the rest trail, add take-profits to the position after the fill (Positions tab).',
+    trailing: 'Trailing stop',
+    trailingMode: { none: 'None', channel: 'Channel', callback: 'Callback' } satisfies Record<TrailingMode, string>,
+    channelBars: 'Days',
+    channelHint: (bars: string) =>
+      `The stop is kept at the lowest low of the last ${bars} daily bars (the highest high for a short), moved after every 00:00 UTC close, never against the position.`,
+    callbackPct: 'Callback %',
+    activePx: 'Activation price',
+    optional: 'optional',
+    callbackHint: 'The exchange closes the position once the price comes back this far from its best since activation.',
+    error: {
+      TP_VALUE: (leg: number) => `Take-profit ${leg}: enter a price, or an R multiple, above 0.`,
+      TP_R_NEEDS_STOP: (leg: number) => `Take-profit ${leg}: an R multiple needs an entry and a stop on the losing side.`,
+      TP_PCT: (leg: number) => `Take-profit ${leg}: enter its share as a percentage above 0 and at most 100.`,
+      TP_REST: () => 'The legs before the last take 100% or more: nothing is left for the last one.',
+      TP_OVER_100: () => 'The take-profit shares add up to more than 100%.',
+      BREAKEVEN: () => 'The cost-price stop needs a stop and two take-profit legs or more.',
+      CHANNEL_BARS: () => 'Channel days: a whole number from 2 to 100.',
+      CALLBACK_RATIO: () => 'Callback: from 0.1% to 20%.',
+      ACTIVE_PX: () => 'Activation price: a positive number, or empty.',
+    } satisfies Record<ExitFormError['code'], (leg: number) => string>,
+    // the exit plan in words
+    joinParts: (parts: string[]) => parts.join('; '),
+    stopText: (px: string) => `stop ${px}`,
+    tpNone: 'no take-profit',
+    tpLegs: (legs: Array<{ px: string; pct: string }>) => legs.map((l) => `${l.px} (${l.pct})`).join(', '),
+    tpList: (legs: Array<{ px: string; pct: string }>) => `take-profit ${legs.map((l) => `${l.px} (${l.pct})`).join(', ')}`,
+    breakevenOn: 'stop to the entry after the first take-profit',
+    trailingNone: 'no trailing stop',
+    trailingChannelText: (bars: number) => `trailing stop at the ${bars}-day low`,
+    trailingCallbackText: (ratio: string, activePx: string | null) => `trailing stop ${ratio} callback${activePx === null ? '' : ` from ${activePx}`}`,
+    // the exits of a position
+    tpCount: (n: number) => `${n} legs`,
+    channelShort: (bars: number, level: string) => `channel ${bars}d · ${level}`,
+    callbackShort: (ratio: string, trigger: string) => `callback ${ratio}${trigger === '' ? '' : ` · ${trigger}`}`,
+    colTp: 'Take-profit',
+    colTpTitle: 'Take-profit orders resting at the exchange for the position',
+    colTrailing: 'Trailing',
+    colTrailingTitle: "The exchange's trailing stop (callback), or the channel trailing Pegasus keeps, with its level now",
+    open: 'Exits',
+    openTitle: 'Take-profits, trailing stops and channel trailing of this position',
+    dialogTitle: (instId: string, side: string) => `Exits of ${instId} ${side}`,
+    stops: 'Stop-loss',
+    tps: 'Take-profit legs',
+    trailingStops: "Trailing stop (exchange's)",
+    channel: 'Channel trailing (Pegasus)',
+    none: 'none',
+    tpLine: (px: string, size: string) => `${px} · ${size}`,
+    callbackLine: (ratio: string, trigger: string, active: string) =>
+      `${ratio} callback${active === '' ? '' : `, from ${active}`}${trigger === '' ? ', not active yet' : `, triggers at ${trigger}`}`,
+    channelLine: (bars: number, level: string) => `${bars}-day channel, stop at ${level}`,
+    channelWaiting: (bars: number) => `${bars}-day channel, first level at the next daily close`,
+    lastMove: (from: string, to: string, time: string) => `last moved ${from} → ${to} (${time})`,
+    lastError: (msg: string) => `last attempt failed: ${msg}`,
+    wholePosition: 'whole position',
+    cancel: 'Cancel',
+    confirmCancel: (what: string, instId: string) => `Cancel the ${what} of ${instId}?`,
+    whatTp: (px: string) => `take-profit at ${px}`,
+    whatTrailing: 'trailing stop',
+    clearChannel: 'Stop channel trailing',
+    clearChannelTitle: 'Pegasus stops moving the stop; the stop stays where it is',
+    confirmClear: (instId: string) => `Stop channel trailing for ${instId}? The stop stays where it is.`,
+    addTps: 'Add take-profit legs',
+    addTpsHint: 'Each leg closes its share of the position; together they may cover less than all of it.',
+    placeTps: 'Place take-profits',
+    setTrailing: 'Set a trailing stop',
+    place: 'Place',
+    campaignPosition: "The campaign's position: its exits are the rule's and are not set by hand.",
+    done: {
+      tps: (n: number, instId: string) => `${n} take-profit leg${n === 1 ? '' : 's'} placed for ${instId}`,
+      trailing: (instId: string, ratio: string) => `Trailing stop placed for ${instId}: ${ratio} callback`,
+      channel: (instId: string, bars: number) => `Channel trailing set for ${instId}: ${bars}-day low`,
+      cleared: (instId: string) => `Channel trailing stopped for ${instId}; the stop stays`,
+      cancelled: (instId: string) => `Exit order cancelled for ${instId}`,
+    },
+    failed: (err: string) => `Not done: ${err}`,
+  },
+
+  /** The JOURNAL tab: every trade of the account (GET /api/journal). */
+  journal: {
+    loading: 'Loading the journal…',
+    what: 'the journal',
+    empty: 'No trade recorded yet',
+    emptyFiltered: 'No trade matches the filters',
+    status: { disabled: 'Not recording', starting: 'Starting', ready: 'Recording', blocked: 'Blocked' } satisfies Record<JournalStatus, string>,
+    statusReason: {
+      JOURNAL_DISABLED: 'This server keeps no trade journal: there is no account to record (no API key).',
+      JOURNAL_STARTING: 'The journal is reading what happened while the API was not running; new trades appear once it is done.',
+      JOURNAL_UNREADABLE: 'The journal file cannot be read: nothing is recorded until it is repaired or moved away.',
+    } as Record<string, string>,
+    filterCoin: 'Coin',
+    filterSource: 'Source',
+    filterStatus: 'Status',
+    all: 'All',
+    source: { manual: 'Manual', signal: 'Signal', campaign: 'Campaign', external: 'External' } satisfies Record<TradeSource, string>,
+    sourceTitle: {
+      manual: 'Opened from the order ticket',
+      signal: 'A signal followed from the SIGNALS tab',
+      campaign: "The campaign pot's own order",
+      external: 'Not placed through Pegasus, or found open',
+    } satisfies Record<TradeSource, string>,
+    tradeStatus: { open: 'Open', closed: 'Closed' } satisfies Record<TradeStatus, string>,
+    exitReason: {
+      take_profit: 'take-profit',
+      stop: 'stop',
+      trailing: 'trailing stop',
+      manual: 'by hand',
+      campaign: 'campaign',
+      liquidation: 'liquidated',
+      adl: 'auto-deleveraged',
+      external: 'outside Pegasus',
+      unknown: 'unknown',
+    } satisfies Record<TradeExitReason, string>,
+    exitReasonLeg: (leg: number) => `take-profit ${leg}`,
+    col: {
+      opened: 'Opened',
+      coin: 'Coin',
+      side: 'Side',
+      source: 'Source',
+      entry: 'Entry avg',
+      size: 'Size',
+      notional: 'Notional',
+      leverage: 'Leverage / mode',
+      stop: 'Initial stop',
+      tps: 'Take-profit plan',
+      trailing: 'Trailing',
+      status: 'Status',
+      exit: 'Exit avg',
+      pnl: 'Realised / net',
+      realised: 'Realised',
+      net: 'net',
+      exitAndReason: 'exit avg · closed by',
+      localUtc: 'local · UTC',
+      r: 'R',
+      duration: 'Held',
+    },
+    sizeTitle: 'Contracts opened in total (with the adds), and their coin',
+    pnlTitle: 'Realised P&L of the exits; net is after fees and funding (USDT)',
+    rTitle: 'Net P&L in multiples of the initial risk (entry to initial stop), once closed',
+    tpCount: (n: number) => `${n} leg${n === 1 ? '' : 's'}`,
+    openFor: (d: string) => `${d} so far`,
+    adoptedTag: 'adopted',
+    adoptedTitle: 'Found open without having seen it open: the entry is the position as the exchange reported it',
+    shown: (n: number, total: number) => `${n} of ${total} trades`,
+    loadOlder: 'Load older trades',
+    loadingOlder: 'Loading…',
+    detail: 'Trade',
+    close: 'Close',
+    loadingTrade: 'Loading the trade…',
+    whatTrade: 'the trade',
+    figures: 'Figures',
+    opened: 'Opened',
+    closed: 'Closed',
+    held: 'Held',
+    sizeNow: 'Size now',
+    maxSize: 'Largest size',
+    margin: 'Margin',
+    fees: 'Fees',
+    funding: 'Funding',
+    realised: 'Realised',
+    net: 'Net',
+    initialRisk: 'Initial risk (1R)',
+    closeReason: 'Closed by',
+    plan: 'Plan',
+    noPlan: 'No plan: Pegasus did not place the opening order (campaign or external), or the journal did not see its request.',
+    planStop: 'Stop',
+    planTps: 'Take-profits',
+    planBreakeven: 'Cost-price stop',
+    planTrailing: 'Trailing',
+    yes: 'yes',
+    no: 'no',
+    signal: 'Signal followed',
+    signalKind: { entry: 'entry', add: 'add' },
+    signalLine: (kind: string, close: string, time: string, entryLevel: string, exitLevel: string) =>
+      `${kind}: close ${close} (${time}); entry level ${entryLevel}, exit level ${exitLevel}`,
+    fills: 'Fills',
+    noFills: 'No fills recorded',
+    role: { open: 'open', add: 'add', reduce: 'reduce', close: 'close' } satisfies Record<TradeFillRole, string>,
+    colRole: 'Role',
+    colPnl: 'P&L',
+    colAfter: 'Held after',
+    exits: 'Exits',
+    colReason: 'Reason',
+    timeline: 'Timeline',
+    noTimeline: 'No event recorded',
+    /** One sentence per event; the fields are formatted, '' when the event does not carry them */
+    event: {
+      order_placed: (e: EventText) =>
+        `Order placed: ${e.side} ${e.contracts} contracts ${e.px === '' ? 'at market' : `at ${e.px}`}${e.source === '' ? '' : ` (${e.source})`}${e.plan === '' ? '' : `; ${e.plan}`}.`,
+      order_cancelled: (e: EventText) => `Order cancelled${e.contracts === '' ? '' : `: ${e.contracts} contracts left unfilled`}.`,
+      fill: (e: EventText) =>
+        `Fill (${e.role}): ${e.side} ${e.contracts} contracts at ${e.px}${e.fee === '' ? '' : `, fee ${e.fee}`}${e.pnl === '' ? '' : `, P&L ${e.pnl}`}${e.reason === '' ? '' : ` — ${e.reason}`}.`,
+      stop_placed: (e: EventText) => `Stop-loss placed at ${e.px}${e.contracts === '' ? '' : ` for ${e.contracts} contracts`}.`,
+      stop_moved: (e: EventText) => `Stop-loss moved ${e.fromPx} → ${e.px}.`,
+      stop_triggered: (e: EventText) => `Stop-loss triggered at ${e.px}.`,
+      stop_cancelled: (e: EventText) => `Stop-loss at ${e.px} cancelled${e.code === '' ? '' : `: ${e.code}`}.`,
+      tp_placed: (e: EventText) => `Take-profit ${e.leg} placed at ${e.px}${e.contracts === '' ? '' : ` for ${e.contracts} contracts`}.`,
+      tp_moved: (e: EventText) => `Take-profit ${e.leg} moved ${e.fromPx} → ${e.px}.`,
+      tp_triggered: (e: EventText) => `Take-profit ${e.leg} triggered at ${e.px}.`,
+      tp_cancelled: (e: EventText) => `Take-profit ${e.leg} at ${e.px} cancelled${e.code === '' ? '' : `: ${e.code}`}.`,
+      trailing_placed: (e: EventText) => `Trailing stop placed${e.px === '' ? '' : ` at ${e.px}`}${e.contracts === '' ? '' : ` for ${e.contracts} contracts`}.`,
+      trailing_moved: (e: EventText) => `Trailing stop moved ${e.fromPx} → ${e.px}.`,
+      trailing_triggered: (e: EventText) => `Trailing stop triggered${e.px === '' ? '' : ` at ${e.px}`}.`,
+      trailing_cancelled: (e: EventText) => `Trailing stop cancelled${e.code === '' ? '' : `: ${e.code}`}.`,
+      liquidation: (e: EventText) => `Liquidated: ${e.contracts} contracts at ${e.px}${e.pnl === '' ? '' : `, P&L ${e.pnl}`}.`,
+      adopted: (e: EventText) => `Found open: ${e.contracts} contracts at ${e.px}${e.code === '' ? '' : ` (${e.code})`}.`,
+      reconciled: (e: EventText) => `Reconciled with the exchange${e.code === '' ? '' : `: ${e.code}`}${e.contracts === '' ? '' : ` (${e.contracts} contracts)`}.`,
+    } satisfies Record<JournalEventKind, (e: EventText) => string>,
+    eventCode: {
+      POSITION_CLOSED: 'the position was closed by then',
+      POSITION_ADOPTED: 'the journal had not seen it open',
+      POSITION_GONE: 'the position was gone, without fills to say how',
+      SIZE_CORRECTED: 'the size set to what the exchange shows',
+    } as Record<string, string>,
   },
 
   /** The CAMPAIGN tab: the scoreboard of the pot the API runs on the paper exchange (docs/strategy.md). */
   campaign: {
     loading: 'Loading the campaign…',
     what: 'the campaign',
+    /** The tab on a stack where the campaign is disabled */
+    disabledTitle: 'The campaign does not run on this stack',
+    disabledNote: 'The campaign pot runs on a stack of its own, on its own paper account: start it with pnpm start --campaign (start-campaign.bat). Its page is on port 5175.',
+    openCampaignPage: 'Open the campaign page',
 
     // the status
     status: 'Status',
@@ -678,8 +1089,32 @@ export const en = {
 
   /** What an API error code means, for the codes the server explains in English only; empty here: the server's own message is shown. */
   apiErrors: {} as Record<string, string>,
-  /** A risk rejection in words, by RiskCheckResult.code, from its details and the server's message; empty here for the same reason. */
-  riskReject: {} as Record<string, (details: RiskDetails, message: string) => string>,
+  /** "CODE: explanation (the server's message)" */
+  errorWithMessage: (code: string, known: string, message: string) => `${code}: ${known} (${message})`,
+  /** A risk rejection in words, by RiskCheckResult.code, from its details and the server's message. The older codes are worded by the server in English. */
+  riskReject: {
+    TP_WRONG_SIDE: (d: RiskDetails) =>
+      `Take-profit ${val(d, 'leg')} at ${val(d, 'triggerPx')} is on the wrong side: a long's take-profit must be above both the entry ${val(d, 'entryPx')} and the mark ${val(d, 'markPx')} (a short's below both).`,
+    CALLBACK_RATIO: (d: RiskDetails) => `The callback ${val(d, 'callbackRatio')} is outside the allowed 0.1% to 20%.`,
+    ACTIVE_PX_WRONG_SIDE: (d: RiskDetails) =>
+      `The activation price ${val(d, 'activePx')} must be beyond the mark ${val(d, 'markPx')} and the last price ${val(d, 'lastPx')} on the profit side (above both for a long).`,
+  } as Record<string, (details: RiskDetails, message: string) => string>,
+  /** Errors of the exits and the journal in words, by code, from their details */
+  errorWords: {
+    EXITS_UNAVAILABLE: () => 'Take-profit and trailing exits are offered in paper trading and against the local mock only: nothing was sent.',
+    TP_LEG_TOO_SMALL: (d: RiskDetails) =>
+      `Take-profit ${val(d, 'leg')} would close ${val(d, 'sz')} contracts, below the minimum order of ${val(d, 'minSz')}: use fewer legs or a larger size.`,
+    TP_TRIGGERS_NOT_DISTINCT: (d: RiskDetails) => `Two take-profit legs have the same price once rounded to the tick (${val(d, 'triggers')}): give each its own price.`,
+    BREAKEVEN_NEEDS_SPLIT_TP: () => 'The cost-price stop needs a stop and two take-profit legs or more.',
+    TP_EXCEEDS_POSITION: (d: RiskDetails) =>
+      `With the ${val(d, 'existing')} contracts the take-profits already close, these ${val(d, 'requested')} would close more than the position's ${val(d, 'size')}: cancel one or ask for less.`,
+    TRAILING_EXCEEDS_POSITION: (d: RiskDetails) =>
+      `With the ${val(d, 'existing')} contracts the trailing stops already close, ${val(d, 'requested')} more would close more than the position's ${val(d, 'size')}.`,
+    CAMPAIGN_POSITION: () => "This is the campaign's position: its exits are the rule's and are not set by hand.",
+    TRAILING_STATE_UNREADABLE: () => "Channel trailing is off: the API's trailing state file cannot be read. Repair it or move it away.",
+    TRADE_NOT_FOUND: (d: RiskDetails) => `The journal has no trade ${val(d, 'id')}.`,
+  } as Record<string, (details: RiskDetails) => string>,
 };
+
 
 export type Messages = typeof en;

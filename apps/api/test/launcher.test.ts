@@ -17,13 +17,25 @@ import { loadConfig } from '../src/config.js';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const scripts = join(repo, 'scripts');
 
+interface StackPorts {
+  api: number;
+  paper: number;
+  web: number;
+}
 interface LaunchOptions {
   parseFlags(argv: string[]): { mock: boolean; paper: boolean; campaign: boolean; dev: boolean; open: boolean };
   mockEnv(port?: number): Record<string, string>;
   paperEnv(port?: number): Record<string, string>;
-  campaignEnv(port?: number, potStart?: string): Record<string, string>;
+  campaignEnv(port?: number, potStart?: string, ports?: StackPorts): Record<string, string>;
   paperExchangeEnv(flags: { campaign: boolean }, overrides: Record<string, string>, port?: number): Record<string, string>;
   potStartOf(env: Record<string, string | undefined>): string;
+  DEFAULT_PORTS: StackPorts;
+  CAMPAIGN_PORTS: StackPorts;
+  stackPorts(flags: { campaign: boolean }, env: Record<string, string | undefined>): StackPorts;
+  webOutDir(flags: { campaign: boolean }): string;
+  webOrigins(webPort: number): string;
+  webServerOptions(webPort: number, apiPort: number): { port: number; strictPort: boolean; proxy: Record<string, { target: string; ws?: boolean; changeOrigin?: boolean }> };
+  webEnv(ports: StackPorts): Record<string, string>;
 }
 const options = (await import(pathToFileURL(join(scripts, 'launch-options.mjs')).href)) as LaunchOptions;
 
@@ -53,9 +65,10 @@ describe('launcher options', () => {
       paper: true,
       endpoints: { rest: 'https://www.okx.com', wsPublic: 'wss://ws.okx.com/ws/v5/public', wsBusiness: 'wss://ws.okx.com/ws/v5/business', restPrivate: 'http://127.0.0.1:9200', wsPrivate: 'ws://127.0.0.1:9200/ws/v5/private' },
     });
-    // the instruments are the owner's own; the halt, the day baseline and the journal are the paper account's
-    expect(config.instruments).toEqual(['SOL-USDT-SWAP']);
+    // the instruments are the owner's own; the halt, the day baseline and the journals are the paper account's
+    expect(config.instruments).toEqual(['SOL-USDT-SWAP', ...CAMPAIGN_INSTRUMENTS]);
     expect(config.stateFile).toMatch(/pegasus-state\.paper\.json$/);
+    expect(config.journalFile).toBe(join(repo, 'data', 'journal.paper.json'));
     expect(config.databaseUrl).toBeFalsy();
     expect(options.paperEnv(9300).PAPER_EXCHANGE_URL).toBe('http://127.0.0.1:9300');
   });
@@ -72,6 +85,7 @@ describe('launcher options', () => {
     });
     expect(config.instruments).toEqual(['BTC-USDT-SWAP', 'ETH-USDT-SWAP']);
     expect(config.stateFile).toMatch(/pegasus-state\.mock\.json$/);
+    expect(config.journalFile).toBe(join(repo, 'data', 'journal.mock.json'));
     expect(config.databaseUrl).toBeFalsy();
     expect(options.mockEnv(9200).OKX_WS_PRIVATE_URL).toBe('ws://127.0.0.1:9200/ws/v5/private');
   });
@@ -86,9 +100,9 @@ describe('launcher options', () => {
   it("--campaign is paper trading on the pot's own account, with the campaign enabled, whatever .env says", () => {
     const dotenv = { OKX_API_KEY: 'live-key', OKX_API_SECRET: 'live-secret', OKX_API_PASSPHRASE: 'live-pass', OKX_DEMO: '1', DATABASE_URL: 'postgres://live', CAMPAIGN_ENABLED: '0', CAMPAIGN_STATE_FILE: 'data/other-ledger.json', STATE_FILE: 'data/pegasus-state.json', INSTRUMENTS: 'SOL-USDT-SWAP' };
     const env = options.campaignEnv();
-    expect(env).toMatchObject({ ...options.paperEnv(), STATE_FILE: 'data/pegasus-state.campaign.json', CAMPAIGN_ENABLED: '1', CAMPAIGN_STATE_FILE: 'data/campaign-ledger.json', PAPER_STATE_FILE: 'data/paper-campaign.json', PAPER_BALANCE: '56' });
+    expect(env).toMatchObject({ ...options.paperEnv(9201), STATE_FILE: 'data/pegasus-state.campaign.json', JOURNAL_FILE: 'data/journal.campaign.json', CAMPAIGN_ENABLED: '1', CAMPAIGN_STATE_FILE: 'data/campaign-ledger.json', PAPER_STATE_FILE: 'data/paper-campaign.json', PAPER_BALANCE: '56' });
     const config = loadConfig({ ...dotenv, ...env });
-    expect(config.okx).toMatchObject({ paper: true, demo: false, credentials: { apiKey: 'paper', apiSecret: 'paper', passphrase: 'paper' }, endpoints: { restPrivate: 'http://127.0.0.1:9200' } });
+    expect(config.okx).toMatchObject({ paper: true, demo: false, credentials: { apiKey: 'paper', apiSecret: 'paper', passphrase: 'paper' }, endpoints: { restPrivate: 'http://127.0.0.1:9201' } });
     expect(config.campaign).toMatchObject({ enabled: true, potStart: '56', instruments: [...CAMPAIGN_INSTRUMENTS] });
     expect(config.campaign.stateFile).toBe(join(repo, 'data', 'campaign-ledger.json'));
     // the kill switch and the day baseline of its own: neither the live account's nor the owner's paper account's
@@ -111,6 +125,64 @@ describe('launcher options', () => {
     expect(options.potStartOf({ CAMPAIGN_POT_START: 'lots' })).toBe('56');
     expect(options.potStartOf({ CAMPAIGN_POT_START: '0' })).toBe('56');
     expect(options.campaignEnv(9200, '100').PAPER_BALANCE).toBe('100');
+  });
+});
+
+describe('the campaign stack beside another one', () => {
+  it('has its own ports, page origins, log directory, trade journal and built page; .env cannot point it at the other stack', () => {
+    expect(options.CAMPAIGN_PORTS).toEqual({ api: 8788, paper: 9201, web: 5175 });
+    const dotenv = { API_PORT: '8787', PAPER_PORT: '9200', WEB_ORIGINS: 'http://localhost:5174', LOG_DIR: 'logs', JOURNAL_FILE: 'data/journal.json', PAPER_TRADING: '1' };
+    const campaign = options.parseFlags(['--campaign']);
+    const paper = options.parseFlags(['--paper']);
+    // .env's API_PORT and PAPER_PORT are the other stack's
+    expect(options.stackPorts(campaign, dotenv)).toEqual({ api: 8788, paper: 9201, web: 5175 });
+    expect(options.stackPorts(paper, dotenv)).toEqual({ api: 8787, paper: 9200, web: 5174 });
+    expect(options.stackPorts(paper, { API_PORT: '9000', PAPER_PORT: '9300' })).toEqual({ api: 9000, paper: 9300, web: 5174 });
+    // its own ports can be moved, never to something that is not a port
+    expect(options.stackPorts(campaign, { CAMPAIGN_API_PORT: '18788', CAMPAIGN_PAPER_PORT: '19201', CAMPAIGN_WEB_PORT: '15175' })).toEqual({ api: 18788, paper: 19201, web: 15175 });
+    expect(options.stackPorts(campaign, { CAMPAIGN_API_PORT: 'eighty', CAMPAIGN_WEB_PORT: '70000' })).toEqual({ api: 8788, paper: 9201, web: 5175 });
+
+    const ports = options.stackPorts(campaign, dotenv);
+    const env = options.campaignEnv(ports.paper, '56', ports);
+    expect(env).toMatchObject({ API_PORT: '8788', PAPER_EXCHANGE_URL: 'http://127.0.0.1:9201', WEB_ORIGINS: 'http://localhost:5175,http://127.0.0.1:5175', LOG_DIR: 'logs/campaign', JOURNAL_FILE: 'data/journal.campaign.json' });
+    const c = loadConfig({ ...dotenv, ...env });
+    const p = loadConfig({ ...dotenv, ...options.paperEnv(9200) });
+    expect(c.server).toMatchObject({ port: 8788, webOrigins: ['http://localhost:5175', 'http://127.0.0.1:5175'] });
+    expect(p.server).toMatchObject({ port: 8787, webOrigins: ['http://localhost:5174'] });
+    expect(c.logDir).toBe(join(repo, 'logs', 'campaign'));
+    expect(c.journalFile).toBe(join(repo, 'data', 'journal.campaign.json'));
+    // no file and no port in common with the paper stack
+    const files = (x: typeof c): string[] => [x.stateFile, x.journalFile, x.logDir, x.okx.endpoints.restPrivate ?? ''];
+    for (const f of files(c)) expect(files(p)).not.toContain(f);
+    expect(options.paperExchangeEnv(campaign, env, ports.paper)).toMatchObject({ PAPER_PORT: '9201', PAPER_STATE_FILE: 'data/paper-campaign.json' });
+
+    // the page: built apart, served on its port, its API calls proxied to its own API
+    expect(options.webOutDir(campaign)).toBe('dist-campaign');
+    expect(options.webOutDir(paper)).toBe('dist');
+    expect(options.webEnv(ports)).toEqual({ PEGASUS_WEB_PORT: '5175', PEGASUS_API_PORT: '8788' });
+    expect(options.webServerOptions(5175, 8788)).toEqual({
+      port: 5175,
+      strictPort: true,
+      proxy: { '/api': { target: 'http://127.0.0.1:8788', changeOrigin: true }, '/ws': { target: 'ws://127.0.0.1:8788', ws: true } },
+    });
+    // the origins the page is served under are the ones its API accepts
+    expect(options.webOrigins(5175).split(',')).toEqual(c.server.webOrigins);
+  });
+
+  it("the page's server settings are the web app's own with the stack's ports", async () => {
+    process.env['PEGASUS_WEB_PORT'] = '5175';
+    process.env['PEGASUS_API_PORT'] = '8788';
+    try {
+      const config = ((await import(pathToFileURL(join(scripts, 'vite.stack.config.mjs')).href)) as { default: { plugins?: unknown[]; server: Record<string, unknown>; preview: Record<string, unknown> } }).default;
+      // the web app's plugins are kept
+      expect(config.plugins?.length).toBeGreaterThan(0);
+      for (const server of [config.server, config.preview]) {
+        expect(server).toMatchObject({ port: 5175, strictPort: true, proxy: { '/api': { target: 'http://127.0.0.1:8788' }, '/ws': { target: 'ws://127.0.0.1:8788', ws: true } } });
+      }
+    } finally {
+      delete process.env['PEGASUS_WEB_PORT'];
+      delete process.env['PEGASUS_API_PORT'];
+    }
   });
 });
 
@@ -188,6 +260,24 @@ describe('launcher in a stub tree', () => {
     expect(both.status).toBe(1);
     expect(both.stdout).toContain('--mock 和 --campaign 不能同时使用');
     expect(both.stdout).not.toContain('正在构建');
+  });
+
+  it('--campaign builds its page apart and says its own ports; the others build the usual page', () => {
+    // a "vite" that says how it was called, then fails like a build that went wrong
+    writeFileSync(join(root, 'apps/web/node_modules/vite/bin/vite.js'), "console.log('vite ' + process.argv.slice(2).join(' '));\nprocess.exit(3);\n");
+    writeFileSync(join(root, '.env'), 'PAPER_TRADING=0\n');
+    Object.assign(extraEnv, { CAMPAIGN_API_PORT: String(freePort), CAMPAIGN_PAPER_PORT: String(freePort), CAMPAIGN_WEB_PORT: String(freePort) });
+    try {
+      const campaign = launch('--campaign');
+      expect(campaign.status).toBe(1);
+      expect(campaign.stdout).toContain(`滚仓使用自己的端口（后端 ${freePort}，纸面交易所 ${freePort}，页面 ${freePort}）、日志目录 logs/campaign 和交易日志 data/journal.campaign.json，可以和 pnpm start --paper 同时运行`);
+      expect(campaign.stdout).toContain('vite build --outDir dist-campaign');
+      const plain = launch();
+      expect(plain.stdout).toContain('vite build --outDir dist');
+      expect(plain.stdout).not.toContain('滚仓使用自己的端口');
+    } finally {
+      for (const key of ['CAMPAIGN_API_PORT', 'CAMPAIGN_PAPER_PORT', 'CAMPAIGN_WEB_PORT']) delete extraEnv[key];
+    }
   });
 
   it('paper trading is refused while .env points the market data at the mock exchange', () => {

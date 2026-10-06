@@ -5,18 +5,21 @@
 // Flags: --paper (paper trading: OKX's live prices, a simulated account), --campaign (paper trading on the campaign
 // pot's own paper account, data/paper-campaign.json, with the campaign enabled; start-campaign.bat), --mock (local
 // mock exchange instead of OKX), --dev (Vite dev server with hot reload), --no-open.
+// --campaign has its own ports (API 8788, paper exchange 9201, page 5175), log directory, trade journal and built
+// page (apps/web/dist-campaign), so it runs beside `pnpm start` or `pnpm start --paper`. The page reaches its API
+// through the proxy of scripts/vite.stack.config.mjs, which points it at the API of its own stack.
 import { exec, execFileSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
-import { campaignEnv, mockEnv, paperEnv, paperExchangeEnv, parseFlags, potStartOf } from './launch-options.mjs';
+import { campaignEnv, mockEnv, paperEnv, paperExchangeEnv, parseFlags, potStartOf, stackPorts, webEnv, webOutDir } from './launch-options.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const envFile = join(root, '.env');
-// The dev server's port in apps/web/vite.config.ts; the API's WEB_ORIGINS default names it.
-const WEB_PORT = 5174;
+// The page's server settings with the ports of the stack (its proxy to the API of the same stack), relative to apps/web.
+const STACK_CONFIG = '../../scripts/vite.stack.config.mjs';
 
 const children = new Map();
 let stopping = false;
@@ -123,13 +126,13 @@ async function waitFor(what, ready, timeoutMs) {
 }
 
 /**
- * Serves the built page with `vite preview`, or runs the dev server with --dev. Preview takes its proxy (/api, /ws)
- * and strictPort from the dev server's settings in vite.config.ts, but not its port. Either way Vite's output is
- * piped so the URL it settles on can be read; that also keeps it from clearing the other services' logs.
+ * Serves the built page with `vite preview`, or runs the dev server with --dev, on the stack's page port with /api and
+ * /ws proxied to the stack's API (scripts/vite.stack.config.mjs). Either way Vite's output is piped so the URL it
+ * settles on can be read; that also keeps it from clearing the other services' logs.
  */
-function startWeb(dev) {
-  const args = dev ? [] : ['preview', '--port', String(WEB_PORT), '--strictPort'];
-  const child = start('前端', 'apps/web', ['node_modules/vite/bin/vite.js', ...args], { stdio: ['ignore', 'pipe', 'inherit'] });
+function startWeb(dev, ports, outDir) {
+  const args = dev ? ['--config', STACK_CONFIG, '--port', String(ports.web), '--strictPort'] : ['preview', '--config', STACK_CONFIG, '--port', String(ports.web), '--strictPort', '--outDir', outDir];
+  const child = start('前端', 'apps/web', ['node_modules/vite/bin/vite.js', ...args], { stdio: ['ignore', 'pipe', 'inherit'], env: webEnv(ports) });
   let seen = '';
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (text) => {
@@ -156,11 +159,13 @@ async function main() {
   const base = { ...(existsSync(envFile) ? parseEnv(readFileSync(envFile, 'utf8')) : {}), ...process.env };
   // Paper trading is chosen on the command line or, for double-clicking start.bat, by PAPER_TRADING=1 in .env.
   const paper = flags.paper || (!flags.mock && base.PAPER_TRADING === '1');
-  const paperPort = paper ? Number(base.PAPER_PORT ?? 9200) : null;
+  // --campaign has ports of its own (CAMPAIGN_*_PORT move them); the others take API_PORT and PAPER_PORT from .env.
+  const ports = stackPorts(flags, base);
+  const paperPort = paper ? ports.paper : null;
   // --mock, --paper and --campaign only change what the children see; .env is read here, never written.
-  const overrides = flags.mock ? mockEnv(Number(process.env.MOCK_OKX_PORT ?? 9100)) : flags.campaign ? campaignEnv(paperPort, potStartOf(base)) : paper ? paperEnv(paperPort) : {};
+  const overrides = flags.mock ? mockEnv(Number(process.env.MOCK_OKX_PORT ?? 9100)) : flags.campaign ? campaignEnv(ports.paper, potStartOf(base), ports) : paper ? paperEnv(paperPort) : {};
   const env = { ...base, ...overrides };
-  const apiPort = Number(env.API_PORT ?? 8787);
+  const apiPort = ports.api;
   const mockPort = localPort(env.OKX_REST_URL);
   if (paper && mockPort !== null) throw new Error('纸面交易需要 OKX 的真实行情，但 .env 里的 OKX_REST_URL 指向了本机的模拟交易所；请删掉 .env 里的四个 OKX_*_URL 再启动');
   const version = gitVersion();
@@ -170,6 +175,7 @@ async function main() {
       ? '，纸面交易模式（OKX 实盘行情，虚拟账户，不会向 OKX 下单）'
       : '';
   say(`版本：${version ?? '未知（不是 git 仓库或没有安装 git）'}${flags.mock ? '，模拟交易所模式（--mock）' : ''}${mode}${flags.dev ? '，开发模式（--dev）' : ''}`);
+  if (flags.campaign) say(`滚仓使用自己的端口（后端 ${ports.api}，纸面交易所 ${ports.paper}，页面 ${ports.web}）、日志目录 logs/campaign 和交易日志 data/journal.campaign.json，可以和 pnpm start --paper 同时运行`);
 
   const busy = [];
   if (mockPort !== null && (await portOpen(mockPort))) busy.push(mockPort);
@@ -180,7 +186,7 @@ async function main() {
   // Built before anything is started: a failed build leaves nothing running, and the page and the API come from the same files.
   if (!flags.dev) {
     say('正在构建前端页面');
-    const code = await runToEnd('前端构建', 'apps/web', ['node_modules/vite/bin/vite.js', 'build']);
+    const code = await runToEnd('前端构建', 'apps/web', ['node_modules/vite/bin/vite.js', 'build', '--outDir', webOutDir(flags)]);
     if (code !== 0) throw new Error(`前端页面构建失败（退出码 ${code}），Pegasus 没有启动。具体错误见上面的输出`);
     if (stopping) return;
   }
@@ -207,7 +213,7 @@ async function main() {
   if (stopping) return;
 
   say('正在启动前端');
-  startWeb(flags.dev);
+  startWeb(flags.dev, ports, webOutDir(flags));
   await waitFor('前端', () => webUrl !== null, 60_000);
   if (stopping) return;
 

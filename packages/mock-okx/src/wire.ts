@@ -264,7 +264,7 @@ export interface OkxMarginAdjustment {
 
 export type OkxTriggerPxType = 'last' | 'index' | 'mark';
 
-/** A stop-loss attached to an order, as echoed in the order's `attachAlgoOrds` (take-profit is not simulated). */
+/** A take-profit / stop-loss attached to an order, as echoed in the order's `attachAlgoOrds`: one entry per object sent. */
 export interface OkxAttachAlgoOrd {
   attachAlgoId: string;
   attachAlgoClOrdId: string;
@@ -273,40 +273,68 @@ export interface OkxAttachAlgoOrd {
   tpTriggerPxType: string;
   slTriggerPx: string;
   slOrdPx: string;
-  slTriggerPxType: OkxTriggerPxType;
+  /** '' for a take-profit only entry */
+  slTriggerPxType: OkxTriggerPxType | '';
+  /** A leg of split take-profits: its contracts; '' otherwise */
   sz: string;
+  /** '1' on the cost-price stop of split take-profits */
   amendPxOnTriggerType: string;
   failCode: string;
   failReason: string;
 }
 
-/** An active stop-loss generated when an order that carried `attachAlgoOrds` was completely filled (mock state, not an OKX wire shape). */
+/** The algo order types the simulator keeps: one-way TP/SL, one-cancels-the-other TP/SL, trailing stop. */
+export type OkxAlgoOrdType = 'conditional' | 'oco' | 'move_order_stop';
+
+/**
+ * An active algo order (mock state, not an OKX wire shape): a stop-loss, a take-profit, both (oco) or a trailing stop,
+ * generated from an order's `attachAlgoOrds` once that order was completely filled, or placed on its own. A plain
+ * stop-loss has exactly the fields of the first version; the others are present only where they apply.
+ */
 export interface MockStop {
   algoId: string;
   algoClOrdId: string;
-  /** The order it was attached to */
+  /** The order it was attached to; '' for one placed on its own */
   ordId: string;
   instId: string;
   tdMode: OkxMgnMode;
   posSide: OkxPosSide;
   /** Side of the closing order it sends when triggered */
   side: OkxSide;
-  /** Contracts it closes: the filled size of the parent order */
+  /** Contracts it closes */
   sz: string;
+  /** '' without a stop-loss */
   slTriggerPx: string;
-  slTriggerPxType: OkxTriggerPxType;
+  /** '' without a stop-loss */
+  slTriggerPxType: OkxTriggerPxType | '';
+  /** Absent for a one-way (conditional) order */
+  ordType?: 'oco' | 'move_order_stop';
+  tpTriggerPx?: string;
+  tpTriggerPxType?: OkxTriggerPxType;
+  /** The cost-price stop of split take-profits, until it has moved */
+  amendPxOnTriggerType?: true;
+  /** Trailing stop */
+  callbackRatio?: string;
+  callbackSpread?: string;
+  activePx?: string;
+  /** Trailing stop: the price it triggers at now; '' until it is active */
+  moveTriggerPx?: string;
+  /** Present (false) when the order it sends is not reduce-only */
+  reduceOnly?: false;
+  /** Present (false) when it stays after its position is fully closed */
+  cxlOnClosePos?: false;
 }
 
 /**
- * A stop-loss as OKX lists it among the algo orders (GET /api/v5/trade/orders-algo-pending, `ordType` conditional).
- * Take-profit and OCO orders are not simulated.
+ * An algo order as OKX lists it (GET /api/v5/trade/orders-algo-pending): a TP/SL (`conditional`, `oco`) or a trailing
+ * stop (`move_order_stop`).
  */
 export interface OkxAlgoOrder {
   instType: 'SWAP';
   instId: string;
   algoId: string;
   algoClOrdId: string;
-  ordType: 'conditional';
+  ordType: OkxAlgoOrdType;
   side: OkxSide;
   posSide: OkxPosSide;
   tdMode: OkxMgnMode;
@@ -318,8 +346,14 @@ export interface OkxAlgoOrder {
   tpTriggerPxType: string;
   tpOrdPx: string;
   slTriggerPx: string;
-  slTriggerPxType: OkxTriggerPxType;
+  slTriggerPxType: OkxTriggerPxType | '';
   slOrdPx: string;
+  callbackRatio: string;
+  callbackSpread: string;
+  activePx: string;
+  moveTriggerPx: string;
+  /** '1' on the cost-price stop of split take-profits */
+  amendPxOnTriggerType: string;
   /** Orders the algo order has sent: empty until it triggers */
   ordIdList: string[];
   actualSz: string;

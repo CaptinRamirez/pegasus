@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query';
 import { CAMPAIGN_QUERY, useCampaignReplay } from '../hooks/useCampaign';
 import { useT } from '../i18n';
 import { replayResult, replayState } from '../lib/campaign';
+import { CAMPAIGN_WEB_PORT, stackUrl } from '../lib/stacks';
 import { useStore } from '../store/store';
 import { CampaignChart } from './campaign/CampaignChart';
 import { AcceptanceCard, ErrorsSection, PotCard, StatusCard, StepsCard } from './campaign/CampaignSummary';
@@ -31,7 +32,24 @@ export function CampaignPanel() {
     );
   }
 
-  const started = view.status !== 'disabled' && view.pot !== null;
+  // This stack does not run the campaign: it runs on a stack of its own, whose page is linked.
+  if (view.status === 'disabled') {
+    const url = stackUrl(CAMPAIGN_WEB_PORT);
+    return (
+      <div className="campaign campaign-disabled">
+        <div className="campaign-card">
+          <h4>{t.campaign.disabledTitle}</h4>
+          <div className="campaign-note">{t.campaign.disabledNote}</div>
+          <div className="campaign-note campaign-reason dim">{view.reason === null ? null : ((t.campaign.reasons as Readonly<Record<string, string>>)[view.reason.code] ?? view.reason.message)}</div>
+          <a className="btn btn-primary campaign-link" href={url} target="_blank" rel="noopener noreferrer">
+            {t.campaign.openCampaignPage} · {url}
+          </a>
+        </div>
+      </div>
+    );
+  }
+
+  const started = view.pot !== null;
   const replay = replayState(started, replayQuery.data, replayQuery.error);
   return (
     <div className="campaign">

@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { D, Decimal, ZERO, contractsToCoin, notionalQuote, positionDirection, utcDayStart, type CancelSweepState, type Instrument, type Order, type OrdType, type PosSide, type Position, type PositionOverLimit, type RiskCheckResult, type RiskConfig, type RiskState, type Side } from '@pegasus/shared';
+import { CALLBACK_RATIO_MAX, CALLBACK_RATIO_MIN, D, Decimal, ZERO, contractsToCoin, notionalQuote, positionDirection, utcDayStart, type CancelSweepState, type Instrument, type Order, type OrdType, type PosSide, type Position, type PositionOverLimit, type RiskCheckResult, type RiskConfig, type RiskState, type Side } from '@pegasus/shared';
 import type { Store } from '../db/store.js';
 import { AppError } from '../errors.js';
 import type { Logger } from '../logger.js';
@@ -57,6 +57,24 @@ export interface CampaignRiskContext {
  * real one, the mark against the fill. A fraction of the limit (10 allows 10.1).
  */
 export const CAMPAIGN_LEVERAGE_TOLERANCE = '0.01';
+
+/** What the exits of a position are checked against (RiskEngine.checkExits). */
+export interface ExitCheckInput {
+  /** The direction of the position the exits close: the one an opening order opens, or the open position's */
+  direction: 'long' | 'short';
+  /** The entry: the opening order's reference price (limit price or estimated fill), or the open position's average price */
+  entryPx: string;
+  /** The live mark price */
+  markPx: string;
+  /** The last price, which a trailing stop's activation is compared with; the mark when not known */
+  lastPx?: string;
+  /** Take-profit triggers, rounded to the tick */
+  takeProfits?: string[];
+  /** A trailing stop's callback ratio */
+  callbackRatio?: string;
+  /** A trailing stop's activation price */
+  activePx?: string;
+}
 
 /** An accepted opening order, held against the limits until the account mirror has caught up with it. */
 export interface ExposureReservation {
@@ -369,6 +387,51 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
       });
     }
     return null;
+  }
+
+  /**
+   * The exit rules: the take-profits, trailing stops and cost-price stop of an opening order or an open position. An
+   * exit can only reduce, so the kill switch never refuses one, as it never refuses a stop. Returns the first violated
+   * rule:
+   * - TP_WRONG_SIDE: a take-profit trigger not on the profit side of both the entry and the live mark (above both for
+   *   a long, below both for a short): one between them would take a loss, one beyond the mark would fire at once
+   *   (`details`: leg, triggerPx, entryPx, markPx).
+   * - CALLBACK_RATIO: a callback ratio outside CALLBACK_RATIO_MIN..CALLBACK_RATIO_MAX (0.1% to 20%, @pegasus/shared).
+   * - ACTIVE_PX_WRONG_SIDE: an activation price not on the profit side of the mark and the last price (above both for
+   *   a long; OKX refuses a sell trailing stop whose activation price is not above the last price: 51258, and the
+   *   mirror for a buy: 51259).
+   */
+  checkExits(input: ExitCheckInput): RiskCheckResult {
+    const long = input.direction === 'long';
+    const beyond = (px: string, ref: string): boolean => (long ? D(px).gt(ref) : D(px).lt(ref));
+    const refs = [input.entryPx, input.markPx];
+    for (const [i, triggerPx] of (input.takeProfits ?? []).entries()) {
+      if (!refs.every((ref) => beyond(triggerPx, ref))) {
+        return fail('TP_WRONG_SIDE', `take-profit ${i + 1} at ${triggerPx} must be ${long ? 'above' : 'below'} both the entry ${input.entryPx} and the mark price ${input.markPx} of a ${input.direction} position`, {
+          leg: i + 1,
+          triggerPx,
+          entryPx: input.entryPx,
+          markPx: input.markPx,
+        });
+      }
+    }
+    if (input.callbackRatio !== undefined) {
+      const r = D(input.callbackRatio);
+      if (r.lt(CALLBACK_RATIO_MIN) || r.gt(CALLBACK_RATIO_MAX)) {
+        return fail('CALLBACK_RATIO', `the callback ratio ${input.callbackRatio} is outside ${CALLBACK_RATIO_MIN} to ${CALLBACK_RATIO_MAX} (0.1% to 20%)`, { callbackRatio: input.callbackRatio, min: CALLBACK_RATIO_MIN, max: CALLBACK_RATIO_MAX });
+      }
+    }
+    if (input.activePx !== undefined) {
+      const lastPx = input.lastPx ?? input.markPx;
+      if (![input.markPx, lastPx].every((ref) => beyond(input.activePx as string, ref))) {
+        return fail('ACTIVE_PX_WRONG_SIDE', `the activation price ${input.activePx} must be ${long ? 'above' : 'below'} the mark ${input.markPx} and the last price ${lastPx} of a ${input.direction} position`, {
+          activePx: input.activePx,
+          markPx: input.markPx,
+          lastPx,
+        });
+      }
+    }
+    return pass();
   }
 
   /**

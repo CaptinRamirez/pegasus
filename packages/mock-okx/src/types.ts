@@ -36,7 +36,7 @@ export interface MockState {
   positions: OkxPosition[];
   balance: OkxBalance;
   fills: OkxFill[];
-  /** Active attached stop-losses (algo orders: they are not in `orders`). */
+  /** Active algo orders: stop-losses, take-profits, oco orders and trailing stops, attached or placed on their own (they are not in `orders`). */
   stops: MockStop[];
 }
 
@@ -50,8 +50,8 @@ export interface MockOkxHandle {
   /** Jumps the simulated mid price (and runs matching for resting orders). The book and the last price follow; so does the mark unless it is pinned. */
   setPrice(instId: string, px: string): void;
   /**
-   * Pins the mark price at `px`, apart from the book and the last price, and checks the attached stops against
-   * it; it stays there through later ticks and setPrice calls until `null` lets it follow the mid price again.
+   * Pins the mark price at `px`, apart from the book and the last price, and checks the algo orders against it; it
+   * stays there through later ticks and setPrice calls until `null` lets it follow the mid price again.
    */
   setMarkPrice(instId: string, px: string | null): void;
   getState(): MockState;

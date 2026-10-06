@@ -3,7 +3,7 @@ import { useMutation } from '@tanstack/react-query';
 import { D, algoOrderClosesPosition, type AlgoOrder } from '@pegasus/shared';
 import { api } from '../lib/api';
 import { errorText, labelOf, useLang, useT, type Messages } from '../i18n';
-import { fmtContracts, fmtDateTime, fmtPx, fmtTime } from '../lib/format';
+import { fmtContracts, fmtDateTime, fmtPct, fmtPx, fmtTime } from '../lib/format';
 import { accountUnknown, stopsAsOf, type AccountUnknown } from '../store/alerts';
 import { getTradingBlock, useStore } from '../store/store';
 
@@ -135,7 +135,13 @@ export function StopsTable() {
                 )}
               </td>
               <td>
-                {a.slTriggerPx === '' ? '–' : fmtPx(a.slTriggerPx, inst)}
+                {a.ordType === 'move_order_stop' ? (
+                  <span className="stop-kind">{t.exits.callbackShort(fmtPct(a.callbackRatio ?? '', 2), a.moveTriggerPx === undefined || a.moveTriggerPx === '' ? '' : fmtPx(a.moveTriggerPx, inst))}</span>
+                ) : a.slTriggerPx === '' ? (
+                  '–'
+                ) : (
+                  fmtPx(a.slTriggerPx, inst)
+                )}
                 {a.slTriggerPx !== '' && <span className="dim"> {labelOf(t.enums.triggerPx, a.slTriggerPxType)}</span>}
               </td>
               <td>{a.slTriggerPx === '' ? '–' : a.slOrdPx === '-1' ? t.common.market : fmtPx(a.slOrdPx, inst)}</td>

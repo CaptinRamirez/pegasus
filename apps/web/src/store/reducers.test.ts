@@ -6,6 +6,8 @@ import type {
   ConnectionStatus,
   HelloPayload,
   Instrument,
+  JournalTradeSummary,
+  JournalUpdate,
   Order,
   OrderBook,
   Position,
@@ -16,8 +18,8 @@ import type {
 } from '@pegasus/shared';
 import { blockedView, disabledView, runningView } from '../test/campaign-fixtures';
 import { STOPS_STALE_MS, accountAsOf, accountUnknown, activeAlerts, isStreamStale, killSwitchSweepNotice, overLimitNotice, stopsAsOf, trimAdvice, trimShares } from './alerts';
-import { LOST_STOP_RECENT_MS, applyAlgoOrders, applyCampaign, applyOrderHistorySeed, applyServerMessage, applyWsStatus, pushToast, stampMessage } from './reducers';
-import { ACCOUNT_NOT_LOADED_BLOCK, READ_ONLY_KEY_BLOCK, getTradingBlock } from './store';
+import { LOST_STOP_RECENT_MS, applyAlgoOrders, applyCampaign, applyJournal, applyOrderHistorySeed, applyServerMessage, applyWsStatus, pushToast, stampMessage } from './reducers';
+import { ACCOUNT_NOT_LOADED_BLOCK, READ_ONLY_KEY_BLOCK, getTradingBlock, useStore } from './store';
 import { LIMITS, initialState, type TerminalState } from './types';
 
 const inst = (instId: string, baseCcy: string): Instrument => ({
@@ -472,6 +474,85 @@ describe('the campaign view', () => {
     s = { ...s, ...applyServerMessage(s, { type: 'hello', data: hello }) };
     expect(s.campaign).toBe(runningView);
     expect(initialState('tok').campaign).toBeNull();
+  });
+});
+
+describe('the journal message', () => {
+  const trade = (id: string, updatedAt: number, size: string): JournalTradeSummary => ({
+    id,
+    seq: Number(id.split('-')[0]),
+    instId: 'BTC-USDT-SWAP',
+    mgnMode: 'isolated',
+    posSide: 'net',
+    direction: 'long',
+    source: 'manual',
+    status: size === '0' ? 'closed' : 'open',
+    openedAt: 1_000,
+    closedAt: size === '0' ? 2_000 : null,
+    durationMs: size === '0' ? 1_000 : null,
+    updatedAt,
+    ccy: 'USDT',
+    entry: { avgPx: '60000', contracts: '2', coin: '0.02', notional: '1200', maxContracts: '2', leverage: '5', mgnMode: 'isolated', margin: '240' },
+    size,
+    exitPx: null,
+    plan: null,
+    initialStop: null,
+    initialRisk: null,
+    fees: '0.6',
+    funding: null,
+    realisedPnl: '0',
+    netPnl: '-0.6',
+    rMultiple: null,
+    exits: [],
+    closeReason: null,
+    adopted: false,
+  });
+
+  it('merges the trades it carries by id, keeps the newest version of each, and counts as a message from the server', () => {
+    let s = stateAfterHello();
+    expect(s.journal).toBeNull();
+    const first: JournalUpdate = { status: 'ready', reason: null, trades: [trade('1-BTC-USDT-SWAP', 10, '2')], serverTime: 100 };
+    s = { ...s, ...applyServerMessage(s, { type: 'journal', data: first }) };
+    expect(s.journal?.status).toBe('ready');
+    expect(Object.keys(s.journal?.trades ?? {})).toEqual(['1-BTC-USDT-SWAP']);
+    expect(stampMessage(s, { type: 'journal', data: first }, 5)).toEqual({ lastMessageAt: 5 });
+    // a second trade joins the first; a newer version of the first replaces it
+    s = { ...s, ...applyJournal(s, { status: 'ready', reason: null, trades: [trade('2-BTC-USDT-SWAP', 20, '1'), trade('1-BTC-USDT-SWAP', 30, '0')], serverTime: 200 }) };
+    expect(s.journal?.trades['1-BTC-USDT-SWAP']?.status).toBe('closed');
+    expect(s.journal?.trades['2-BTC-USDT-SWAP']?.size).toBe('1');
+    // an older version of a trade does not replace a newer one
+    s = { ...s, ...applyJournal(s, { status: 'ready', reason: null, trades: [trade('1-BTC-USDT-SWAP', 15, '2')], serverTime: 300 }) };
+    expect(s.journal?.trades['1-BTC-USDT-SWAP']?.size).toBe('0');
+  });
+
+  it('an older message changes nothing, and only the most recently changed trades are kept', () => {
+    const s: TerminalState = { ...initialState('tok'), journal: { status: 'ready', reason: null, trades: {}, serverTime: 500 } };
+    expect(applyJournal(s, { status: 'blocked', reason: { code: 'JOURNAL_UNREADABLE', message: 'x' }, trades: [], serverTime: 400 })).toEqual({});
+    const many = Array.from({ length: LIMITS.journalTrades + 3 }, (_, i) => trade(`${i + 1}-BTC-USDT-SWAP`, i + 1, '1'));
+    const next = applyJournal(s, { status: 'ready', reason: null, trades: many, serverTime: 600 });
+    const ids = Object.keys(next.journal?.trades ?? {});
+    expect(ids).toHaveLength(LIMITS.journalTrades);
+    expect(ids).not.toContain('1-BTC-USDT-SWAP');
+    expect(ids).toContain(`${LIMITS.journalTrades + 3}-BTC-USDT-SWAP`);
+  });
+});
+
+describe('the toast of an order and the ticket put from another tab', () => {
+  it('a toast can carry a link to the journal', () => {
+    const s = initialState('tok');
+    const link = { kind: 'journal' as const, instId: 'BTC-USDT-SWAP', mgnMode: 'isolated' as const, posSide: 'net' as const, ordId: 'o1' };
+    const next = pushToast(s, 'success', { en: 'Signal followed', zh: '已按信号下单' }, false, link);
+    expect(next.toasts?.[0]).toMatchObject({ kind: 'success', message: 'Signal followed', zh: '已按信号下单', link });
+    expect(pushToast(s, 'info', 'plain').toasts?.[0]).not.toHaveProperty('link');
+  });
+
+  it('focusTicket selects the coin and hands the side to the ticket; asking again is a new request', () => {
+    useStore.setState({ ...initialState('tok'), ticketPrice: { px: '1', nonce: 1 } });
+    useStore.getState().focusTicket('ETH-USDT-SWAP', 'buy');
+    expect(useStore.getState()).toMatchObject({ selectedInstId: 'ETH-USDT-SWAP', ticketPrice: null, ticketPrefill: null, ticketFocus: { instId: 'ETH-USDT-SWAP', side: 'buy', nonce: 1 } });
+    useStore.getState().focusTicket('ETH-USDT-SWAP', 'buy');
+    expect(useStore.getState().ticketFocus?.nonce).toBe(2);
+    useStore.setState({ ...initialState(null) });
   });
 });
 

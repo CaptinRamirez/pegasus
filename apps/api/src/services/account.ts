@@ -28,6 +28,16 @@ const LEVERAGE_TTL_MS = 30_000;
 const VANISHED_ORDER_AGE_MS = 120_000;
 /** The two TP/SL algo order types; OKX lists them together in one call. */
 const ALGO_ORD_TYPES = 'conditional,oco';
+/** Trailing stops: OKX lists them only on their own. */
+const TRAILING_ORD_TYPE = 'move_order_stop';
+
+export interface AccountServiceOptions {
+  /**
+   * Also read the trailing stops (OKX `move_order_stop`) into the algo order list: one more call per read. Only where
+   * the exits of this stage are enabled (config.exits.enabled: paper trading and the local mock).
+   */
+  readTrailingStops?: boolean;
+}
 const ALGO_PAGE_SIZE = 100;
 const ALGO_MAX_PAGES = 5;
 /**
@@ -90,6 +100,7 @@ export class AccountService extends EventEmitter<AccountEvents> {
     private readonly clients: OkxClients,
     private readonly store: Store,
     private readonly log: Logger,
+    private readonly opts: AccountServiceOptions = {},
   ) {
     super();
   }
@@ -446,25 +457,32 @@ export class AccountService extends EventEmitter<AccountEvents> {
   }
 
   private async pullAlgoOrders(): Promise<AlgoOrderList> {
+    const rows = await this.readAlgoPages(ALGO_ORD_TYPES);
+    if (this.opts.readTrailingStops) rows.push(...(await this.readAlgoPages(TRAILING_ORD_TYPE)));
+    const list: AlgoOrderList = { orders: rows.map(mapAlgoOrder).sort((a, b) => b.cTime - a.cTime), ts: Date.now() };
+    this.algoOrders = list;
+    this.emit('algoOrders', list);
+    return list;
+  }
+
+  /** The pending algo orders of one ordType value (a type, or `conditional,oco`), up to ALGO_MAX_PAGES pages. */
+  private async readAlgoPages(ordType: string): Promise<OkxAlgoOrder[]> {
     const rows: OkxAlgoOrder[] = [];
     let after: string | undefined;
     for (let page = 1; ; page++) {
-      const params: { ordType: string; instType: 'SWAP'; limit: number; after?: string } = { ordType: ALGO_ORD_TYPES, instType: 'SWAP', limit: ALGO_PAGE_SIZE };
+      const params: { ordType: string; instType: 'SWAP'; limit: number; after?: string } = { ordType, instType: 'SWAP', limit: ALGO_PAGE_SIZE };
       if (after !== undefined) params.after = after;
       const batch = await this.clients.rest.getAlgoOrdersPending(params);
       rows.push(...batch);
       const last = batch[batch.length - 1];
       if (batch.length < ALGO_PAGE_SIZE || !last) break;
       if (page === ALGO_MAX_PAGES) {
-        this.log.warn({ read: rows.length }, 'more algo orders than are read; the stops shown are incomplete');
+        this.log.warn({ read: rows.length, ordType }, 'more algo orders than are read; the stops shown are incomplete');
         break;
       }
       after = last.algoId;
     }
-    const list: AlgoOrderList = { orders: rows.map(mapAlgoOrder).sort((a, b) => b.cTime - a.cTime), ts: Date.now() };
-    this.algoOrders = list;
-    this.emit('algoOrders', list);
-    return list;
+    return rows;
   }
 
   private applyBalance(b: OkxBalance): void {

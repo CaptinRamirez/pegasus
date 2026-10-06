@@ -10,15 +10,20 @@ import type {
   FundingRate,
   InstId,
   Instrument,
+  JournalStatus,
+  JournalStatusReason,
+  JournalTradeSummary,
   MarkPrice,
   OrdType,
   Order,
   OrderBook,
+  PosSide,
   Position,
   RiskConfig,
   RiskState,
   Side,
   SizeUnit,
+  TdMode,
   Ticker,
   Trade,
 } from '@pegasus/shared';
@@ -37,6 +42,19 @@ export interface MarketData {
 
 export type ToastKind = 'info' | 'success' | 'error';
 
+/**
+ * Where a toast leads: the trade journal's record of the position an order went into. The journal hears of the
+ * trade after the order, so the trade is looked up when the link is followed: the trade of that instrument, margin
+ * mode and leg.
+ */
+export interface ToastLink {
+  kind: 'journal';
+  instId: InstId;
+  mgnMode: TdMode;
+  posSide: PosSide;
+  ordId: string;
+}
+
 export interface Toast {
   id: number;
   kind: ToastKind;
@@ -47,6 +65,8 @@ export interface Toast {
   ts: number;
   /** Never dropped to make room for newer toasts (the lost-stop notice) */
   sticky?: true;
+  /** A link shown under the text */
+  link?: ToastLink;
 }
 
 export interface TicketPrice {
@@ -70,6 +90,14 @@ export interface TicketPrefill {
 }
 
 export type TicketPrefillInput = Omit<TicketPrefill, 'nonce'>;
+
+/** A coin and a side put into the order ticket, which takes the focus; nothing else is filled (manual open from the signals tab). */
+export interface TicketFocus {
+  instId: InstId;
+  side: Side;
+  /** Changes on every request so the same focus can be asked for again */
+  nonce: number;
+}
 
 export interface TerminalState {
   token: string | null;
@@ -115,8 +143,23 @@ export interface TerminalState {
   lostStopNotified: string[];
   ticketPrice: TicketPrice | null;
   ticketPrefill: TicketPrefill | null;
+  ticketFocus: TicketFocus | null;
   /** The campaign's state, from the `campaign` message or GET /api/campaign, the newer of the two; null until either came */
   campaign: CampaignView | null;
+  /** The trade journal as the `journal` messages left it; null until the first one came */
+  journal: JournalSlice | null;
+}
+
+/**
+ * What the `journal` messages said: the journal's status and the trades they carried, by id, each the newest version
+ * seen (at most LIMITS.journalTrades, the most recently changed). GET /api/journal gives the rest.
+ */
+export interface JournalSlice {
+  status: JournalStatus;
+  reason: JournalStatusReason | null;
+  trades: Record<string, JournalTradeSummary>;
+  /** Server time of the last message */
+  serverTime: number;
 }
 
 export const LIMITS = {
@@ -126,6 +169,7 @@ export const LIMITS = {
   candles: 600,
   toasts: 6,
   lostStopNotified: 200,
+  journalTrades: 200,
 } as const;
 
 export const DEFAULT_BAR: CandleBar = '5m';
@@ -166,6 +210,8 @@ export function initialState(token: string | null): TerminalState {
     lostStopNotified: [],
     ticketPrice: null,
     ticketPrefill: null,
+    ticketFocus: null,
     campaign: null,
+    journal: null,
   };
 }

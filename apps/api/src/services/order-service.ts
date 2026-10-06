@@ -1,18 +1,23 @@
 import { randomBytes } from 'node:crypto';
-import { OkxApiError, OkxTransportError, OkxWsError, type OkxCancelOrderParams, type OkxLeverageInfo, type OkxMarginBalance, type OkxOrder, type OkxOrderAck, type OkxPlaceAlgoParams, type OkxPlaceOrderParams, type OkxSetLeverageParams } from '@pegasus/okx';
+import { OkxApiError, OkxTransportError, OkxWsError, type OkxAttachAlgoOrd, type OkxCancelOrderParams, type OkxLeverageInfo, type OkxMarginBalance, type OkxOrder, type OkxOrderAck, type OkxPlaceAlgoParams, type OkxPlaceOrderParams, type OkxSetLeverageParams } from '@pegasus/okx';
 import {
+  algoOrderClosesPosition,
   ceilToStep,
   contractsToCoin,
   D,
   Decimal,
   floorToStep,
+  isMultipleOf,
   normalizePrice,
   notionalQuote,
   positionDirection,
+  SIGNAL_CL_ORD_PREFIX,
+  sizeTakeProfitLegs,
   sizeToContracts,
   SizingError,
   stopCoverage,
   toPlainString,
+  ZERO,
   type AlgoOrder,
   type AlgoOrderList,
   type AmendAlgoOrderRequest,
@@ -24,24 +29,33 @@ import {
   type OrderPreview,
   type PlaceOrderRequest,
   type PlaceStopRequest,
+  type PlaceTakeProfitsRequest,
+  type PlaceTakeProfitsResult,
+  type PlaceTrailingStopRequest,
+  type PlaceTrailingStopResult,
   type Position,
   type PosSide,
+  type TakeProfitLegPreview,
   type TdMode,
 } from '@pegasus/shared';
 import type { Store } from '../db/store.js';
-import { AppError, ExchangeUnreachableError, RiskRejectedError } from '../errors.js';
+import { AppError, ExchangeUnreachableError, RiskRejectedError, UnknownInstrumentError } from '../errors.js';
 import type { Logger } from '../logger.js';
 import type { OkxClients } from '../okx/clients.js';
 import { mapOrder } from '../okx/mappers.js';
 import type { AccountService } from './account.js';
 import type { MarketDataService } from './market-data.js';
-import { isClosingOrder, type CampaignRiskContext, type ExposureReservation, type RiskCheckInput, type RiskEngine } from './risk-engine.js';
+import { isClosingOrder, type CampaignRiskContext, type ExitCheckInput, type ExposureReservation, type RiskCheckInput, type RiskEngine } from './risk-engine.js';
 
 const CL_ORD_PREFIX = 'pg';
 /** Longest an accepted order is held against the limits while the account mirror has not shown its effect. */
 const RESERVATION_TTL_MS = 10_000;
 /** Prefix of the client id of an attached stop-loss; the rest is the tail of the order's clOrdId. */
 const ATTACH_SL_PREFIX = 'sl';
+/** Prefix of the client id of a take-profit leg: `tp` + the leg's number (1 to 5) + the tail of an id. */
+const TP_PREFIX = 'tp';
+/** Prefix of the client id of a trailing stop (OKX move_order_stop) placed by Pegasus. */
+const TRAIL_PREFIX = 'tr';
 /** How many submitted client order ids are remembered for the retry lookup. */
 const MAX_SENT_IDS = 200;
 
@@ -71,6 +85,33 @@ export function attachAlgoClOrdIdFor(clOrdId: string): string {
   return `${ATTACH_SL_PREFIX}${clOrdId.slice(-(32 - ATTACH_SL_PREFIX.length))}`;
 }
 
+/** Client id of take-profit leg `leg` (1-based) of an order or a request, inside OKX's limit of 32 alphanumeric characters. */
+export function takeProfitAlgoClOrdIdFor(clOrdId: string, leg: number): string {
+  const prefix = `${TP_PREFIX}${leg}`;
+  return `${prefix}${clOrdId.slice(-(32 - prefix.length))}`;
+}
+
+/** Client id of a trailing stop placed by Pegasus. */
+export function trailingAlgoClOrdIdFor(clOrdId: string): string {
+  return `${TRAIL_PREFIX}${clOrdId.slice(-(32 - TRAIL_PREFIX.length))}`;
+}
+
+/**
+ * Whether an algo order is one Pegasus placed, by its client id: a stop-loss (`sl`: attached to an entry or placed for
+ * a position; `ch`: kept by channel trailing), a take-profit leg (`tp1`…`tp5`) or a trailing stop (`tr`).
+ */
+export function isPegasusExitAlgo(a: Pick<AlgoOrder, 'algoClOrdId'>): boolean {
+  return /^(sl|ch|tr|tp[1-9])[A-Za-z0-9]/.test(a.algoClOrdId);
+}
+
+/** The take-profits, the cost-price stop and the trailing stops of this stage are refused outside paper trading and the local mock. */
+export class ExitsUnavailableError extends AppError {
+  constructor() {
+    super('EXITS_UNAVAILABLE', 'take-profits, the cost-price stop and trailing stops are offered in paper trading and against the local mock only; nothing was sent', 403);
+    this.name = 'ExitsUnavailableError';
+  }
+}
+
 /** Translate OKX order errors into API errors with the exchange code attached. */
 export function exchangeError(err: unknown): AppError {
   if (err instanceof OkxApiError) {
@@ -86,7 +127,16 @@ export function exchangeError(err: unknown): AppError {
  * position-mode handling, risk checks and submission (WebSocket when the
  * private socket is ready, REST otherwise).
  */
+/** What place() reports once an order is at the exchange: sent now, or found there from an earlier attempt. */
+export interface OrderPlacedEvent {
+  request: PlaceOrderRequest;
+  order: Order;
+  /** True when a retry found the order an earlier attempt had left at the exchange; nothing was sent now */
+  earlier: boolean;
+}
+
 export class OrderService {
+  private readonly placedListeners: Array<(e: OrderPlacedEvent) => void> = [];
   /**
    * Opening orders that passed the risk check, by clOrdId. The orders and positions pushes of a fill arrive
    * after the order is accepted, in either order; until the positions show it the next order is checked
@@ -107,15 +157,35 @@ export class OrderService {
     private readonly risk: RiskEngine,
     private readonly store: Store,
     private readonly log: Logger,
-    private readonly opts: { defaultTdMode: TdMode; wsTrading: boolean },
+    /** `exits`: take-profits, the cost-price stop and trailing stops are offered (config.exits.enabled: paper trading and the local mock); refused with EXITS_UNAVAILABLE otherwise */
+    private readonly opts: { defaultTdMode: TdMode; wsTrading: boolean; exits?: boolean },
   ) {
     this.account.on('order', (order) => this.onOrderUpdate(order));
     this.account.on('positions', (positions) => this.onPositions(positions));
   }
 
+  /** Whether the exits of this stage are offered here (paper trading, the local mock). */
+  get exitsEnabled(): boolean {
+    return this.opts.exits === true;
+  }
+
   /** `campaign` is for the campaign's own orders (CampaignOrders); a request of the terminal never carries one. */
-  preview(req: PlaceOrderRequest, campaign?: CampaignRiskContext): Promise<OrderPreview> {
+  async preview(req: PlaceOrderRequest, campaign?: CampaignRiskContext): Promise<OrderPreview> {
+    this.checkSource(req);
     return this.evaluate(req, undefined, campaign);
+  }
+
+  /**
+   * An order that follows a signal carries the client id prefix `ps` (SIGNAL_CL_ORD_PREFIX), and only such an order
+   * does: the journal and the exchange's order history tell the two apart by it. A clOrdId of the request that does not
+   * fit is refused rather than rewritten, since the page retries under its own id.
+   */
+  private checkSource(req: PlaceOrderRequest): void {
+    if (req.clOrdId === undefined) return;
+    const signal = req.source === 'signal';
+    if (signal !== req.clOrdId.startsWith(SIGNAL_CL_ORD_PREFIX)) {
+      throw new AppError('VALIDATION', signal ? `an order that follows a signal needs a clOrdId starting with '${SIGNAL_CL_ORD_PREFIX}' (or none: the server makes one)` : `the clOrdId prefix '${SIGNAL_CL_ORD_PREFIX}' is for orders that follow a signal (source 'signal')`, 400, { clOrdId: req.clOrdId });
+    }
   }
 
   /**
@@ -183,6 +253,7 @@ export class OrderService {
     const markRef = this.market.refPrice(req.instId);
     if (markRef === undefined) throw new AppError('NO_PRICE', `no reference price available yet for ${req.instId}`, 503);
     const stop = req.slTriggerPx === undefined ? null : this.attachedStop(req.slTriggerPx, req, inst, posSide, closing, sized.sz, refPrice);
+    const exits = this.exitPlan(req, inst, posSide, closing, sized.sz, refPrice);
     // The stop is not an input of the risk check: it never relaxes a limit.
     const input: RiskCheckInput = {
       inst,
@@ -203,12 +274,84 @@ export class OrderService {
       instrumentOf: (id) => this.market.specOf(id),
     };
     if (campaign) input.campaign = campaign;
-    const risk = this.risk.check(input);
-    // No await between the check above and this line.
+    let risk = this.risk.check(input);
+    // The exits are checked once the order itself passes: the first violated rule is reported.
+    if (risk.ok && exits.check) risk = this.risk.checkExits(exits.check);
+    // No await between the checks above and this line.
     if (placeAs !== undefined && risk.ok && !closing) {
       this.reservations.set(placeAs, { clOrdId: placeAs, instId: req.instId, side: req.side, posSide, notional, full: notional, expiresAt: Infinity, closedAt: null, partial: null });
     }
-    return { instId: req.instId, side: req.side, ordType: req.ordType, tdMode, posSide, sz: sized.sz, coin: sized.coin.toFixed(), px, refPrice, notionalQuote: notional, estSlippagePct, lever, slTriggerPx: stop?.slTriggerPx ?? '', stopLossQuote: stop?.stopLossQuote ?? '', risk };
+    const preview: OrderPreview = { instId: req.instId, side: req.side, ordType: req.ordType, tdMode, posSide, sz: sized.sz, coin: sized.coin.toFixed(), px, refPrice, notionalQuote: notional, estSlippagePct, lever, slTriggerPx: stop?.slTriggerPx ?? '', stopLossQuote: stop?.stopLossQuote ?? '', risk };
+    if (exits.legs) preview.takeProfits = exits.legs;
+    return preview;
+  }
+
+  /**
+   * The exits an opening order asks for: its take-profit legs, sized, and what the risk engine checks them with.
+   * Refused outright (no risk verdict): outside paper trading and the local mock (EXITS_UNAVAILABLE); on an order that
+   * closes, or in net mode reduces, a position (VALIDATION); the cost-price stop without a stop-loss and two legs
+   * (BREAKEVEN_NEEDS_SPLIT_TP: OKX moves the stop-loss of split take-profits only, 51085); two legs with one trigger
+   * (TP_TRIGGERS_NOT_DISTINCT: OKX 51081); a leg below the instrument's minimum size (TP_LEG_TOO_SMALL); no live mark
+   * price (NO_PRICE). The legs are whole lots of the order's size and cover all of it: OKX refuses split take-profits
+   * whose sizes do not add up to the order's (51083), so the last leg takes what the others leave.
+   */
+  private exitPlan(req: PlaceOrderRequest, inst: Instrument, posSide: PosSide, closing: boolean, sz: string, refPrice: string): { legs: TakeProfitLegPreview[] | null; check: ExitCheckInput | null } {
+    if (req.takeProfits === undefined && req.breakevenAfterTp1 !== true && req.trailing === undefined) return { legs: null, check: null };
+    if (!this.exitsEnabled) throw new ExitsUnavailableError();
+    if (closing) throw new AppError('VALIDATION', 'take-profits and trailing exits can only accompany an order that opens a position');
+    const buy = req.side === 'buy';
+    const reduces = posSide === 'net' && this.account.positionList().some((p) => p.instId === req.instId && p.posSide === 'net' && (buy ? D(p.pos || '0').lt(0) : D(p.pos || '0').gt(0)));
+    if (reduces) throw new AppError('VALIDATION', `take-profits and trailing exits can only accompany an order that opens a position: this ${req.side} order reduces the open net ${buy ? 'short' : 'long'} position of ${req.instId}`);
+    const legsAsked = req.takeProfits ?? [];
+    if (req.breakevenAfterTp1 === true && (req.slTriggerPx === undefined || legsAsked.length < 2)) {
+      throw new AppError('BREAKEVEN_NEEDS_SPLIT_TP', 'the cost-price stop (breakevenAfterTp1) needs a stop-loss (slTriggerPx) and two take-profits or more: OKX moves the stop-loss of split take-profits only', 400, { takeProfits: legsAsked.length, slTriggerPx: req.slTriggerPx ?? '' });
+    }
+    const markPx = this.market.liveMarkPrice(req.instId);
+    if (markPx === undefined) throw new AppError('NO_PRICE', `no live mark price for ${req.instId}: mark-triggered take-profits and trailing exits cannot be checked against it; retry shortly`, 503);
+    const check: ExitCheckInput = { direction: buy ? 'long' : 'short', entryPx: refPrice, markPx };
+    let legs: TakeProfitLegPreview[] | null = null;
+    if (legsAsked.length > 0) {
+      // Rounded to the tick towards the entry (down for a long, up for a short): the smaller profit.
+      const triggers = legsAsked.map((leg) => (buy ? floorToStep(leg.triggerPx, inst.tickSz) : ceilToStep(leg.triggerPx, inst.tickSz)));
+      if (triggers.some((t) => t.lte(0))) throw new AppError('VALIDATION', 'a take-profit trigger rounds to zero at this tick size');
+      const distinct = new Set(triggers.map((t) => t.toFixed()));
+      if (distinct.size < triggers.length) throw new AppError('TP_TRIGGERS_NOT_DISTINCT', 'two take-profit legs have the same trigger once rounded to the tick; OKX refuses that (51081)', 400, { triggers: triggers.map((t) => toPlainString(t, inst.tickSz)) });
+      const sizes = sizeTakeProfitLegs(legsAsked.map((leg) => leg.fraction), sz, inst.lotSz, 'whole');
+      sizes.forEach((legSz, i) => {
+        if (legSz.lt(inst.minSz) || legSz.lte(0)) {
+          throw new AppError('TP_LEG_TOO_SMALL', `take-profit ${i + 1} comes to ${legSz.toFixed()} of the order's ${sz} contracts, below the instrument's minimum of ${inst.minSz}: fewer legs, or a larger order`, 400, { leg: i + 1, sz: legSz.toFixed(), minSz: inst.minSz, orderSz: sz });
+        }
+      });
+      legs = triggers.map((t, i) => {
+        const legSz = sizes[i] ?? ZERO;
+        return { triggerPx: toPlainString(t, inst.tickSz), fraction: legsAsked[i]?.fraction ?? '', sz: legSz.toFixed(), profitQuote: contractsToCoin(legSz, inst, refPrice).mul(t.minus(refPrice).abs()).toFixed() };
+      });
+      check.takeProfits = legs.map((l) => l.triggerPx);
+    }
+    if (req.trailing?.kind === 'callback') {
+      check.callbackRatio = req.trailing.ratio;
+      if (req.trailing.activePx !== undefined) check.activePx = req.trailing.activePx;
+      const last = this.market.ticker(req.instId)?.last;
+      if (last) check.lastPx = last;
+    }
+    return { legs, check };
+  }
+
+  /**
+   * The `attachAlgoOrds` of an opening order. A stop-loss alone, or one take-profit (with the stop-loss when there is
+   * one): one object for the whole fill, which OKX turns into one algo order (an oco order with both). Two take-profits
+   * or more: split take-profits, one object per leg with its `sz`, and the stop-loss in an object of its own, with
+   * `amendPxOnTriggerType: '1'` for the cost-price stop. Every leg is mark-triggered and executes at market.
+   */
+  private attachments(clOrdId: string, slTriggerPx: string, legs: TakeProfitLegPreview[] | undefined, breakeven: boolean): OkxAttachAlgoOrd[] {
+    const sl: OkxAttachAlgoOrd | null = slTriggerPx === '' ? null : { slTriggerPx, slOrdPx: '-1', slTriggerPxType: 'mark' };
+    const tp = (leg: TakeProfitLegPreview): OkxAttachAlgoOrd => ({ tpTriggerPx: leg.triggerPx, tpOrdPx: '-1', tpTriggerPxType: 'mark' });
+    const [first] = legs ?? [];
+    if (!first) return sl ? [{ attachAlgoClOrdId: attachAlgoClOrdIdFor(clOrdId), ...sl }] : [];
+    if (legs?.length === 1) return [{ attachAlgoClOrdId: sl ? attachAlgoClOrdIdFor(clOrdId) : takeProfitAlgoClOrdIdFor(clOrdId, 1), ...tp(first), ...(sl ?? {}) }];
+    const out: OkxAttachAlgoOrd[] = (legs ?? []).map((leg, i) => ({ attachAlgoClOrdId: takeProfitAlgoClOrdIdFor(clOrdId, i + 1), ...tp(leg), sz: leg.sz }));
+    if (sl) out.push({ attachAlgoClOrdId: attachAlgoClOrdIdFor(clOrdId), ...sl, ...(breakeven ? { amendPxOnTriggerType: '1' as const } : {}) });
+    return out;
   }
 
   /**
@@ -295,7 +438,9 @@ export class OrderService {
   /** `campaign` is for the campaign's own orders (CampaignOrders); a request of the terminal never carries one. */
   async place(req: PlaceOrderRequest, campaign?: CampaignRiskContext): Promise<{ order: Order; preview: OrderPreview }> {
     const config = this.account.requireTrading();
-    const clOrdId = req.clOrdId ?? generateClOrdId();
+    this.checkSource(req);
+    // `source` and `signal` are for the trade journal (onPlaced): they never go to the exchange; a signal order is told apart by its prefix.
+    const clOrdId = req.clOrdId ?? generateClOrdId(Date.now(), req.source === 'signal' ? SIGNAL_CL_ORD_PREFIX : CL_ORD_PREFIX);
     // The page marks its retries as well: this memory does not survive a restart, and a restart in mid-request
     // is exactly how a reply gets lost.
     if (this.sentIds.get(clOrdId) === req.instId || (req.retry === true && req.clOrdId !== undefined)) {
@@ -303,6 +448,7 @@ export class OrderService {
       const earlier = await this.findEarlierAttempt(req.instId, clOrdId);
       if (earlier) {
         this.log.warn({ ordId: earlier.ordId, clOrdId, state: earlier.state }, 'retry of an order that already reached the exchange; nothing sent');
+        this.notifyPlaced({ request: req, order: earlier, earlier: true });
         return { order: earlier, preview: this.previewOfExisting(earlier, inst) };
       }
     }
@@ -324,10 +470,9 @@ export class OrderService {
     if (preview.ordType !== 'market') params.px = preview.px;
     if (config.posMode === 'long_short_mode') params.posSide = preview.posSide;
     else if (req.reduceOnly) params.reduceOnly = true;
-    // The exchange creates the stop when the order fills, sized to the fill. OKX triggers on the last price unless told otherwise.
-    if (preview.slTriggerPx !== '') {
-      params.attachAlgoOrds = [{ attachAlgoClOrdId: attachAlgoClOrdIdFor(clOrdId), slTriggerPx: preview.slTriggerPx, slOrdPx: '-1', slTriggerPxType: 'mark' }];
-    }
+    // The exchange creates the stop and the take-profits when the order has filled. OKX triggers on the last price unless told otherwise.
+    const attached = this.attachments(clOrdId, preview.slTriggerPx, preview.takeProfits, req.breakevenAfterTp1 === true);
+    if (attached.length > 0) params.attachAlgoOrds = attached;
 
     const t0 = Date.now();
     this.rememberSent(clOrdId, req.instId);
@@ -347,7 +492,7 @@ export class OrderService {
     }
     // The clock of the reservation starts at the acknowledgement, not at the submit.
     this.startReservationClock(clOrdId);
-    this.log.info({ ordId: ack.ordId, clOrdId, instId: params.instId, side: params.side, ordType: params.ordType, sz: params.sz, px: params.px, slTriggerPx: preview.slTriggerPx, latencyMs: Date.now() - t0 }, 'order accepted');
+    this.log.info({ ordId: ack.ordId, clOrdId, instId: params.instId, side: params.side, ordType: params.ordType, sz: params.sz, px: params.px, slTriggerPx: preview.slTriggerPx, takeProfits: preview.takeProfits?.map((l) => `${l.sz}@${l.triggerPx}`), breakevenAfterTp1: req.breakevenAfterTp1 === true, trailing: req.trailing, source: req.source ?? 'manual', latencyMs: Date.now() - t0 }, 'order accepted');
     const order: Order = {
       ordId: ack.ordId,
       clOrdId,
@@ -372,7 +517,23 @@ export class OrderService {
     if (preview.slTriggerPx !== '') order.slTriggerPx = preview.slTriggerPx;
     // Journal the synthetic 'live' row only when the fill push has not already recorded a newer state.
     if (this.account.noteLocalOrder(order)) void this.store.upsertOrder(order).catch(() => undefined);
+    this.notifyPlaced({ request: req, order, earlier: false });
     return { order, preview };
+  }
+
+  /** Called for every order place() has put at the exchange (or found there from an earlier attempt): the trade journal records the plan it carries. */
+  onPlaced(listener: (e: OrderPlacedEvent) => void): void {
+    this.placedListeners.push(listener);
+  }
+
+  private notifyPlaced(e: OrderPlacedEvent): void {
+    for (const listener of this.placedListeners) {
+      try {
+        listener(e);
+      } catch (err) {
+        this.log.warn({ clOrdId: e.order.clOrdId, err: (err as Error).message }, 'order placed listener failed');
+      }
+    }
   }
 
   private rememberSent(clOrdId: string, instId: string): void {
@@ -532,7 +693,7 @@ export class OrderService {
    * and must lie on the losing side of the live mark. A stop can only take risk away, so the kill switch does not
    * refuse it.
    */
-  async placeStop(req: PlaceStopRequest): Promise<{ algoId: string; instId: string; slTriggerPx: string; sz: string }> {
+  async placeStop(req: PlaceStopRequest, opts: { algoClOrdId?: string } = {}): Promise<{ algoId: string; instId: string; slTriggerPx: string; sz: string }> {
     const longShort = this.account.requireRestTrading().posMode === 'long_short_mode';
     if (longShort && req.posSide !== 'long' && req.posSide !== 'short') throw new AppError('VALIDATION', 'posSide (long|short) is required to place a stop in long/short mode');
     const posSide: PosSide = longShort ? (req.posSide ?? 'net') : 'net';
@@ -565,7 +726,7 @@ export class OrderService {
       slTriggerPx,
       slOrdPx: '-1',
       slTriggerPxType: 'mark',
-      algoClOrdId: attachAlgoClOrdIdFor(generateClOrdId()),
+      algoClOrdId: opts.algoClOrdId ?? attachAlgoClOrdIdFor(generateClOrdId()),
     };
     if (longShort) params.posSide = posSide;
     else {
@@ -583,7 +744,7 @@ export class OrderService {
     this.log.info({ algoId, instId: req.instId, side: params.side, sz: params.sz, slTriggerPx }, 'stop placed');
     void this.store.addRiskEvent('STOP_PLACED', { algoId, instId: req.instId, sz: params.sz, slTriggerPx });
     await this.showAlgoChange();
-    return { algoId, instId: req.instId, slTriggerPx, sz: params.sz };
+    return { algoId, instId: req.instId, slTriggerPx, sz: sz.toFixed() };
   }
 
   /**
@@ -657,6 +818,139 @@ export class OrderService {
       this.log.warn({ err: (err as Error).message }, 'algo order read after a change failed');
       return null;
     }
+  }
+
+  // ---- exits for an open position (paper trading and the local mock) ----
+
+  /**
+   * The open position a request names: its instrument, margin mode and, in long/short mode, side (required there), as
+   * the mirror has it. VALIDATION when there is none.
+   */
+  private requirePosition(req: { instId: string; mgnMode: TdMode; posSide?: PosSide | undefined }, longShort: boolean, what: string): { position: Position; posSide: PosSide; direction: 'long' | 'short' } {
+    if (longShort && req.posSide !== 'long' && req.posSide !== 'short') throw new AppError('VALIDATION', `posSide (long|short) is required to place ${what} in long/short mode`);
+    const posSide: PosSide = longShort ? (req.posSide ?? 'net') : 'net';
+    const position = this.account.positionList().find((p) => p.instId === req.instId && p.mgnMode === req.mgnMode && p.posSide === posSide);
+    const direction = position ? positionDirection(position) : null;
+    if (!position || direction === null) throw new AppError('VALIDATION', `no open ${req.mgnMode} position in ${req.instId}${longShort ? ` on the ${posSide} side` : ''} to place ${what} for`);
+    return { position, posSide, direction };
+  }
+
+  /** What an algo order placed for an open position adds: the closing side, and reduce-only in net mode (posSide in long/short mode). */
+  private closingParams(req: { instId: string; mgnMode: TdMode }, posSide: PosSide, direction: 'long' | 'short'): Pick<OkxPlaceAlgoParams, 'instId' | 'tdMode' | 'side' | 'posSide' | 'reduceOnly'> {
+    const base: Pick<OkxPlaceAlgoParams, 'instId' | 'tdMode' | 'side' | 'posSide' | 'reduceOnly'> = { instId: req.instId, tdMode: req.mgnMode, side: direction === 'long' ? 'sell' : 'buy' };
+    if (posSide === 'net') base.reduceOnly = true;
+    else base.posSide = posSide;
+    return base;
+  }
+
+  /**
+   * Take-profit legs for an open position: one OKX `conditional` order per leg, mark-triggered, executed at market, on
+   * the closing side, reduce-only (in net mode with `cxlOnClosePos`, so that OKX cancels it with the position; in
+   * long/short mode with the position's `posSide`). Each leg closes its fraction of the position in whole lots, the
+   * last one what the others leave of the fractions' sum; together with the take-profits already resting for the
+   * position they may not close more than it holds (TP_EXCEEDS_POSITION). The triggers are rounded to the tick towards
+   * the entry and checked by the risk engine (TP_WRONG_SIDE). A leg only reduces: the kill switch does not refuse it.
+   * The legs are placed one after the other; when one is refused the ones placed before it are cancelled.
+   */
+  async placeTakeProfits(req: PlaceTakeProfitsRequest): Promise<PlaceTakeProfitsResult> {
+    if (!this.exitsEnabled) throw new ExitsUnavailableError();
+    const longShort = this.account.requireRestTrading().posMode === 'long_short_mode';
+    const { position, posSide, direction } = this.requirePosition(req, longShort, 'take-profits');
+    const inst = this.market.specOf(req.instId);
+    if (!inst) throw new UnknownInstrumentError(req.instId);
+    const long = direction === 'long';
+    const triggers = req.takeProfits.map((leg) => (long ? floorToStep(leg.triggerPx, inst.tickSz) : ceilToStep(leg.triggerPx, inst.tickSz)));
+    if (triggers.some((t) => t.lte(0))) throw new AppError('VALIDATION', 'a take-profit trigger rounds to zero at this tick size');
+    if (new Set(triggers.map((t) => t.toFixed())).size < triggers.length) throw new AppError('TP_TRIGGERS_NOT_DISTINCT', 'two take-profit legs have the same trigger once rounded to the tick', 400, { triggers: triggers.map((t) => toPlainString(t, inst.tickSz)) });
+    const size = D(position.pos).abs();
+    const sizes = sizeTakeProfitLegs(req.takeProfits.map((leg) => leg.fraction), size, inst.lotSz, 'share');
+    sizes.forEach((sz, i) => {
+      if (sz.lt(inst.minSz) || sz.lte(0)) throw new AppError('TP_LEG_TOO_SMALL', `take-profit ${i + 1} comes to ${sz.toFixed()} of the position's ${size.toFixed()} contracts, below the instrument's minimum of ${inst.minSz}`, 400, { leg: i + 1, sz: sz.toFixed(), minSz: inst.minSz, size: size.toFixed() });
+    });
+    const resting = (await this.account.refreshAlgoOrders()).orders.filter((a) => a.tpTriggerPx !== '' && algoOrderClosesPosition(a, position));
+    const existing = resting.reduce((sum, a) => sum.plus(a.closeFraction !== '' ? size.times(a.closeFraction) : D(a.sz || '0')), ZERO);
+    const requested = sizes.reduce((sum, sz) => sum.plus(sz), ZERO);
+    if (existing.plus(requested).gt(size)) {
+      throw new AppError('TP_EXCEEDS_POSITION', `the take-profits would close ${existing.plus(requested).toFixed()} contracts of a position of ${size.toFixed()} (${existing.toFixed()} already rest): cancel one or ask for less`, 400, { existing: existing.toFixed(), requested: requested.toFixed(), size: size.toFixed() });
+    }
+    const markPx = this.market.liveMarkPrice(req.instId);
+    if (markPx === undefined) throw new AppError('NO_PRICE', `no live mark price for ${req.instId}: a mark-triggered take-profit cannot be checked against it; retry shortly`, 503);
+    const prices = triggers.map((t) => toPlainString(t, inst.tickSz));
+    const risk = this.risk.checkExits({ direction, entryPx: position.avgPx || markPx, markPx, takeProfits: prices });
+    if (!risk.ok) {
+      this.log.warn({ req, risk }, 'take-profits rejected by risk engine');
+      throw new RiskRejectedError(risk);
+    }
+    const base = { ...this.closingParams(req, posSide, direction), ...(posSide === 'net' ? { cxlOnClosePos: true } : {}) };
+    const id = generateClOrdId();
+    const legs: PlaceTakeProfitsResult['legs'] = [];
+    for (const [i, triggerPx] of prices.entries()) {
+      const sz = (sizes[i] ?? ZERO).toFixed();
+      const params: OkxPlaceAlgoParams = { ...base, ordType: 'conditional', sz, tpTriggerPx: triggerPx, tpOrdPx: '-1', tpTriggerPxType: 'mark', algoClOrdId: takeProfitAlgoClOrdIdFor(id, i + 1) };
+      try {
+        legs.push({ algoId: (await this.clients.rest.placeAlgoOrder(params)).algoId, triggerPx, sz });
+      } catch (err) {
+        this.log.warn({ params, err: (err as Error).message, placed: legs.map((l) => l.algoId) }, 'take-profit placement failed; cancelling the legs placed before it');
+        for (const leg of legs) await this.clients.rest.cancelAlgoOrder({ instId: req.instId, algoId: leg.algoId }).catch(() => undefined);
+        await this.showAlgoChange();
+        throw exchangeError(err);
+      }
+    }
+    this.log.info({ instId: req.instId, posSide, legs }, 'take-profits placed');
+    void this.store.addRiskEvent('TAKE_PROFITS_PLACED', { instId: req.instId, posSide, legs });
+    await this.showAlgoChange();
+    return { instId: req.instId, posSide, legs };
+  }
+
+  /**
+   * The exchange's trailing stop (OKX `move_order_stop`) for an open position: on the closing side, reduce-only in net
+   * mode (posSide in long/short mode), for `sz` contracts or the whole position. It closes once the last price has come
+   * back `ratio` from its extreme since activation (`activePx`, rounded to the tick towards the price; at once
+   * without). The risk engine checks the ratio (CALLBACK_RATIO) and the activation price (ACTIVE_PX_WRONG_SIDE); with
+   * the trailing stops already resting for the position it may not close more than the position holds
+   * (TRAILING_EXCEEDS_POSITION). It only reduces: the kill switch does not refuse it. OKX does not amend a trailing
+   * stop; it is cancelled through POST /api/algo-orders/cancel and placed again.
+   */
+  async placeTrailingStop(req: PlaceTrailingStopRequest, opts: { algoClOrdId?: string } = {}): Promise<PlaceTrailingStopResult> {
+    if (!this.exitsEnabled) throw new ExitsUnavailableError();
+    const longShort = this.account.requireRestTrading().posMode === 'long_short_mode';
+    const { position, posSide, direction } = this.requirePosition(req, longShort, 'a trailing stop');
+    const inst = this.market.specOf(req.instId);
+    if (!inst) throw new UnknownInstrumentError(req.instId);
+    const size = D(position.pos).abs();
+    const sz = req.sz === undefined ? size : D(req.sz);
+    if (!isMultipleOf(sz, inst.lotSz) || sz.lt(inst.minSz)) throw new AppError('VALIDATION', `a trailing stop for ${sz.toFixed()} contracts is not a whole number of lots of ${inst.lotSz} at least ${inst.minSz}`, 400, { sz: sz.toFixed() });
+    const resting = (await this.account.refreshAlgoOrders()).orders.filter((a) => a.ordType === 'move_order_stop' && algoOrderClosesPosition(a, position));
+    const existing = resting.reduce((sum, a) => sum.plus(a.sz || '0'), ZERO);
+    if (existing.plus(sz).gt(size)) {
+      throw new AppError('TRAILING_EXCEEDS_POSITION', `the trailing stops would close ${existing.plus(sz).toFixed()} contracts of a position of ${size.toFixed()} (${existing.toFixed()} already rest)`, 400, { existing: existing.toFixed(), requested: sz.toFixed(), size: size.toFixed() });
+    }
+    const markPx = this.market.liveMarkPrice(req.instId);
+    if (markPx === undefined) throw new AppError('NO_PRICE', `no live mark price for ${req.instId}: the trailing stop cannot be checked against it; retry shortly`, 503);
+    const long = direction === 'long';
+    const activePx = req.activePx === undefined ? undefined : toPlainString(long ? floorToStep(req.activePx, inst.tickSz) : ceilToStep(req.activePx, inst.tickSz), inst.tickSz);
+    const check: ExitCheckInput = { direction, entryPx: position.avgPx || markPx, markPx, callbackRatio: req.ratio };
+    const last = this.market.ticker(req.instId)?.last;
+    if (last) check.lastPx = last;
+    if (activePx !== undefined) check.activePx = activePx;
+    const risk = this.risk.checkExits(check);
+    if (!risk.ok) {
+      this.log.warn({ req, risk }, 'trailing stop rejected by risk engine');
+      throw new RiskRejectedError(risk);
+    }
+    const params: OkxPlaceAlgoParams = { ...this.closingParams(req, posSide, direction), ordType: 'move_order_stop', sz: sz.toFixed(), callbackRatio: req.ratio, algoClOrdId: opts.algoClOrdId ?? trailingAlgoClOrdIdFor(generateClOrdId()) };
+    if (activePx !== undefined) params.activePx = activePx;
+    let algoId: string;
+    try {
+      algoId = (await this.clients.rest.placeAlgoOrder(params)).algoId;
+    } catch (err) {
+      this.log.warn({ params, err: (err as Error).message }, 'trailing stop placement failed');
+      throw exchangeError(err);
+    }
+    this.log.info({ algoId, instId: req.instId, posSide, sz: params.sz, callbackRatio: req.ratio, activePx: activePx ?? '' }, 'trailing stop placed');
+    void this.store.addRiskEvent('TRAILING_STOP_PLACED', { algoId, instId: req.instId, posSide, sz: params.sz, callbackRatio: req.ratio, activePx: activePx ?? '' });
+    await this.showAlgoChange();
+    return { algoId, instId: req.instId, posSide, sz: sz.toFixed(), callbackRatio: req.ratio, activePx: activePx ?? '' };
   }
 
   async closePosition(req: ClosePositionRequest): Promise<{ instId: string; posSide: PosSide }> {

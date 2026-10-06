@@ -64,7 +64,8 @@ describe('attached stop-loss', () => {
     expect((await place(h, { ...buy, ...stop('59000.05') })).sCode).toBe('51000');
     expect((await place(h, { ...buy, attachAlgoOrds: [{ slTriggerPx: '59000' }] })).sCode).toBe('51000');
     expect((await place(h, { ...buy, ...stop('59000', { slTriggerPxType: 'bid' }) })).sCode).toBe('51000');
-    expect((await place(h, { ...buy, ...stop('59000', { tpTriggerPx: '62000', tpOrdPx: '-1' }) })).sCode).toBe('51000');
+    // a limit take-profit is not simulated (a market one is: see exits.test.ts)
+    expect((await place(h, { ...buy, ...stop('59000', { tpTriggerPx: '62000', tpOrdPx: '62100', tpOrdKind: 'limit' }) })).sCode).toBe('51000');
     expect((await place(h, { ...buy, attachAlgoOrds: 'x' })).sCode).toBe('51000');
     expect(h.getState().orders).toEqual([]);
     expect(h.getState().stops).toEqual([]);
@@ -269,7 +270,8 @@ describe('attached stop-loss', () => {
     expect((await amend2({ newSlTriggerPx: '59000.05' }))?.sCode).toBe('51000');
     expect((await amend2({ newSlTriggerPx: '0' }))?.sCode).toBe('51526');
     expect((await amend2({}))?.sCode).toBe('51000');
-    expect((await amend2({ newTpTriggerPx: '65000' }))?.sCode).toBe('51000');
+    // a take-profit cannot be added to a stop-loss order (OKX 51526)
+    expect((await amend2({ newTpTriggerPx: '65000' }))?.sCode).toBe('51526');
     // OKX refuses a change of the trigger price type; naming the type the stop already has changes nothing
     expect(await amend2({ newSlTriggerPx: '59100', newSlTriggerPxType: 'last' })).toMatchObject({ sCode: '51528', sMsg: 'Unable to modify trigger price type' });
     expect((await amend2({ newSlTriggerPxType: 'mark' }))?.sCode).toBe('0');

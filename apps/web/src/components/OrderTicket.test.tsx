@@ -8,13 +8,14 @@ import { api, type LeverageInfo } from '../lib/api';
 import { ApiError } from '../lib/http';
 import { useStore } from '../store/store';
 import { initialState } from '../store/types';
+import { trailingOn } from '../test/signals-fixtures';
 import { OrderTicket } from './OrderTicket';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 vi.mock('../lib/api', async (importOriginal) => {
   const mod = await importOriginal<typeof import('../lib/api')>();
-  return { ...mod, api: { leverage: vi.fn(), previewOrder: vi.fn(), placeOrder: vi.fn() } };
+  return { ...mod, api: { leverage: vi.fn(), previewOrder: vi.fn(), placeOrder: vi.fn(), trailing: vi.fn() } };
 });
 
 const eth: Instrument = {
@@ -74,8 +75,12 @@ describe('OrderTicket', () => {
   const leverage = vi.mocked(api.leverage);
   const previewOrder = vi.mocked(api.previewOrder);
   const placeOrder = vi.mocked(api.placeOrder);
+  const trailing = vi.mocked(api.trailing);
 
   beforeEach(() => {
+    trailing.mockReset();
+    // an API that does not answer for its exits: the ticket shows no exits section
+    trailing.mockRejectedValue(new ApiError('NOT_FOUND', 'route not found', undefined, 404));
     leverage.mockReset();
     leverage.mockImplementation((instId, mgnMode) => Promise.resolve<LeverageInfo[]>([{ instId, mgnMode, posSide: 'long', lever: '3' }, { instId, mgnMode, posSide: 'short', lever: '3' }]));
     previewOrder.mockReset();
@@ -167,8 +172,11 @@ describe('OrderTicket', () => {
 
     await click(submit());
     await until('the order', () => placeOrder.mock.calls.length === 1);
-    expect(placeOrder.mock.calls[0]?.[0]).toMatchObject({ instId: 'ETH-USDT-SWAP', side: 'buy', posSide: 'long', reduceOnly: false });
+    expect(placeOrder.mock.calls[0]?.[0]).toMatchObject({ instId: 'ETH-USDT-SWAP', side: 'buy', posSide: 'long', reduceOnly: false, source: 'manual' });
     expect(placeOrder.mock.calls[0]?.[0].clOrdId).toMatch(/^pgw[0-9a-z]{9,29}$/);
+    // the toast leads to the trade in the journal
+    await until('the toast', () => useStore.getState().toasts.length === 1);
+    expect(useStore.getState().toasts[0]?.link).toEqual({ kind: 'journal', instId: 'ETH-USDT-SWAP', mgnMode: 'cross', posSide: 'long', ordId: 'o1' });
     await until('the toast', () => useStore.getState().toasts.length === 1);
     expect(useStore.getState().toasts[0]?.message).toBe('Order live: Open long, buy 2 contracts ETH-USDT-SWAP @ 3000 (o1)');
     expect(submit()?.title).toBe('Open long: buy 2 contracts ETH-USDT-SWAP @ 3000');
@@ -388,5 +396,50 @@ describe('OrderTicket', () => {
     await until('the failed query', () => lever()?.placeholder === 'unavailable');
     expect(lever()?.value).toBe('');
     expect(container.textContent).toContain('unavailable');
+  });
+
+  it('exits: explained where the API refuses them; offered, a ladder with the cost-price stop and channel trailing go with the order', async () => {
+    trailing.mockRejectedValue(new ApiError('EXITS_UNAVAILABLE', 'exits are offered in paper trading only', undefined, 403));
+    await render();
+    await until('the answer', () => container.querySelector('.ticket-exits-off') !== null);
+    expect(container.querySelector('.ticket-exits-off')?.textContent).toBe('Take-profit and trailing exits are offered in paper trading and against the local mock only.');
+    expect(container.querySelector('.ticket-exits-toggle')).toBeNull();
+    await act(async () => root.unmount());
+    root = createRoot(container);
+
+    trailing.mockResolvedValue(trailingOn);
+    await render();
+    await until('the exits section', () => container.querySelector('.ticket-exits-toggle') !== null);
+    // closed, it adds no field: price, size, stop and leverage are still the ticket's inputs
+    expect(inputs()).toHaveLength(4);
+    await fill('3000', '4');
+    await type(inputs()[2], '2900');
+    await click(container.querySelector('.ticket-exits-toggle'));
+    const button = (label: string) => [...container.querySelectorAll<HTMLButtonElement>('.ticket-exits button')].find((b) => b.textContent === label);
+    await click(button('Ladder'));
+    const rows = [...container.querySelectorAll<HTMLElement>('.ticket-exits .exit-row')];
+    await type(rows[0]?.querySelector<HTMLInputElement>('input') ?? undefined, '3100');
+    await type(rows[1]?.querySelector<HTMLInputElement>('input') ?? undefined, '3200');
+    await click(container.querySelector('.ticket-exits .exit-breakeven input'));
+    await click(button('Channel'));
+    await until('the exits in the preview', () => lastPreviewed()?.takeProfits !== undefined && lastPreviewed()?.trailing !== undefined && submit()?.disabled === false);
+    expect(lastPreviewed()).toMatchObject({
+      slTriggerPx: '2900',
+      takeProfits: [
+        { triggerPx: '3100', fraction: '0.5' },
+        { triggerPx: '3200', fraction: '0.5' },
+      ],
+      breakevenAfterTp1: true,
+      trailing: { kind: 'channel', bars: 10 },
+      source: 'manual',
+    });
+    // a new leg without its price leaves the order incomplete; a field not filled in yet is not flagged as an error
+    await click(button('+ leg'));
+    await until('the incomplete form', () => submit()?.disabled === true);
+    expect(container.querySelector('.ticket-exits .exit-error')).toBeNull();
+    // closing the section takes the exits off the order
+    await click(container.querySelector('.ticket-exits-toggle'));
+    await until('the order without exits', () => lastPreviewed()?.takeProfits === undefined && submit()?.disabled === false);
+    expect(lastPreviewed()?.trailing).toBeUndefined();
   });
 });

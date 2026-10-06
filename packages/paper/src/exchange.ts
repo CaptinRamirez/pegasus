@@ -144,7 +144,7 @@ export class PaperExchange {
       const from = this.lastSeen[instId];
       if (from !== undefined) {
         const r = await replayInstrument(this.engine, this.deps.bars, instId, from, now);
-        if (r.bars > 0) this.deps.log(`${instId}: replayed ${new Date(from).toISOString()} to ${new Date(now).toISOString()} (${r.bars} bars): ${r.filled} resting order(s) filled, ${r.stopped} stop(s) triggered, ${r.liquidated} position(s) liquidated`);
+        if (r.bars > 0) this.deps.log(`${instId}: replayed ${new Date(from).toISOString()} to ${new Date(now).toISOString()} (${r.bars} bars): ${r.filled} resting order(s) filled, ${r.stopped} stop(s) triggered, ${r.liquidated} position(s) liquidated, ${r.takeProfits} take-profit(s) triggered`);
         replayed.set(instId, r);
       }
       this.lastSeen[instId] = now;
@@ -217,7 +217,7 @@ export class PaperExchange {
       const now = this.now();
       if (from !== undefined && now - from > REPLAY_GAP_MS) {
         const r = await replayInstrument(this.engine, this.deps.bars, instId, from, now);
-        this.deps.log(`${instId}: quotes were missing since ${new Date(from).toISOString()}; replayed ${r.bars} bars: ${r.filled} resting order(s) filled, ${r.stopped} stop(s) triggered, ${r.liquidated} position(s) liquidated`);
+        this.deps.log(`${instId}: quotes were missing since ${new Date(from).toISOString()}; replayed ${r.bars} bars: ${r.filled} resting order(s) filled, ${r.stopped} stop(s) triggered, ${r.liquidated} position(s) liquidated, ${r.takeProfits} take-profit(s) triggered`);
         await this.settleFunding(now);
         this.retest(instId, r);
       }

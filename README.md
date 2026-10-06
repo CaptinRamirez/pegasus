@@ -6,13 +6,13 @@
 pegasus/
 ├── apps/
 │   ├── api/          Fastify 后端：OKX 行情/账户接入、风控、下单、WebSocket 推送、持久化
-│   └── web/          React + Vite 交易终端（滚仓记分牌、K 线、盘口、成交、下单面板、持仓、风控面板、信号面板）
+│   └── web/          React + Vite 交易终端（按币种的信号和跟单、K 线、盘口、成交、下单面板、止盈止损、持仓、开仓记录、滚仓记分牌、风控面板）
 ├── packages/
 │   ├── shared/       前后端共享的领域类型、zod 校验、WS 协议、合约张数/价格换算
 │   ├── okx/          OKX v5 REST + WebSocket 客户端（签名、登录、心跳、重连、重订阅、按 seqId 校验盘口连续性）
 │   ├── mock-okx/     本地模拟的 OKX 交易所（REST + WS + 撮合），离线开发和端到端测试用
 │   ├── paper/        纸面交易所：OKX 实盘行情 + 本地虚拟账户（订单、持仓、止损、资金费），`pnpm start --paper`
-│   └── backtest/     回测工具：滚仓回放（pnpm backtest:campaign），以及存档的 55 日突破框架（和 SIGNALS 面板用同一份信号代码）
+│   └── backtest/     回测工具：滚仓回放（pnpm backtest:campaign），以及存档的 55 日突破框架
 ├── docs/strategy.md  现行交易框架：滚仓（第 0 关，纸面阶段）
 ├── docs/api.md       前后端接口契约
 ├── docker-compose.yml  Postgres（可选）
@@ -28,6 +28,18 @@ pegasus/
 - **API key 只在后端**，通过 `.env` 读取。前端用一个共享 token（`API_TOKEN`）访问后端，后端默认只监听 127.0.0.1，并且只接受发往本机（localhost / 127.0.0.1）且来自 `WEB_ORIGINS` 所列页面地址的请求。页面必须用 http://localhost:5174 或 http://127.0.0.1:5174 打开，否则下单和实时推送会被拒绝（403）。
 - **先跑模拟盘**：`OKX_DEMO=1` 使用 OKX 模拟交易（REST 加 `x-simulated-trading: 1`，WS 走 `wspap.okx.com`）。
 - **界面中英双语**：页头（和登录页）右侧的 `EN / 中文` 按钮切换整页语言，选择保存在浏览器的 localStorage（`pegasus.lang`）；没选过时跟随浏览器语言。文案集中在 `apps/web/src/i18n/`（`en.ts` 定义全部条目，`zh.ts` 必须逐条对应，缺一条就编译不过）。信号面板里由后端生成的理由和仓位说明通过 `GET /api/signals?lang=zh` 取中文；后端的其他英文报错按错误码在前端给出中文说明，原文保留在括号里。
+
+## 怎么用：信号、下单、开仓记录
+
+- **信号**（页面下方的"信号"标签）：左边是滚仓规则的十个币种，有信号的排在前面；点一个币，右边只讲这个币。卡片上写着：
+  - 现在是什么状态，一句话说明理由；
+  - 开仓线（20 日高点）、离场线（10 日低点，也就是移动止损线）、下次加仓价；
+  - 跟单方案：张数、杠杆、保证金、强平价，以及这笔会亏多少（USDT 和占权益的百分比）。
+- **按信号开仓**：弹出确认单，所有参数都已填好、都可以改（类型、张数或风险比例、杠杆、止损、止盈、移动止损），右边实时显示检查结果和一句话总结。点"确认下单"才会下单。默认的离场方案是按 10 日通道上移的移动止损，不设固定止盈。
+- **手动开仓**：只把币种和"买入"填进右边的下单面板，其余自己填。下单面板的"止盈与移动止损"里可以设单个止盈、阶梯止盈（最多 5 档）、第一档止盈后止损移到成本价、回撤比例或通道移动止损。
+- **持仓**：每个仓位显示止损、止盈各档和移动止损；"离场"按钮可以补挂止盈、设置或取消移动止损、撤掉某一张离场单。
+- **开仓记录**：每笔交易从开仓到平仓一行，写明来源（滚仓 / 按信号 / 手动 / 外部）、开仓均价、数量、杠杆、初始止损、止盈计划、移动止损、平仓原因、盈亏和 R。点开能看到完整的成交和时间线。重启不会丢。
+- 在滚仓专用的页面（5175）上不能跟单：那个账户的仓位由程序按规则自动执行。
 
 ## 快速开始
 
@@ -69,12 +81,17 @@ pnpm start --paper     # Windows 上也可以直接双击 start-paper.bat
 
 想让 `pnpm start` 和双击 `start.bat` 默认就是纸面交易，在 `.env` 里加一行 `PAPER_TRADING=1`。页面左上角的标识是 **PAPER**。
 
-- **行情是真的**：K 线、盘口、成交、标记价、资金费率、持仓量都直接来自 OKX 的实盘公开数据（不是 OKX 模拟盘的行情），SIGNALS 面板照常工作。
+- **行情是真的**：K 线、盘口、成交、标记价、资金费率、持仓量都直接来自 OKX 的实盘公开数据（不是 OKX 模拟盘的行情），信号页照常工作。
 - **账户是虚拟的**：订单、持仓、余额、止损单都由本机的纸面交易所（`packages/paper`，端口 9200）撮合和记账，保存在 `data/paper-account.json`。`.env` 里即使填了 OKX 的 key，这个模式下也完全不用它。
 - **撮合规则**：
   - 市价单和可以立即成交的限价单，按下单那一刻 OKX 真实盘口的前五档逐档成交，付吃单手续费（默认 0.05%）；超出前五档的部分按第五档的价格成交。
   - 挂着的限价单：对手方最优价到达委托价时，按委托价全部成交，付挂单手续费（默认 0.02%）。不模拟排队，真实交易所里可能只成交一部分。
   - 止损单：进场单完全成交后生成（和 OKX 的规则一致），真实标记价到达触发价时按当时的真实盘口市价平仓。没有止损的仓位，在持仓表的 Stop 栏点 add stop 补挂；移动和撤销在 Stops 标签页。
+  - 止盈单：可以挂单个止盈，也可以挂最多 5 档的阶梯止盈。按标记价触发，按市价平掉这一档的张数。可以设置"第一档止盈后，止损移到开仓均价"。
+  - 移动止损有两种：
+    - 交易所的回撤止损（OKX `move_order_stop`）：按最新成交价跟踪，从激活后的最高价回落设定比例时平仓。
+    - 通道止损：止损单挂在最近 N 根日线的最低价。后端在每天 UTC 0 点收盘后把它往上移，只上不下；程序没开时错过的收盘，下次启动时补上。
+  - 止盈和移动止损目前只在纸面交易和本地 mock 上开放。实盘和 OKX 模拟盘会拒绝（`EXITS_UNAVAILABLE`），要先在 OKX 模拟盘上核实交易所的真实行为。核实清单见 `docs/okx-api-notes.md` 第 6.10 节。
   - 资金费：每个结算时刻按当时持有的张数 × 合约面值 × 该时刻的标记价 × OKX 实际结算的费率，从余额里收付；每笔记在账户文件的 `funding.ledger` 里，纸面交易所的窗口里也会打印。
 - **关机期间不会漏算**：程序没开的那段时间，下次启动时用 OKX 的历史 K 线补算，补算完才开始服务，所以隔得久时启动会多等一会儿。
   - 挂着的限价单：某根 K 线的最低价跌破买单价（或最高价涨破卖单价）时，按委托价成交；只是碰到价格不算。
@@ -83,9 +100,10 @@ pnpm start --paper     # Windows 上也可以直接双击 start-paper.bat
   - 50 小时以内用 1 分钟 K 线；更久的用 5 分钟、15 分钟或 1 小时 K 线，精度相应变粗。
   - 运行中行情连接断开超过 1 分钟，恢复时同样先补算。断开期间不成交、不触发止损。
 - **强平只模拟逐仓**：标记价到达逐仓仓位的强平价时，交易所整仓强平，保证金全部损失。公式照 OKX 帮助中心，维持保证金率一律取第一档。关机期间补算时，每根标记价 K 线先检查强平。全仓仓位不会被强平。
-- **没有模拟的**：全仓强平、自动减仓（ADL）、高档位的分级强平、排队和部分成交、止盈单、币本位合约（只支持 USDT 本位永续）、现货。
+- **没有模拟的**：全仓强平、自动减仓（ADL）、高档位的分级强平、排队和部分成交、币本位合约（只支持 USDT 本位永续）、现货。
 - **初始资金**默认 100,000 USDT，只在新建账户时生效；默认杠杆 3 倍（可以在下单面板里改）。想重新开始，关掉程序后删除 `data/paper-account.json`。每次启动时上一次的文件会另存一份 `data/paper-account.json.bak`。
 - 熔断状态单独存在 `data/pegasus-state.paper.json`，不会和真实账户的混在一起。
+- 开仓记录存在 `data/journal.paper.json`。通道止损管理的是哪些仓位，记在 `data/pegasus-state.paper.trailing.json`。
 
 | 变量（写在 `.env` 里，都可以不设） | 说明 |
 | --- | --- |
@@ -106,6 +124,8 @@ pnpm start --paper     # Windows 上也可以直接双击 start-paper.bat
 pnpm start --campaign     # Windows 上也可以直接双击 start-campaign.bat
 ```
 
+**滚仓模式用自己的一组端口**：页面 http://localhost:5175，后端 8788，纸面交易所 9201。所以它可以和 `pnpm start --paper`（页面 5174）同时运行，两个页面各开一个浏览器标签。第一次打开 5175 时要再输入一次 token。端口可以用 `CAMPAIGN_WEB_PORT`、`CAMPAIGN_API_PORT`、`CAMPAIGN_PAPER_PORT` 修改。
+
 **资金池有自己的纸面账户和文件**，和 `--paper` 的账户（`data/paper-account.json`）互不影响：
 
 | 文件 | 内容 |
@@ -114,6 +134,8 @@ pnpm start --campaign     # Windows 上也可以直接双击 start-campaign.bat
 | `data/campaign-ledger.json` | 账本：资金池、每次战役、取回记录、决策日志、执行错误 |
 | `data/pegasus-state.campaign.json` | 这个账户的熔断状态 |
 | `data/campaign-replay/` | 回放用的 OKX 历史数据缓存 |
+| `data/journal.campaign.json` | 这个账户的开仓记录 |
+| `logs/campaign/` | 这个账户的日志 |
 
 **页面默认打开"滚仓"标签页**，上面有：
 
@@ -201,12 +223,14 @@ pnpm db:migrate
 | `OKX_DEMO` | `1` 模拟盘，`0` 实盘 |
 | `INSTRUMENTS` | 启动时跟踪的合约，逗号分隔，例如 `BTC-USDT-SWAP,ETH-USDT-SWAP` |
 | `DEFAULT_TD_MODE` | 默认保证金模式 `cross` / `isolated` |
-| `SIGNAL_PHASES` | SIGNALS 面板计算的日线切点（UTC 小时），`0`、`12` 或 `0,12`（默认）。每个切点按 1/n 个单位算仓位：两个切点时同一标的分两笔各半仓 |
+| `SIGNAL_PHASES` | 存档的 55 日突破框架（`GET /api/signals`、`pnpm backtest`）计算的日线切点（UTC 小时），`0`、`12` 或 `0,12`（默认）。每个切点按 1/n 个单位算仓位：两个切点时同一标的分两笔各半仓 |
 | `OKX_WS_TRADING` | 保持 `0`（用 REST 下单撤单）。设为 `1` 会被拒绝启动：OKX 已弃用 WebSocket 下单接口的 `instId` 参数，Pegasus 尚未迁移到 `instIdCode` |
 | `OKX_REST_URL` 等四个地址变量 | 只在连 mock 时需要，四个必须一起设或都不设；一般用 `--mock` 即可，不必手动设 |
 | `API_TOKEN` | 前端访问后端的共享密钥 |
 | `WEB_ORIGINS` | 允许访问后端的页面地址（逗号分隔，精确匹配），默认 `http://localhost:5174,http://127.0.0.1:5174`；只有把页面改到别的地址或端口时才需要改 |
 | `STATE_FILE` | 保存 kill switch 和当日权益基准的文件，默认 `data/pegasus-state.json`（相对项目目录） |
+| `JOURNAL_FILE` | 开仓记录文件，默认 `data/journal.json`。每笔交易从开仓到平仓一条，包括计划、成交、离场原因、盈亏和 R。启动器给每个账户单独一个：`--paper` 用 `data/journal.paper.json`，`--mock` 用 `data/journal.mock.json`，`--campaign` 用 `data/journal.campaign.json` |
+| `TRAILING_STATE_FILE` | 通道止损的设置文件，默认放在 `STATE_FILE` 旁边，并按它命名 |
 | `LOG_DIR` | 日志目录，默认 `logs`（相对项目目录），每天一个文件，保留最近 14 个 |
 | `RISK_MAX_ORDER_NOTIONAL` | 单笔最大名义（USD） |
 | `RISK_MAX_POSITION_NOTIONAL_PER_INSTRUMENT` | 单品种最大持仓名义 |
@@ -228,7 +252,7 @@ pnpm build       # 前端构建
 pnpm backtest:campaign                  # 滚仓规则的回放（--help 看全部参数）
 pnpm backtest:campaign --check packages/backtest/reference/campaigns-okx.json   # 复现研究阶段记录的 497 次战役
 pnpm backtest:campaign --reconcile data/campaign-ledger.json                     # 账本与回放逐笔对账
-pnpm backtest    # 存档的 55 日突破框架：用 SIGNALS 面板同一份信号代码回测 BTC、ETH（约两分钟；--help 看全部参数）
+pnpm backtest    # 存档的 55 日突破框架：回测 BTC、ETH（约两分钟；--help 看全部参数）
 pnpm dev:paper   # 单独运行纸面交易所（调试用；平时用 pnpm start --paper）
 ```
 
@@ -239,7 +263,8 @@ pnpm dev:paper   # 单独运行纸面交易所（调试用；平时用 pnpm star
 ## 已知限制 / 下一步
 
 - 只支持 SWAP（永续）；交割、期权、现货未接。
-- 纸面交易只模拟逐仓强平（按第一档），不模拟全仓强平、排队和止盈单。
+- 纸面交易只模拟逐仓强平（按第一档），不模拟全仓强平和排队。
+- 止盈、阶梯止盈和移动止损只在纸面交易和本地 mock 上开放，实盘和 OKX 模拟盘暂不可用。
 - 止损单只能改触发价，不能改数量（撤掉后在持仓表里用 add stop 按需要的数量重新挂）；还没成交的进场单所附带的止损不能单独改（撤单重下）。
 - 滚仓只在纸面交易上运行。实盘下单、子账户和真钱，要等纸面阶段通过、董事会再次批准之后才做。
 - 前端为桌面宽度设计。

@@ -114,17 +114,19 @@ describe('CampaignPanel', () => {
 
   const ids = (): string[] => chart.series.map((s) => s.id);
 
-  it('a disabled campaign: the status and its reason in words, no pot, and no replay or log is read', async () => {
+  it('a disabled campaign: a short note that links to the campaign stack\'s page on port 5175, and no replay or log is read', async () => {
     await render(disabledView);
     await settle();
-    expect(container.querySelector('.campaign-status')?.textContent).toBe('disabled');
+    const note = container.querySelector('.campaign-disabled');
+    expect(note?.textContent).toContain(en.campaign.disabledTitle);
+    expect(note?.textContent).toContain('pnpm start --campaign');
     expect(container.querySelector('.campaign-reason')?.textContent).toBe(en.campaign.reasons.CAMPAIGN_DISABLED);
-    expect(container.querySelector('.campaign-reason')?.getAttribute('title')).toBe(`CAMPAIGN_DISABLED: ${disabledView.reason?.message ?? ''}`);
-    // the reason says it all: no second line with the API's words
-    expect(container.querySelector('.campaign-reason-detail')).toBeNull();
-    expect(container.querySelector('.campaign-pot')?.textContent).toContain('The pot has not started.');
-    expect(container.querySelector('.campaign-next-step')?.textContent).toBe('none: the campaign is not running');
-    expect(container.querySelector('.campaign-rule')?.textContent).toContain('10 instruments · pyramid · 10× isolated longs');
+    const link = container.querySelector<HTMLAnchorElement>('a.campaign-link');
+    expect(link?.getAttribute('href')).toBe(`${window.location.protocol}//${window.location.hostname}:5175/`);
+    expect(link?.getAttribute('target')).toBe('_blank');
+    // no empty scoreboard
+    expect(container.querySelector('.campaign-status')).toBeNull();
+    expect(container.querySelector('.campaign-pot')).toBeNull();
     expect(container.querySelector('.campaign-chart')).toBeNull();
     expect(campaignReplay).not.toHaveBeenCalled();
     expect(campaignLog).not.toHaveBeenCalled();

@@ -156,7 +156,7 @@ describe('the decision log', () => {
 describe('the tab a page opens on', () => {
   it('is the campaign unless it is disabled; undecided until the status is known', () => {
     expect(defaultTab(null)).toBeNull();
-    expect(defaultTab('disabled')).toBe('positions');
+    expect(defaultTab('disabled')).toBe('signals');
     for (const status of ['blocked', 'running', 'finished'] as const) expect(defaultTab(status)).toBe('campaign');
   });
 });

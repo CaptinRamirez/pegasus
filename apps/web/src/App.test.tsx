@@ -8,10 +8,14 @@ import { LANG_KEY, useLangStore } from './i18n';
 import { TOKEN_KEY } from './lib/http';
 import { useStore } from './store/store';
 import { initialState } from './store/types';
+import { resetUi } from './store/ui';
 import { disabledView, logPage2, runningView } from './test/campaign-fixtures';
+import { journalPage } from './test/journal-fixtures';
+import { SIGNAL_INSTRUMENTS, signalsResponse } from './test/signals-fixtures';
 
 vi.mock('./hooks/useCandleChart', () => ({ useCandleChart: () => undefined }));
 vi.mock('./hooks/useLineChart', () => ({ useLineChart: () => undefined }));
+vi.mock('./hooks/useSignalChart', async (importOriginal) => ({ ...(await importOriginal<typeof import('./hooks/useSignalChart')>()), useSignalChart: () => undefined }));
 
 class FakeSocket {
   static last: FakeSocket | null = null;
@@ -103,6 +107,8 @@ function envelope(data: unknown): Response {
 
 /** What GET /api/campaign answers in a test; the API's default is a disabled campaign. */
 let campaignReply: CampaignView = disabledView;
+/** What GET /api/campaign/signals answers; null answers like an API that does not have the route. */
+let signalsReply: unknown = null;
 
 describe('App', () => {
   let root: Root;
@@ -113,8 +119,11 @@ describe('App', () => {
     vi.stubGlobal('WebSocket', FakeSocket);
     vi.stubGlobal('fetch', fetchMock);
     campaignReply = disabledView;
+    signalsReply = null;
     fetchMock.mockImplementation((input) => {
       const url = String(input);
+      if (url.startsWith('/api/campaign/signals')) return Promise.resolve(envelope(signalsReply));
+      if (url.startsWith('/api/journal')) return Promise.resolve(envelope(journalPage));
       // an API that has no replay route yet
       if (url.startsWith('/api/campaign/replay')) return Promise.resolve(new Response(JSON.stringify({ ok: false, error: { code: 'NOT_FOUND', message: 'route not found' } }), { status: 404 }));
       if (url.startsWith('/api/campaign/log')) return Promise.resolve(envelope(logPage2));
@@ -137,6 +146,7 @@ describe('App', () => {
     localStorage.clear();
     useStore.setState({ ...initialState(null) });
     useLangStore.setState({ lang: 'en' });
+    resetUi();
   });
 
   const render = async () => {
@@ -184,6 +194,7 @@ describe('App', () => {
       ws.push({ type: 'hello', data: hello });
     });
     expect(ws.sent).toContain(JSON.stringify({ type: 'subscribe', instId: 'BTC-USDT-SWAP', bar: useStore.getState().bar }));
+    await pickTab('Positions');
 
     const text = container.textContent ?? '';
     expect(text).toContain('DEMO');
@@ -259,6 +270,7 @@ describe('App', () => {
       });
     };
     const emptyTexts = (): string[] => [...container.querySelectorAll('.panel-bottom .empty, .col-right .empty')].map((el) => el.textContent ?? '');
+    await tab('Positions');
     // the page is open but the API has not said anything yet (it is still starting)
     expect(container.textContent).not.toContain('No open positions');
     expect(container.textContent).not.toContain('No balance yet');
@@ -284,6 +296,7 @@ describe('App', () => {
 
   it('a loaded flat account still reads as flat after the socket drops', async () => {
     const ws = await connect({ ...hello, positions: [] });
+    await pickTab('Positions');
     expect(container.textContent).toContain('No open positions');
     await act(async () => {
       ws.onclose?.();
@@ -313,6 +326,7 @@ describe('App', () => {
       connection: { ...hello.connection, account: { ...hello.connection.account, readOnly: true } },
       openOrders: [order],
     });
+    await pickTab('Positions');
     const why = 'Read-only API key: trading from Pegasus is disabled';
     expect(container.querySelector('.notice-warn')?.textContent).toBe(why);
     const submit = container.querySelector<HTMLButtonElement>('button.btn-buy');
@@ -343,6 +357,7 @@ describe('App', () => {
       positions: [],
       connection: { ...hello.connection, okxPrivate: 'disconnected', account: { state: 'starting', error: null, lastSyncAt: null, readOnly: false } },
     });
+    await pickTab('Positions');
     expect(container.querySelector<HTMLButtonElement>('button.btn-buy')?.disabled).toBe(true);
     expect(container.querySelector('.notice-warn')?.textContent).toContain('Account not loaded');
     expect(container.textContent).not.toContain('Reduce only');
@@ -404,6 +419,7 @@ describe('App', () => {
       ...down,
       connection: { ...hello.connection, okxPrivate: 'disconnected', account: { state: 'error', error: { code: '50111', message: 'Invalid OK-ACCESS-KEY', ts: 1 }, lastSyncAt: null, readOnly: false } },
     });
+    await pickTab('Positions');
     const banner = container.querySelector('.banner')?.textContent ?? '';
     expect(banner).toContain('OKX does not recognise the API key (OKX: [50111] Invalid OK-ACCESS-KEY)');
     expect(banner).not.toContain('API key 无效');
@@ -422,6 +438,7 @@ describe('App', () => {
   it('switches the whole page between English and Chinese from the header and remembers the choice', async () => {
     const noAccount = { state: 'error', error: { code: '50111', message: 'Invalid OK-ACCESS-KEY', ts: 1 }, lastSyncAt: null, readOnly: false } as const;
     const ws = await connect({ ...hello, account: null, balance: null, positions: [], connection: { ...hello.connection, okxPrivate: 'disconnected', account: noAccount } });
+    await pickTab('Positions');
     expect(container.textContent).toContain('Order ticket');
     expect(localStorage.getItem(LANG_KEY)).toBeNull();
 
@@ -429,7 +446,7 @@ describe('App', () => {
       button('中文')?.click();
     });
     expect(localStorage.getItem(LANG_KEY)).toBe('zh');
-    expect([...container.querySelectorAll('button.tab')].map((b) => b.textContent)).toEqual(['滚仓', '持仓', '当前委托', '止损单', '历史委托', '成交记录', '信号（已存档）']);
+    expect([...container.querySelectorAll('button.tab')].map((b) => b.textContent)).toEqual(['滚仓', '信号', '开仓记录', '持仓', '当前委托', '止损单', '历史委托', '成交记录']);
     const banner = container.querySelector('.banner')?.textContent ?? '';
     expect(banner).toContain('账户数据未更新：API key 无效（OKX: [50111] Invalid OK-ACCESS-KEY）');
     expect(banner).not.toContain('Account data is not updating');
@@ -677,32 +694,43 @@ describe('App', () => {
     expect(useStore.getState().campaign?.errorCount).toBe(3);
   });
 
-  it('opens on the positions tab while the campaign is disabled, and the campaign tab says why', async () => {
+  it('opens on the signals tab while the campaign is disabled, and the campaign tab links to the campaign stack', async () => {
     await connect(hello);
     await settleAll();
     expect(useStore.getState().campaign?.status).toBe('disabled');
-    expect(activeTab()).toBe('Positions1');
+    expect(activeTab()).toBe('Signals');
+    expect(container.querySelector('.panel-bottom-tall')).not.toBeNull();
     await pickTab('Campaign');
-    expect(container.querySelector('.campaign-status')?.textContent).toBe('disabled');
+    expect(container.querySelector('.campaign-disabled')?.textContent).toContain('pnpm start --campaign');
     expect(container.querySelector('.campaign-reason')?.textContent).toContain('CAMPAIGN_ENABLED=1');
+    expect(container.querySelector('a.campaign-link')?.getAttribute('href')).toMatch(/:5175\/$/);
   });
 
-  it('the Signals tab is labelled as the archived 55-day breakout framework', async () => {
-    await connect(hello);
-    const signals = [...container.querySelectorAll<HTMLButtonElement>('button.tab')].find((b) => b.textContent === 'Signals (archived)');
-    expect(signals?.title).toContain('archived 55-day breakout framework');
-    expect(signals?.title).toContain('docs/archive/strategy-breakout.md');
-    await pickTab('Signals');
-    expect(container.querySelector('.signals-archived')?.textContent).toBe(
-      'Archived: the 55-day breakout framework, docs/archive/strategy-breakout.md. The current framework is the campaign rule (CAMPAIGN tab).',
+  it('the Signals tab reads the campaign rule coin by coin, actionable coins first; the Journal tab lists every trade', async () => {
+    signalsReply = signalsResponse;
+    await connect({ ...hello, instruments: SIGNAL_INSTRUMENTS });
+    await settleAll();
+    const signals = [...container.querySelectorAll<HTMLButtonElement>('button.tab')].find((b) => b.textContent === 'Signals');
+    expect(signals?.title).toContain('campaign rule');
+    expect(container.textContent).not.toContain('archived');
+    const coins = [...container.querySelectorAll('.sig-coin .sig-coin-name')].map((el) => el.textContent);
+    expect(coins).toEqual(['BTC', 'ADA', 'ETH', 'LTC', 'XRP', 'TRX', 'BCH', 'ETC', 'DOT', 'LINK']);
+    expect(container.querySelector('.sig-headline')?.textContent).toBe('Entry signal: open a long');
+    expect(container.querySelector('.sig-sentence')?.textContent).toBe(
+      'BTC closed the day above its 20-day high 63,250 (close 64,120). Rule: long; exit on a daily close below the 10-day low 58,900.',
     );
     await act(async () => useLangStore.getState().setLang('zh'));
-    expect(container.querySelector('button.tab.active')?.textContent).toBe('信号（已存档）');
-    expect(container.querySelector('.signals-archived')?.textContent).toContain('55 日突破框架，见 docs/archive/strategy-breakout.md');
+    expect(container.querySelector('button.tab.active')?.textContent).toBe('信号');
+    expect(container.querySelector('.sig-sentence')?.textContent).toBe('BTC 日线收在 20 日高点 63,250 之上（收盘 64,120）。规则：做多，日线跌破 10 日低点 58,900 离场。');
+    await pickTab('开仓记录');
+    await settleAll();
+    expect(container.querySelectorAll('tr.jr-row')).toHaveLength(4);
+    expect([...container.querySelectorAll('tr.jr-row .jr-badge[class*="jr-source"]')].map((el) => el.textContent)).toEqual(['按信号', '手动', '滚仓', '外部']);
   });
 
   it('labels account data with its time once the last sync is older than 90 s', async () => {
     const ws = await connect(hello);
+    await pickTab('Positions');
     expect(container.textContent).not.toContain('as of');
     const old = new Date(Date.now() - 200_000);
     await act(async () => {

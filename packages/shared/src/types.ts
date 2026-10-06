@@ -203,10 +203,36 @@ export interface AlgoOrder {
   slTriggerPxType: TriggerPxType | '';
   /** '-1': executed at market; otherwise the limit price of the closing order */
   slOrdPx: string;
-  /** Take-profit trigger price; '' when none (Pegasus itself only places stops) */
+  /** Take-profit trigger price; '' when none */
   tpTriggerPx: string;
+  /** The OKX algo order type when it is not a one-way (`conditional`) order: `oco` (take-profit and stop-loss), `move_order_stop` (a trailing stop) */
+  ordType?: 'oco' | 'move_order_stop';
+  /** Which price triggers the take-profit; present with a take-profit */
+  tpTriggerPxType?: TriggerPxType;
+  /** Trailing stop: the callback ratio ('0.05' is 5%) */
+  callbackRatio?: string;
+  /** Trailing stop: the callback as a price distance */
+  callbackSpread?: string;
+  /** Trailing stop: the price that activates it; absent when it trailed from its placement */
+  activePx?: string;
+  /** Trailing stop: the price it triggers at now; '' before it is active */
+  moveTriggerPx?: string;
+  /** The stop-loss of split take-profits moves to the entry price when the first take-profit triggers (the cost-price stop) */
+  amendPxOnTriggerType?: true;
   cTime: number;
   uTime: number;
+}
+
+/** One take-profit leg of an order as the server sizes it (OrderPreview.takeProfits). */
+export interface TakeProfitLegPreview {
+  /** The trigger, rounded to the tick towards the entry */
+  triggerPx: string;
+  /** The fraction asked for */
+  fraction: string;
+  /** Contracts it closes: whole lots of the order's size; the last leg takes what the others leave */
+  sz: string;
+  /** Quote-currency profit if the leg fills at its trigger, measured from refPrice */
+  profitQuote: string;
 }
 
 /** The algo orders as last read from the exchange. They are read over REST: on every account reconcile, shortly after a fill, a cancel or a position change, and on request. */
@@ -431,6 +457,8 @@ export interface OrderPreview {
   slTriggerPx: string;
   /** Quote-currency loss if the stop fills at its trigger with `sz`, measured from refPrice; '' when there is no stop */
   stopLossQuote: string;
+  /** The take-profit legs attached to the order, sized; absent without takeProfits */
+  takeProfits?: TakeProfitLegPreview[];
   /** ok=false means the order would be rejected */
   risk: RiskCheckResult;
 }

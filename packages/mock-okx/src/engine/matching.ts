@@ -3,8 +3,11 @@ import type { OkxAlgoAck, OkxExecType, OkxFill, OkxOrderAck, OkxPosition, OkxRes
 import type { WalkFill } from './book.js';
 import { isRejection, reject, type EngineContext, type Market, type Rejection } from './context.js';
 import type { PositionRec } from './account.js';
-import { orderToWire, type OrderRec, type StopRec } from './orders.js';
+import { orderToWire, trailingTrigger, type AlgoLeg, type OrderRec, type StopRec } from './orders.js';
 import { asRecord, str, validateAmend, validateAmendAlgo, validatePlace, validatePlaceAlgo } from './validate.js';
+
+/** Whether the order carries anything in attachAlgoOrds. */
+const hasAttached = (o: OrderRec): boolean => o.attachSl !== null || o.attachTps.length > 0;
 
 /** OKX `cancelSource` codes. */
 const CANCEL_USER = '1';
@@ -86,9 +89,9 @@ export class Matcher {
       affected = outcome.position;
       this.ctx.emit('order', orderToWire(order, true));
     }
-    // OKX generates the attached stop only once the parent order is completely filled, for the whole order: a
-    // partially filled order that is still resting has no stop.
-    if (order.state === 'filled' && order.attachSl) this.ctx.orders.addStop(order, order.attachSl, now);
+    // OKX generates the attached orders only once the parent order is completely filled, for the whole order: a
+    // partially filled order that is still resting has no stop and no take-profit.
+    if (order.state === 'filled' && hasAttached(order)) this.ctx.orders.addAttached(order, now, false);
     if (fills.length > 0) {
       this.ctx.emit('trades', { instId: order.instId, trades });
       const push = market.book.delta(now);
@@ -170,9 +173,9 @@ export class Matcher {
     this.ctx.orders.finish(order);
     // Unverified: OKX documents only that a parent cancelled before any fill generates no stop. The simulator reads
     // that as "a parent cancelled after a partial fill generates the stop for what has filled"; whether the exchange
-    // does so is to be confirmed on demo trading.
-    if (order.attachSl && order.accFillSz.gt(0)) {
-      this.ctx.orders.addStop(order, order.attachSl, order.uTime);
+    // does so is to be confirmed on demo trading. Split take-profits generate nothing then (OrderStore.addAttached).
+    if (hasAttached(order) && order.accFillSz.gt(0)) {
+      this.ctx.orders.addAttached(order, order.uTime, true);
       this.dropOrphanStops(order.instId);
     }
     this.ctx.emit('order', orderToWire(order, false));
@@ -219,7 +222,7 @@ export class Matcher {
     return this.ack(order, { reqId });
   }
 
-  /** Places a stop-loss on its own for an open position (POST /api/v5/trade/order-algo). */
+  /** Places an algo order on its own for an open position (POST /api/v5/trade/order-algo): a TP/SL or a trailing stop. */
   placeAlgoRequest(body: unknown): OkxAlgoAck {
     const v = validatePlaceAlgo(body, this.ctx);
     if (isRejection(v)) {
@@ -249,7 +252,7 @@ export class Matcher {
     return { algoId: stop.algoId, algoClOrdId: stop.algoClOrdId, sCode: '0', sMsg: '' };
   }
 
-  /** Amends one active stop (POST /api/v5/trade/amend-algos); the new trigger is checked against the price at once. */
+  /** Amends one active TP/SL order (POST /api/v5/trade/amend-algos); the new triggers are checked against the price at once. */
   amendAlgoRequest(body: unknown): OkxAlgoAck {
     const v = validateAmendAlgo(body, this.ctx);
     if (isRejection(v)) {
@@ -260,6 +263,8 @@ export class Matcher {
     if (v.newSlTriggerPx) stop.slTriggerPx = v.newSlTriggerPx;
     if (v.newSlOrdPx) stop.slOrdPx = v.newSlOrdPx;
     if (v.newSlTriggerPxType) stop.slTriggerPxType = v.newSlTriggerPxType;
+    if (v.newTpTriggerPx) stop.tpTriggerPx = v.newTpTriggerPx;
+    if (v.newTpOrdPx) stop.tpOrdPx = v.newTpOrdPx;
     if (v.newSz) stop.sz = v.newSz;
     stop.uTime = this.ctx.now();
     return { algoId: stop.algoId, algoClOrdId: stop.algoClOrdId, reqId: v.reqId, sCode: '0', sMsg: '' };
@@ -342,6 +347,7 @@ export class Matcher {
       amendResult: '',
       reqId: '',
       attachSl: null,
+      attachTps: [],
       category: 'full_liquidation',
     };
     const fill = this.fillWire(order, markPx, '');
@@ -361,38 +367,86 @@ export class Matcher {
   }
 
   /**
-   * A stop is dropped when its position is gone. Unverified: OKX does not document whether it cancels an attached
-   * stop once the position is closed (docs/okx-api-notes.md 12, item 31); the simulator drops it.
+   * An algo order with cxlOnClosePos is dropped when its position is gone (OKX: "the TP/SL order will be canceled
+   * when the position is fully closed"); one without stays (OKX: "will not be affected"), and so does a trailing
+   * stop, which has no such flag. Unverified: OKX does not document what becomes of the orders generated from
+   * attachAlgoOrds once the position is closed (docs/okx-api-notes.md 12, item 31); the simulator drops them.
    */
   private dropOrphanStops(instId: string): void {
-    for (const stop of this.ctx.orders.activeStops(instId)) if (!this.stopPosition(stop)) this.ctx.orders.removeStop(stop);
+    for (const stop of this.ctx.orders.activeStops(instId)) if (stop.cxlOnClosePos && !this.stopPosition(stop)) this.ctx.orders.removeStop(stop);
   }
 
   /**
-   * Triggers the active stops whose trigger price type has reached the trigger: the mark price for 'mark' (and
-   * 'index', which the simulator does not model apart), the latest print for 'last'. A triggered stop closes its
-   * size, at most the position, with a reduce-only market order, and is removed once that order is accepted.
+   * Triggers the active algo orders the market has reached: a stop-loss or take-profit leg on the price its trigger
+   * type names (the mark price for 'mark' and 'index', which the simulator does not model apart; the latest print for
+   * 'last'), a trailing stop on the latest print. A triggered order closes its size, at most the position, with a
+   * reduce-only market order, and is removed once that order is accepted. Of an oco order the stop-loss is looked at
+   * first. An order that has not triggered and whose position is gone is dropped when it has cxlOnClosePos.
    */
   checkStops(instId: string): void {
     const market = this.ctx.markets.get(instId);
     if (!market) return;
     for (const stop of this.ctx.orders.activeStops(instId)) {
-      const px = stop.slTriggerPxType === 'last' ? market.lastPx : market.markPx;
-      // A market that has no price yet (zero) triggers nothing.
-      if (px.lte(0) || (stop.side === 'sell' ? px.gt(stop.slTriggerPx) : px.lt(stop.slTriggerPx))) {
-        if (!this.stopPosition(stop)) this.ctx.orders.removeStop(stop);
+      // A close earlier in this loop may have ended it (its position, or the oco order it belonged to).
+      if (!this.ctx.orders.hasStop(stop.algoId)) continue;
+      const leg = this.triggeredLeg(stop, market);
+      if (leg === null) {
+        if (stop.cxlOnClosePos && !this.stopPosition(stop)) this.ctx.orders.removeStop(stop);
         continue;
       }
-      this.fireStop(stop);
+      this.fireStop(stop, undefined, leg);
     }
   }
 
+  /** The leg of an algo order the market has reached now, if any. A trailing stop is moved along (and activated) first. */
+  private triggeredLeg(stop: StopRec, market: Market): AlgoLeg | null {
+    if (stop.ordType === 'move_order_stop') return this.trail(stop, market.lastPx) ? 'trail' : null;
+    const sells = stop.side === 'sell';
+    const priceOf = (type: StopRec['slTriggerPxType']): Dec => (type === 'last' ? market.lastPx : market.markPx);
+    // A market that has no price yet (zero) triggers nothing.
+    if (stop.slTriggerPx) {
+      const px = priceOf(stop.slTriggerPxType);
+      if (px.gt(0) && (sells ? px.lte(stop.slTriggerPx) : px.gte(stop.slTriggerPx))) return 'sl';
+    }
+    if (stop.tpTriggerPx) {
+      const px = priceOf(stop.tpTriggerPxType);
+      if (px.gt(0) && (sells ? px.gte(stop.tpTriggerPx) : px.lte(stop.tpTriggerPx))) return 'tp';
+    }
+    return null;
+  }
+
   /**
-   * Sends the closing order of a triggered stop: its size, at most the position, as a reduce-only market order
-   * (filled at `fillPx` when given, see place). The stop is removed once that order is accepted, or when its
-   * position is gone; returns whether it closed anything.
+   * Moves a trailing stop along with the latest print and says whether that print has reached its trigger. The help
+   * center's rules: it is activated once the latest price reaches the activation price (at once without one); from
+   * then on it keeps the highest price (a stop that sells; the lowest, one that buys) and triggers when the latest
+   * price is at or below highest x (1 - callbackRatio) (at or above lowest x (1 + callbackRatio); or the extreme less
+   * or plus callbackSpread).
    */
-  fireStop(stop: StopRec, fillPx?: Dec): boolean {
+  trail(stop: StopRec, px: Dec): boolean {
+    if (px.lte(0)) return false;
+    const sells = stop.side === 'sell';
+    if (stop.extremePx === null) {
+      if (stop.activePx !== null && (sells ? px.lt(stop.activePx) : px.gt(stop.activePx))) return false;
+      stop.extremePx = px;
+      stop.uTime = this.ctx.now();
+      return false;
+    }
+    if (sells ? px.gt(stop.extremePx) : px.lt(stop.extremePx)) {
+      stop.extremePx = px;
+      stop.uTime = this.ctx.now();
+    }
+    const trigger = trailingTrigger(stop);
+    return trigger !== null && (sells ? px.lte(trigger) : px.gte(trigger));
+  }
+
+  /**
+   * Sends the closing order of a triggered algo order: its size, at most the position, as a reduce-only market order
+   * (filled at `fillPx` when given, see place). The order is removed once that order is accepted; when its position
+   * is gone the trigger fails (OKX: order_failed) and the order ends without closing anything. Returns whether it
+   * closed anything. The first take-profit leg of split take-profits that closes moves the cost-price stop of the
+   * same order to the order's average fill price.
+   */
+  fireStop(stop: StopRec, fillPx?: Dec, leg: AlgoLeg = 'sl'): boolean {
     const position = this.stopPosition(stop);
     if (!position) {
       this.ctx.orders.removeStop(stop);
@@ -407,11 +461,32 @@ export class Matcher {
       reduceOnly: true,
     };
     if (stop.posSide !== 'net') params['posSide'] = stop.posSide;
-    // A refused close leaves the position unprotected: the stop stays active (and visible in the state) and is
-    // tried again on the next price, instead of vanishing as if it had fired.
-    if (this.place(params, fillPx).sCode !== '0') return false;
+    // Removed before the close is sent, so that the close cannot find it again (an oco order ends with either leg);
+    // put back when the close is refused: the position must not be left unprotected, and it is tried again on the
+    // next price instead of vanishing as if it had fired.
     this.ctx.orders.removeStop(stop);
+    if (this.place(params, fillPx).sCode !== '0') {
+      if (this.stopPosition(stop)) this.ctx.orders.addStandaloneStop(stop);
+      return false;
+    }
+    if (leg === 'tp') this.afterTakeProfit(stop);
     return true;
+  }
+
+  /**
+   * The cost-price stop (amendPxOnTriggerType '1' on the stop-loss of split take-profits): "Whether slTriggerPx will
+   * move to avgPx when the first TP order is triggered". The stop-loss of the take-profit's order moves to that
+   * order's average fill price, once, wherever it was.
+   */
+  private afterTakeProfit(tp: StopRec): void {
+    if (tp.ordId === '') return;
+    const now = this.ctx.now();
+    for (const s of this.ctx.orders.activeStops(tp.instId)) {
+      if (s.ordId !== tp.ordId || !s.amendPxOnTriggerType || s.slTriggerPx === null || s.costPx === null) continue;
+      s.slTriggerPx = s.costPx;
+      s.amendPxOnTriggerType = false;
+      s.uTime = now;
+    }
   }
 
   closePosition(body: unknown): ClosePositionResult {

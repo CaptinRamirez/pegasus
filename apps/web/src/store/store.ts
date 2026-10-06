@@ -1,9 +1,9 @@
 import { create } from 'zustand';
-import type { AlgoOrderList, CampaignView, CandleBar, Fill, InstId, Instrument, Localized, Order, RiskState, ServerMessage } from '@pegasus/shared';
+import type { AlgoOrderList, CampaignView, CandleBar, Fill, InstId, Instrument, Localized, Order, RiskState, ServerMessage, Side } from '@pegasus/shared';
 import { readStoredToken, writeStoredToken } from '../lib/http';
 import type { WsStatus } from '../lib/ws';
 import { applyAlgoOrders, applyCampaign, applyOrderHistorySeed, applyRiskReply, applyServerMessage, applyWsStatus, mergeFills, pushToast, stampMessage } from './reducers';
-import { emptyMarket, initialState, type MarketData, type TerminalState, type TicketPrefillInput, type ToastKind } from './types';
+import { emptyMarket, initialState, type MarketData, type TerminalState, type TicketPrefillInput, type ToastKind, type ToastLink } from './types';
 
 export interface TerminalActions {
   setToken: (token: string | null) => void;
@@ -17,14 +17,16 @@ export interface TerminalActions {
   setWsStatus: (status: WsStatus) => void;
   selectInstrument: (instId: InstId) => void;
   setBar: (bar: CandleBar) => void;
-  /** A plain message is shown as it is; one given in both languages follows the language of the page. */
-  pushToast: (kind: ToastKind, message: string | Localized) => void;
+  /** A plain message is shown as it is; one given in both languages follows the language of the page. `link` is shown under it. */
+  pushToast: (kind: ToastKind, message: string | Localized, link?: ToastLink) => void;
   dismissToast: (id: number) => void;
   seedOrderHistory: (orders: Order[]) => void;
   seedFills: (fills: Fill[]) => void;
   setTicketPrice: (px: string) => void;
   /** Selects the prefill's instrument and hands the whole ticket to the order form. */
   applyTicketPrefill: (prefill: TicketPrefillInput) => void;
+  /** Selects the instrument, puts the side into the order ticket and focuses it; nothing else is filled. */
+  focusTicket: (instId: InstId, side: Side) => void;
   reset: () => void;
 }
 
@@ -53,7 +55,7 @@ export const useStore = create<TerminalStore>()((set, get) => ({
     for (const [id, m] of Object.entries(get().market)) market[id] = { ...m, candles: {} };
     set({ bar, market });
   },
-  pushToast: (kind, message) => set((s) => pushToast(s, kind, message)),
+  pushToast: (kind, message, link) => set((s) => pushToast(s, kind, message, false, link)),
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
   seedOrderHistory: (orders) => set((s) => applyOrderHistorySeed(s, orders, Date.now())),
   seedFills: (fills) => set((s) => ({ fills: mergeFills(s.fills, fills) })),
@@ -63,6 +65,13 @@ export const useStore = create<TerminalStore>()((set, get) => ({
       selectedInstId: prefill.instId,
       ticketPrice: null,
       ticketPrefill: { ...prefill, nonce: (s.ticketPrefill?.nonce ?? 0) + 1 },
+    })),
+  focusTicket: (instId, side) =>
+    set((s) => ({
+      selectedInstId: instId,
+      ticketPrice: null,
+      ticketPrefill: null,
+      ticketFocus: { instId, side, nonce: (s.ticketFocus?.nonce ?? 0) + 1 },
     })),
   reset: () => set({ ...initialState(get().token) }),
 }));

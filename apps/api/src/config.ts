@@ -50,6 +50,8 @@ const envSchema = z.object({
   STATE_FILE: z.string().min(1).default('data/pegasus-state.json'),
   /** Directory of the dated log files; relative paths are under the repository root. */
   LOG_DIR: z.string().min(1).default('logs'),
+  /** The trade journal (services/journal.ts), kept in this file whichever store the API uses; relative paths are under the repository root. */
+  JOURNAL_FILE: z.string().min(1).default('data/journal.json'),
   /** The commit the stack was started from; set by the launcher. */
   PEGASUS_VERSION: z.string().min(1).default('unknown'),
 
@@ -74,7 +76,35 @@ const envSchema = z.object({
   CAMPAIGN_STRUCTURE: z.enum(['pyramid', 'noadd']).default(DEFAULT_CAMPAIGN_PARAMS.structure),
   /** The campaign's ledger (the pot, its campaigns, the decision log); relative paths are under the repository root. */
   CAMPAIGN_STATE_FILE: z.string().min(1).default('data/campaign-ledger.json'),
+  /**
+   * Where channel trailing keeps the positions it manages and the trailing exits waiting for their order to fill;
+   * relative paths are under the repository root. Default: next to STATE_FILE, named after it (`<STATE_FILE>.trailing.json`
+   * without the first `.json`), so that the paper, the campaign and the mock accounts each keep their own.
+   */
+  TRAILING_STATE_FILE: z.string().default(''),
 });
+
+/** The exit orders of this stage, take-profits, the cost-price stop and trailing stops: paper trading and the local mock only. */
+export interface ExitsConfig {
+  /**
+   * True only where nothing can reach an OKX account: paper trading (the paper exchange) or a mock exchange on this
+   * machine (all four OKX_*_URL overrides on a loopback host). Elsewhere the requests that use them are refused with
+   * EXITS_UNAVAILABLE and the trailing stops are not read.
+   */
+  enabled: boolean;
+  /** Absolute path of TRAILING_STATE_FILE */
+  stateFile: string;
+}
+
+/** Whether a URL names this machine. */
+function isLoopback(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === 'localhost' || host === '[::1]' || host === '::1' || /^127(\.\d{1,3}){3}$/.test(host);
+  } catch {
+    return false;
+  }
+}
 
 export interface CampaignConfig {
   enabled: boolean;
@@ -131,11 +161,15 @@ export interface AppConfig {
   stateFile: string;
   /** Absolute path of the directory the dated log files go to. */
   logDir: string;
+  /** Absolute path of the trade journal's file (JOURNAL_FILE). */
+  journalFile: string;
   /** Short commit hash the stack was started from, or 'unknown'. */
   version: string;
   risk: RiskConfig;
   /** The campaign rule; `enabled` only ever in paper trading. */
   campaign: CampaignConfig;
+  /** Take-profits, the cost-price stop and trailing stops; `enabled` only in paper trading and against a local mock. */
+  exits: ExitsConfig;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -191,8 +225,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       throw new Error(`invalid configuration: CAMPAIGN_MIN_STAKE ${e.CAMPAIGN_MIN_STAKE} is more than CAMPAIGN_POT_START ${e.CAMPAIGN_POT_START}: the pot could never open a campaign`);
     }
   }
-  // The campaign's instruments are tracked like the terminal's own: market data, the instrument list, positions.
-  const instruments = campaignEnabled ? [...new Set([...ownInstruments, ...campaignInstruments])] : ownInstruments;
+  // The campaign's instruments are tracked like the terminal's own (market data, the instrument list, positions)
+  // whenever the market data is OKX's (live, demo, paper): the signals page shows the campaign rule on them, and
+  // following a signal needs them tracked. A local mock (endpoints overridden) lists only its own instruments.
+  const instruments = campaignEnabled || !overridden ? [...new Set([...ownInstruments, ...campaignInstruments])] : ownInstruments;
   const phaseNames = e.SIGNAL_PHASES.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
   const unknownPhases = phaseNames.filter((s) => !SIGNAL_PHASE_HOURS.some((h) => String(h) === s));
   if (phaseNames.length === 0 || unknownPhases.length > 0) {
@@ -207,6 +243,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     endpoints.restPrivate = base.origin;
     endpoints.wsPrivate = `${base.protocol === 'https:' ? 'wss' : 'ws'}://${base.host}/ws/v5/private`;
   }
+  // The exits of this stage never reach an OKX account: the paper exchange, or a mock on this machine.
+  const exitsEnabled = paper || (overridden && ENDPOINT_OVERRIDES.every((name) => isLoopback(e[name])));
+  const stateFile = resolve(REPO_ROOT, e.STATE_FILE);
+  const trailingFile = e.TRAILING_STATE_FILE !== '' ? resolve(REPO_ROOT, e.TRAILING_STATE_FILE) : `${stateFile.replace(/\.json$/i, '')}.trailing.json`;
   return {
     okx: {
       credentials,
@@ -221,8 +261,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     signalPhases,
     defaultTdMode: e.DEFAULT_TD_MODE,
     databaseUrl: e.DATABASE_URL,
-    stateFile: resolve(REPO_ROOT, e.STATE_FILE),
+    stateFile,
     logDir: resolve(REPO_ROOT, e.LOG_DIR),
+    journalFile: resolve(REPO_ROOT, e.JOURNAL_FILE),
     version: e.PEGASUS_VERSION,
     risk: {
       maxOrderNotional: e.RISK_MAX_ORDER_NOTIONAL,
@@ -245,5 +286,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       stateFile: resolve(REPO_ROOT, e.CAMPAIGN_STATE_FILE),
       replayCacheDir: resolve(REPO_ROOT, 'data', 'campaign-replay'),
     },
+    exits: { enabled: exitsEnabled, stateFile: trailingFile },
   };
 }
