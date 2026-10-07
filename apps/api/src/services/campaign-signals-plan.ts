@@ -44,13 +44,18 @@ import {
  * line (the lowest low of the last exitChannel confirmed daily bars: what the next daily close is measured against,
  * and where the channel trailing exit keeps the stop), the channel trailing exit over exitChannel bars and no
  * take-profit. Size: riskPct of the equity lost from the mark to the stop, in whole lots rounded down, at least the
- * minimum order (BELOW_MIN_ORDER when that risks more). Leverage, for an entry: the highest whole number up to the
- * campaign's leverage, RISK_MAX_LEVERAGE and the instrument's maximum that keeps the estimated isolated liquidation
- * price (isolatedLongLiquidationPrice with campaignMaintenanceRate: the first tier plus the taker fee; the margin is
- * notional / leverage) at or below the stop x (1 - LIQ_BUFFER_PCT); 1x always does. For an add, the position's own
- * leverage setting (an add to an isolated position posts notional / setting) and the position after the add is
- * estimated the same way (LIQUIDATION_NEAR_STOP when it would not stay below the stop with the buffer). Linear
- * contracts only.
+ * minimum order (BELOW_MIN_ORDER when that risks more): `riskContracts`. Then no more than the risk limits allow
+ * (`contracts`): the per-order notional, the coin's position limit less what is held on it and the total limit less
+ * what is held, each contract valued at the mark plus the slippage the engine tolerates (RISK_MAX_SLIPPAGE_PCT: the
+ * engine values a market buy at its estimated fill, and refuses one that slips more), in whole lots (LIMITED_BY_*
+ * says which limit cut the size); when even the minimum order breaks a limit the plan has no size (OVER_*).
+ * Leverage, for an entry: the highest whole number up to the campaign's leverage, RISK_MAX_LEVERAGE and the
+ * instrument's maximum that keeps the estimated isolated liquidation price (isolatedLongLiquidationPrice with
+ * campaignMaintenanceRate: the first tier plus the taker fee; the margin is notional / leverage) at or below the
+ * stop x (1 - LIQ_BUFFER_PCT); 1x always does (LEVERAGE_REDUCED names both liquidation prices). For an add, the
+ * position's own leverage setting (an add to an isolated position posts notional / setting) and the position after
+ * the add is estimated the same way (LIQUIDATION_NEAR_STOP when it would not stay below the stop with the buffer).
+ * Linear contracts only.
  */
 
 /** A coin whose mark is at most this far below the next entry level is near an entry. */
@@ -208,16 +213,30 @@ export interface PlanInput {
   killSwitch: boolean;
 }
 
-/** The highest whole leverage up to `cap` whose estimated isolated liquidation stays at or below stop x (1 - LIQ_BUFFER_PCT); 1 at least. */
-export function followLeverage(entryPx: Decimal, stopPx: Decimal, cap: number, maintenance: string): { leverage: number; liqPx: Decimal } {
-  const limit = stopPx.mul(D(1).minus(LIQ_BUFFER_PCT));
-  for (let lever = Math.max(1, cap); lever >= 1; lever--) {
-    // The liquidation price does not depend on the size: one unit of coin at the entry, its margin entry / lever.
-    const liqPx = isolatedLongLiquidationPrice({ qty: 1, avgPx: entryPx, margin: entryPx.div(lever) }, maintenance);
-    if (liqPx.lte(limit) || lever === 1) return { leverage: lever, liqPx: Decimal.max(liqPx, ZERO) };
+/** The estimated isolated liquidation of a long at `entryPx` with `lever`: it does not depend on the size, so one unit of coin, its margin entry / lever. */
+const liquidationAt = (entryPx: Decimal, lever: number, maintenance: string): Decimal =>
+  Decimal.max(isolatedLongLiquidationPrice({ qty: 1, avgPx: entryPx, margin: entryPx.div(lever) }, maintenance), ZERO);
+
+/** The line the estimated liquidation must stay at or below: the stop less LIQ_BUFFER_PCT of it. */
+const liquidationLimit = (stopPx: Decimal): Decimal => stopPx.mul(D(1).minus(LIQ_BUFFER_PCT));
+
+/**
+ * The highest whole leverage up to `cap` whose estimated isolated liquidation stays at or below stop x (1 - LIQ_BUFFER_PCT); 1 at
+ * least. `liqPxAtCap` is the liquidation at `cap` itself, the one a reduced leverage is explained by.
+ */
+export function followLeverage(entryPx: Decimal, stopPx: Decimal, cap: number, maintenance: string): { leverage: number; liqPx: Decimal; liqPxAtCap: Decimal } {
+  const limit = liquidationLimit(stopPx);
+  const top = Math.max(1, cap);
+  const liqPxAtCap = liquidationAt(entryPx, top, maintenance);
+  for (let lever = top; lever >= 1; lever--) {
+    const liqPx = lever === top ? liqPxAtCap : liquidationAt(entryPx, lever, maintenance);
+    if (liqPx.lte(limit) || lever === 1) return { leverage: lever, liqPx, liqPxAtCap };
   }
-  return { leverage: 1, liqPx: ZERO };
+  return { leverage: 1, liqPx: ZERO, liqPxAtCap };
 }
+
+/** The size a risk limit leaves room for: `room` of notional over a contract valued at `perContract`, in whole lots, never negative. */
+const roomContracts = (room: Decimal, perContract: Decimal, inst: Instrument): Decimal => Decimal.max(floorToStep(room.div(perContract), inst.lotSz), ZERO);
 
 /** How to follow an entry or an add by hand (see the header). */
 export function planCampaignFollow(input: PlanInput): CampaignFollowPlan {
@@ -234,12 +253,14 @@ export function planCampaignFollow(input: PlanInput): CampaignFollowPlan {
     instId: inst.instId,
     side: 'buy',
     tdMode: 'isolated',
+    spec: inst,
     entryPx: entry.toFixed(),
     stopPx: stop.toFixed(),
     stopDistance: stopDistance.toFixed(),
     stopDistancePct: fine(stopDistancePct),
     riskTarget: null,
     riskAmount: null,
+    riskContracts: null,
     contracts: null,
     coin: null,
     notional: null,
@@ -283,7 +304,12 @@ export function planCampaignFollow(input: PlanInput): CampaignFollowPlan {
     leverage = chosen.leverage;
     plan.leverage = String(chosen.leverage);
     plan.liqPx = fine(chosen.liqPx);
-    if (chosen.leverage < cap) warnings.push({ code: 'LEVERAGE_REDUCED', params: { leverage: chosen.leverage, maxLeverage: cap } });
+    if (chosen.leverage < cap) {
+      warnings.push({
+        code: 'LEVERAGE_REDUCED',
+        params: { leverage: chosen.leverage, maxLeverage: cap, liqPx: fine(chosen.liqPx), liqPxAtMax: fine(chosen.liqPxAtCap), stopPx: stop.toFixed(), limitPx: fine(liquidationLimit(stop)) },
+      });
+    }
   }
 
   const equity = input.equity !== null && D(input.equity).gt(0) ? D(input.equity) : null;
@@ -299,10 +325,47 @@ export function planCampaignFollow(input: PlanInput): CampaignFollowPlan {
     contracts = D(inst.minSz);
     warnings.push({ code: 'BELOW_MIN_ORDER', params: { sized: sized.toFixed(), minSz: inst.minSz, riskAmount: fine(contracts.mul(riskPerContract)) } });
   }
+  plan.riskTarget = fine(riskTarget);
+  plan.riskContracts = contracts.toFixed();
+
+  // The risk limits, as the engine checks an opening order: each contract valued at the mark plus the slippage it tolerates.
+  const risk = input.risk;
+  const valued = notionalQuote(1, entry, inst).mul(D(1).plus(risk.maxSlippagePct));
+  const rooms = [
+    { code: 'ORDER_NOTIONAL', limit: risk.maxOrderNotional, held: ZERO, room: roomContracts(D(risk.maxOrderNotional), valued, inst) },
+    { code: 'POSITION_NOTIONAL', limit: risk.maxPositionNotionalPerInstrument, held: D(input.instrumentNotional), room: roomContracts(D(risk.maxPositionNotionalPerInstrument).minus(input.instrumentNotional), valued, inst) },
+    { code: 'TOTAL_NOTIONAL', limit: risk.maxTotalPositionNotional, held: D(input.totalNotional), room: roomContracts(D(risk.maxTotalPositionNotional).minus(input.totalNotional), valued, inst) },
+  ] as const;
+  let tightest: (typeof rooms)[number] = rooms[0];
+  for (const r of rooms) if (r.room.lt(tightest.room)) tightest = r;
+  if (tightest.room.lt(inst.minSz)) {
+    // not even the minimum order passes: no size, as without a stop (so the plan does not hold the minimum: BELOW_MIN_ORDER goes);
+    // the minimum order counted as the room was, each contract at the mark plus the slippage
+    const minNotional = valued.mul(inst.minSz);
+    const params = tightest.code === 'ORDER_NOTIONAL' ? { notional: fine(minNotional), limit: tightest.limit } : { projected: fine(tightest.held.plus(minNotional)), limit: tightest.limit };
+    const below = warnings.findIndex((w) => w.code === 'BELOW_MIN_ORDER');
+    if (below >= 0) warnings.splice(below, 1);
+    warnings.push({ code: `OVER_${tightest.code}`, params });
+    return plan;
+  }
+  if (tightest.room.lt(contracts)) {
+    contracts = tightest.room;
+    warnings.push({
+      code: `LIMITED_BY_${tightest.code}`,
+      params: {
+        riskContracts: plan.riskContracts,
+        contracts: contracts.toFixed(),
+        notional: fine(notionalQuote(contracts, entry, inst)),
+        limit: tightest.limit,
+        riskAmount: fine(contracts.mul(riskPerContract)),
+        perContract: fine(valued),
+        slippagePct: risk.maxSlippagePct,
+      },
+    });
+  }
   const coin = contractsToCoin(contracts, inst);
   const notional = notionalQuote(contracts, entry, inst);
   const margin = notional.div(leverage);
-  plan.riskTarget = fine(riskTarget);
   plan.riskAmount = fine(contracts.mul(riskPerContract));
   plan.contracts = contracts.toFixed();
   plan.coin = coin.toFixed();
@@ -320,13 +383,9 @@ export function planCampaignFollow(input: PlanInput): CampaignFollowPlan {
     const afterLiq = afterMargin === null ? null : isolatedLongLiquidationPrice({ qty: totalCoin, avgPx, margin: afterMargin }, maintenance);
     plan.after = { contracts: D(held.contracts).plus(contracts).toFixed(), avgPx: fine(avgPx), margin: afterMargin === null ? null : fine(afterMargin), liqPx: afterLiq === null ? null : fine(afterLiq) };
     plan.liqPx = plan.after.liqPx;
-    if (afterLiq !== null && afterLiq.gt(stop.mul(D(1).minus(LIQ_BUFFER_PCT)))) warnings.push({ code: 'LIQUIDATION_NEAR_STOP', params: { liqPx: fine(afterLiq), stopPx: stop.toFixed() } });
+    if (afterLiq !== null && afterLiq.gt(liquidationLimit(stop))) {
+      warnings.push({ code: 'LIQUIDATION_NEAR_STOP', params: { liqPx: fine(afterLiq), stopPx: stop.toFixed(), limitPx: fine(liquidationLimit(stop)), leverage: plan.leverage } });
+    }
   }
-  const risk = input.risk;
-  if (notional.gt(risk.maxOrderNotional)) warnings.push({ code: 'OVER_ORDER_NOTIONAL', params: { notional: fine(notional), limit: risk.maxOrderNotional } });
-  const projected = D(input.instrumentNotional).plus(notional);
-  if (projected.gt(risk.maxPositionNotionalPerInstrument)) warnings.push({ code: 'OVER_POSITION_NOTIONAL', params: { projected: fine(projected), limit: risk.maxPositionNotionalPerInstrument } });
-  const total = D(input.totalNotional).plus(notional);
-  if (total.gt(risk.maxTotalPositionNotional)) warnings.push({ code: 'OVER_TOTAL_NOTIONAL', params: { projected: fine(total), limit: risk.maxTotalPositionNotional } });
   return plan;
 }

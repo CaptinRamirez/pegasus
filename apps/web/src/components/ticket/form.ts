@@ -10,7 +10,7 @@ import {
   type TdMode,
 } from '@pegasus/shared';
 import type { Messages } from '../../i18n';
-import { buildExitFields, defaultExitForm, type ExitForm, type ExitFormError } from '../../lib/exits';
+import { defaultExitForm, type ExitFields, type ExitForm, type ExitFormError } from '../../lib/exits';
 
 export interface TicketForm {
   side: Side;
@@ -29,6 +29,12 @@ export interface TicketForm {
   exits: ExitForm;
   /** The exits section is open: its take-profits and trailing are part of the order */
   exitsOn: boolean;
+  /**
+   * A market order's entry for the R multiples and percentages of its exits: the last price when the exits section
+   * was opened, frozen so that the levels (and the request) do not move with every tick; null for an order with a
+   * price, or while the section is closed
+   */
+  exitEntryPx: string | null;
 }
 
 export type Intent = 'Open long' | 'Open short' | 'Close long' | 'Close short';
@@ -49,6 +55,7 @@ export function defaultForm(): TicketForm {
     restoreUnit: null,
     exits: defaultExitForm(),
     exitsOn: false,
+    exitEntryPx: null,
   };
 }
 
@@ -88,9 +95,13 @@ export function intentOf(side: Side, posSide: PosSide | undefined): Intent | nul
 /**
  * Builds a PlaceOrderRequest from the form, or null when the form is not yet
  * complete/valid. Validation uses the shared zod schema so only requests the
- * server would accept are previewed or submitted.
+ * server would accept are previewed or submitted. `exits` are the request
+ * fields of the exit plan's complete parts (checkExitForm), sent with an
+ * opening order while the exits section is open: an order is previewed with
+ * them while a leg is still being written, and the ticket submits it only
+ * once every part is complete.
  */
-export function buildRequest(form: TicketForm, instId: string | null, posMode: PosMode | null, exits?: ExitInput): PlaceOrderRequest | null {
+export function buildRequest(form: TicketForm, instId: string | null, posMode: PosMode | null, exits?: ExitFields): PlaceOrderRequest | null {
   if (instId === null) return null;
   const candidate: Record<string, unknown> = {
     instId,
@@ -105,34 +116,11 @@ export function buildRequest(form: TicketForm, instId: string | null, posMode: P
   if (posMode === 'long_short_mode') candidate['posSide'] = derivePosSide(form.side, form.reduceOnly);
   // Only an opening order carries a stop; the server refuses one on a closing order.
   if (!form.reduceOnly && form.slTriggerPx.trim() !== '') candidate['slTriggerPx'] = form.slTriggerPx.trim();
-  // The same for take-profits and a trailing exit; an exit part that is not complete leaves the form incomplete.
-  if (!form.reduceOnly && form.exitsOn && exits !== undefined) {
-    const built = exitFieldsOf(form, exits);
-    if (!built.ok) return null;
-    Object.assign(candidate, built.fields);
-  }
+  // The same for take-profits and a trailing exit.
+  if (!form.reduceOnly && form.exitsOn && exits !== undefined) Object.assign(candidate, exits);
   candidate['source'] = 'manual';
   const parsed = placeOrderRequestSchema.safeParse(candidate);
   return parsed.success ? parsed.data : null;
-}
-
-/** What the exit part of the ticket needs besides the form: the entry R multiples are measured from, and the instrument. */
-export interface ExitInput {
-  /** The limit price, or the last price for a market order; null when unknown */
-  entry: string | null;
-  inst: Instrument | null;
-}
-
-/** The exit fields of the ticket's opening order, or why it has none yet. */
-export function exitFieldsOf(form: TicketForm, input: ExitInput): ReturnType<typeof buildExitFields> {
-  const stop = form.slTriggerPx.trim();
-  return buildExitFields(form.exits, {
-    direction: form.side === 'buy' ? 'long' : 'short',
-    entry: input.entry,
-    stop: stop === '' ? null : stop,
-    inst: input.inst,
-    whole: true,
-  });
 }
 
 export type { ExitFormError };

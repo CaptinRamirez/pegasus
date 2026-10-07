@@ -16,9 +16,9 @@ import type {
 } from '@pegasus/shared';
 import type { Intent } from '../components/ticket/form';
 import { pad2, splitDuration } from '../lib/campaign';
-import type { ExitFormError, TpMode, TrailingMode } from '../lib/exits';
-import { fmtAgeCoarse } from '../lib/format';
-import type { CodeText, FollowBlock } from '../lib/signals';
+import type { ExitFormError, TpBasis, TpMode, TrailingMode } from '../lib/exits';
+import { fmtAgeCoarse, fmtNum, safeDecimal } from '../lib/format';
+import type { CapBound, CodeText, FollowBlock } from '../lib/signals';
 
 /** The rule of the campaign in one line, its figures formatted. */
 export interface CampaignRuleText {
@@ -51,23 +51,76 @@ export interface SignalContext {
   addStep: string;
 }
 
+/** A take-profit leg in words: its price, the share of the size it closes, and the R multiple and gain it stands for ('' when unknown). */
+export interface TpLegText {
+  px: string;
+  pct: string;
+  /** "2.00R" or '' */
+  r: string;
+  /** "+26.22%" or '' */
+  gain: string;
+  /** What is missing or wrong with the leg while it cannot be said ("not filled in, suggested 0.3437 (2R)"); '' when it can */
+  problem: string;
+}
+
+/** The size the risk limits allowed, for the note under the contracts field; the figures are formatted. */
+export interface CappedSizeText {
+  riskPct: string;
+  riskContracts: string;
+  /** The limit in the page's language (follow.bound) */
+  bound: string;
+  limit: string;
+  contracts: string;
+  /** The loss at the stop with that size, '' without a stop */
+  riskAmount: string;
+  riskShare: string;
+  /** What each contract is counted at against the limit, in USDT: the entry, plus `slippagePct` of slippage for a market order ('' for a limit order) */
+  perContract: string;
+  slippagePct: string;
+}
+
+/** The estimated liquidation of the confirmation sheet's order against its stop, for follow.liqAboveStop; the figures are formatted. */
+export interface LiquidationText {
+  liqPx: string;
+  stopPx: string;
+  /** The line the liquidation must stay at or below: the stop less the buffer */
+  limitPx: string;
+  leverage: string;
+  /** The highest leverage at which it does, '' when none was found */
+  safeLeverage: string;
+  /** Where the liquidation stands: 'above' at or above the stop, 'near' below it but above the line */
+  relation: 'above' | 'near' | '';
+  /** An add: the liquidation is the position's after it */
+  add: boolean;
+}
+
 /** The confirmation sheet's order in one sentence; the figures are formatted, '' where there is none. */
 export interface FollowSummaryText {
-  contracts: string;
-  /** Base coin with its unit, "0.03 BTC" */
-  coin: string;
+  /** The size in words (follow.sizeText), or what is missing (follow.sizeMissing) */
+  size: string;
   instId: string;
-  /** '' at market */
+  ordType: 'market' | 'limit';
+  /** The limit price; '' while none is filled in (or at market) */
   limitPx: string;
   /** The margin mode in the page's language */
   mgnMode: string;
+  /** '' while not filled in */
   leverage: string;
+  /** The stop and the loss at it in words (follow.stopLine, stopByChannel, stopNotBelow, noStopLine) */
   stop: string;
-  stopPct: string;
-  risk: string;
-  riskPct: string;
   /** The exit plan in words */
   exits: string;
+}
+
+/** The stop of the confirmation sheet's order and the loss at it, for follow.stopLine; '' where unknown. */
+export interface StopLineText {
+  stop: string;
+  /** "13.11%" below the entry, or '' */
+  stopPct: string;
+  /** The loss at the stop in USDT, or '' */
+  risk: string;
+  /** The loss as a share of the equity, "0.65%", or '' */
+  riskPct: string;
 }
 
 /** A journal event's fields, formatted and in the page's language; '' for one the event does not carry. */
@@ -92,6 +145,17 @@ const val = (d: RiskDetails, key: string): string => {
   const v = d[key];
   return typeof v === 'string' || typeof v === 'number' ? String(v) : Array.isArray(v) ? v.join(', ') : '';
 };
+
+/** A USDT amount of the details of a risk rejection, with separators and the unit; the raw value when it is not a number. */
+const usdtOf = (d: RiskDetails, key: string): string => {
+  const v = safeDecimal(val(d, key));
+  return v === null ? val(d, key) : `${fmtNum(v, 2)} USDT`;
+};
+
+/** How a LIMITED_BY_* warning counts each contract against the limit: at the mark plus the slippage headroom ('' when the API did not say) */
+const countedAt = (p: CodeText): string => (p.perContract === '' ? '' : ` (each contract counted at ${p.perContract} USDT${p.slippagePct === '' ? '' : `: the mark plus ${p.slippagePct} of slippage`})`);
+/** The same for the sheet's size note: at the entry, plus the slippage headroom of a market order */
+const countedAtCap = (s: CappedSizeText): string => (s.perContract === '' ? '' : ` (each contract counted at ${s.perContract} USDT${s.slippagePct === '' ? '' : `: the entry plus ${s.slippagePct} of slippage`})`);
 
 /**
  * Every text of the terminal in English. The shape of this object is the contract of a dictionary:
@@ -403,6 +467,8 @@ export const en = {
       'Stop-loss attached to the order: OKX creates it only once the order is completely filled; while the order is partially filled, the filled part has no stop. Triggered by the mark price and executed at market. Leave empty for none.',
     stopMark: 'Stop (mark)',
     stopHint: (tickSz: string) => `(optional, tick ${tickSz})`,
+    /** The stop typed is not on the losing side of the entry */
+    stopWrongSide: (short: boolean) => `Not ${short ? 'above' : 'below'} the entry (a ${short ? 'short' : 'long'} needs its stop ${short ? 'above' : 'below'} it): the server refuses the stop.`,
     none: 'none',
     reduceOnly: 'Reduce only',
     completeForm: 'Complete the form',
@@ -430,6 +496,9 @@ export const en = {
   preview: {
     previewing: 'Previewing…',
     enterSize: 'Enter a size to preview the order',
+    enterPrice: 'Enter the price to preview the order',
+    /** The form has a field that is not a number or a stop the server refuses: what the ticket says instead of a preview */
+    incomplete: 'Complete the form to preview the order',
     action: 'Action',
     contracts: 'Contracts',
     coin: 'Coin',
@@ -548,15 +617,31 @@ export const en = {
       STOP_TOO_WIDE: (p: CodeText) => `The stop is ${p.stopDistancePct} below the entry, wider than ${p.limit}: the position is small for its risk.`,
       STOP_TOO_NARROW: (p: CodeText) => `The stop is only ${p.stopDistancePct} below the entry, closer than ${p.limit}: noise can stop it out, and the position is large.`,
       BELOW_MIN_ORDER: (p: CodeText) => `The risk buys only ${p.sized} contracts, below the minimum order of ${p.minSz}: the plan holds the minimum, which risks ${p.riskAmount} USDT.`,
-      OVER_ORDER_NOTIONAL: (p: CodeText) => `The order's notional ${p.notional} USDT is over the per-order limit of ${p.limit}: the risk engine refuses it. Use fewer contracts.`,
-      OVER_POSITION_NOTIONAL: (p: CodeText) => `With this order the coin's positions come to ${p.projected} USDT, over the per-coin limit of ${p.limit}: the risk engine refuses it.`,
-      OVER_TOTAL_NOTIONAL: (p: CodeText) => `With this order all positions come to ${p.projected} USDT, over the total limit of ${p.limit}: the risk engine refuses it.`,
+      LIMITED_BY_ORDER_NOTIONAL: (p: CodeText) =>
+        `The risk sizes ${p.riskContracts} contracts; the per-order limit of ${p.limit} USDT allows ${p.contracts}${countedAt(p)} (${p.notional} USDT), risking ${p.riskAmount} USDT: the plan holds ${p.contracts}.`,
+      LIMITED_BY_POSITION_NOTIONAL: (p: CodeText) =>
+        `The risk sizes ${p.riskContracts} contracts; with what is held on the coin, its position limit of ${p.limit} USDT allows ${p.contracts} more${countedAt(p)} (${p.notional} USDT), risking ${p.riskAmount} USDT: the plan holds ${p.contracts}.`,
+      LIMITED_BY_TOTAL_NOTIONAL: (p: CodeText) =>
+        `The risk sizes ${p.riskContracts} contracts; with all positions held, the total limit of ${p.limit} USDT allows ${p.contracts} more${countedAt(p)} (${p.notional} USDT), risking ${p.riskAmount} USDT: the plan holds ${p.contracts}.`,
+      OVER_ORDER_NOTIONAL: (p: CodeText) => `Even the minimum order (${p.notional} USDT) is over the per-order limit of ${p.limit} USDT: the risk engine refuses it, so the plan has no size.`,
+      OVER_POSITION_NOTIONAL: (p: CodeText) => `With even the minimum order the coin's positions come to ${p.projected} USDT, over its limit of ${p.limit}: the risk engine refuses it, so the plan has no size.`,
+      OVER_TOTAL_NOTIONAL: (p: CodeText) => `With even the minimum order all positions come to ${p.projected} USDT, over the total limit of ${p.limit}: the risk engine refuses it, so the plan has no size.`,
       SIGNAL_STALE: (p: CodeText) => `The bar of the signal closed at ${p.closedAt}, more than a bar ago: a newer bar is not confirmed yet. Check before following.`,
       PRICE_FAR_ABOVE_SIGNAL: (p: CodeText) => `The price ${p.markPx} is already ${p.risePct} above the signal's close ${p.close} (more than ${p.limit}): a late entry, with the stop further away.`,
       EQUITY_UNKNOWN: () => 'No equity to size with: the plan has no size.',
       LINEAR_ONLY: () => 'Plans are for USDT-margined (linear) swaps only: this one has no size.',
-      LEVERAGE_REDUCED: (p: CodeText) => `Leverage ${p.leverage}× instead of ${p.maxLeverage}×, so that the liquidation stays below the stop.`,
-      LIQUIDATION_NEAR_STOP: (p: CodeText) => `After the add the estimated liquidation ${p.liqPx} is not safely below the stop ${p.stopPx}.`,
+      LEVERAGE_REDUCED: (p: CodeText) =>
+        p.liqPxAtMax === '' || p.liqPx === ''
+          ? `Leverage ${p.leverage}× instead of ${p.maxLeverage}×, so that the liquidation stays below the stop.`
+          : `At ${p.maxLeverage}× the estimated liquidation ${p.liqPxAtMax} would be ${
+              p.liqRelation === 'above'
+                ? `above the stop ${p.stopPx}: the position would be liquidated before the stop`
+                : p.liqRelation === 'near'
+                  ? `below the stop ${p.stopPx} but within the buffer${p.limitPx === '' ? '' : ` (it must stay at or below ${p.limitPx})`}: a wick could liquidate the position before the stop`
+                  : `not safely below the stop ${p.stopPx}${p.limitPx === '' ? '' : ` (it must stay at or below ${p.limitPx})`}`
+            }. The leverage is lowered to ${p.leverage}×, where the liquidation is ${p.liqPx}, below the stop${p.limitPx === '' ? '' : ` (it must stay at or below ${p.limitPx})`}.`,
+      LIQUIDATION_NEAR_STOP: (p: CodeText) =>
+        `After the add${p.leverage === '' ? '' : `, at the position's ${p.leverage}×,`} the estimated liquidation ${p.liqPx} is not safely below the stop ${p.stopPx}${p.limitPx === '' ? '' : ` (it must stay at or below ${p.limitPx})`}.`,
       NOT_TRACKED: () => 'This server does not track the coin: an order on it is refused. Add it to INSTRUMENTS.',
       CAMPAIGN_ACCOUNT: () => "The campaign pot runs on this account: its positions are the pot's, and an order here disturbs it.",
       KILL_SWITCH: () => 'The kill switch is on: trading is halted.',
@@ -602,34 +687,108 @@ export const en = {
     contracts: 'Contracts',
     riskPct: 'Risk % of equity',
     recompute: 'Size from risk',
-    recomputeTitle: 'Contracts that lose this share of the equity from the entry to the stop, whole lots rounded down, at least the minimum order',
+    recomputeTitle: 'Contracts that lose this share of the equity from the entry to the stop, whole lots rounded down, at least the minimum order, and no more than the risk limits and the balance allow',
     belowMin: (minSz: string) => `the risk buys less than the minimum order: ${minSz} contracts`,
+    /** The limits a size is cut to */
+    bound: { order: 'per-order notional limit', instrument: "coin's position limit", total: 'total position limit', balance: 'available balance' } satisfies Record<CapBound, string>,
+    cappedBy: (s: CappedSizeText) =>
+      `Risk ${s.riskPct} sizes ${s.riskContracts} contracts; the ${s.bound} of ${s.limit} USDT allows ${s.contracts}${countedAtCap(s)}: ${s.contracts} filled in${
+        s.riskAmount === '' ? '' : `, actual risk ${s.riskShare} (${s.riskAmount} USDT)`
+      }.`,
+    capBelowMin: (bound: string, limit: string, minSz: string) => `The ${bound} of ${limit} USDT allows less than the minimum order of ${minSz} contracts: the minimum is filled in, which the risk check refuses.`,
+    overCap: (s: CappedSizeText) => `Over the ${s.bound} of ${s.limit} USDT: at most ${s.contracts} contracts${countedAtCap(s)}.`,
+    /** The button beside the over-cap note that fills in the most the limit allows */
+    useCap: (max: string) => `Use ${max}`,
+    /** The contracts field is empty or not a size; the program's size is proposed */
+    sizeNotFilled: (proposal: string) => `No size yet${proposal === '' ? '' : `; suggested ${proposal} contracts (Size from risk)`}.`,
+    /** The size typed is not a whole number of lots: the server rounds it down to one */
+    sizeOffLot: (typed: string, sent: string, lotSz: string) => `${typed} is not a whole number of lots of ${lotSz}: the order is sent for ${sent} contracts.`,
+    /** The size typed is below the minimum order (after rounding to the lot): the server refuses it */
+    sizeBelowMin: (typed: string, minSz: string) => `${typed} is below the minimum order of ${minSz} contracts: the server refuses it.`,
+    /** The size is the program's, but the risk field holds no percentage to size from */
+    riskPctInvalid: 'Risk %: enter a positive number to size from it; the size filled in is the last one computed.',
     stop: 'Stop (mark trigger)',
     stopBelow: (pct: string) => `${pct} below the entry`,
-    stopNotBelow: 'not below the entry',
+    /** A typed stop off the tick: the server rounds it up to the tick (towards the entry) */
+    stopOnTick: (px: string, tick: string) => `rounded to the tick ${tick}: ${px}`,
+    stopNotBelow: 'not below the entry: the server refuses it',
+    stopInvalid: 'not a price: enter one (digits and a point), or leave it empty',
+    /** The stop field is empty: the program's stop, and where the trailing stop stands after the fill ('' without one) */
+    stopNotFilled: (proposal: string, afterFill: string) => `No stop attached${proposal === '' ? '' : `; suggested ${proposal} (the exit line)`}${afterFill === '' ? '' : `. ${afterFill}`}.`,
+    afterFillChannel: (level: string) => `Channel trailing puts a stop at ${level} once the order has filled`,
+    afterFillCallback: (level: string) => `The callback trailing stop stands at ${level} once the order has filled`,
     exitPlan: 'Exit plan',
     check: 'Live check',
     checking: 'Checking…',
-    enterValues: 'Complete the order to check it',
+    /** The order cannot be checked yet: what is missing */
+    enterSize: (proposal: string) => `Enter the contracts to check the order${proposal === '' ? '' : `; suggested ${proposal}`}.`,
+    enterLimitPx: 'Enter the limit price to check the order.',
     refPrice: 'Ref price',
+    /** The limit price field is empty: the figures are at the mark meanwhile */
+    limitPxMissing: (mark: string) => `not filled in; figures at the mark ${mark}`,
     notional: 'Notional',
     estSlippage: 'Est. slippage',
     marginAt: (lev: string) => `Margin at ${lev}×`,
+    margin: 'Margin',
+    /** The leverage field is empty or not a number: the figures that need it */
+    leverageMissing: 'leverage not filled in',
     fee: (rate: string) => `Fee (taker ${rate}, est.)`,
     liqPx: 'Liquidation (est.)',
+    /** Cross margin: the liquidation is not the order's own */
+    liqCross: "cross: depends on the whole account's margin",
+    /** The estimated liquidation is at or below zero: the position cannot be liquidated at this leverage */
+    liqNone: 'none: at this leverage the price cannot reach it',
+    /** The liquidation at the chosen leverage is not safely below the stop: above it, or below it but within the buffer */
+    liqAboveStop: (l: LiquidationText) =>
+      `${l.add ? `After the add, at the position's ${l.leverage}×, its` : `At ${l.leverage}× the`} liquidation ${l.liqPx} ${
+        l.relation === 'above'
+          ? `is above the stop ${l.stopPx}: the position would be liquidated before the stop`
+          : `is below the stop ${l.stopPx} but within the buffer (it must stay at or below ${l.limitPx}): a wick could liquidate the position before the stop`
+      }.${l.safeLeverage === '' ? '' : ` Lower the leverage to ${l.safeLeverage}×.`}`,
     lossAtStop: 'Loss at stop',
+    /** The loss at the stop channel trailing puts after the fill, since none is attached */
+    lossAtChannel: (level: string) => `at the channel stop ${level}`,
+    /** The loss at the callback trailing stop's trigger, since no other stop is there */
+    lossAtCallback: (level: string) => `at the callback stop ${level}`,
+    /** The callback trailing stop's trigger is nearer than the stop: it fires first, at a smaller loss */
+    callbackFirst: (level: string, loss: string, pct: string) => `the callback stop ${level} fires first: ${loss} USDT${pct === '' ? '' : ` (${pct} of equity)`}`,
+    /** No stop at all: the loss is not bounded */
+    lossNotBounded: 'not bounded (no stop)',
     ofEquity: (pct: string) => `${pct} of equity`,
+    /** Under the contracts field: the loss at the stop as a share of the equity */
+    atRiskShare: (pct: string) => `${pct} of equity at risk`,
     tpLegs: 'Take-profit legs',
     tpLeg: (n: number) => `TP${n}`,
     tpContracts: 'Contracts',
     tpProfit: 'Profit',
     riskOk: 'Risk check passed',
+    /** The order passes without the parts of the exit plan that are not complete yet */
+    riskOkPartial: 'Risk check passed for the order without the exit-plan parts still to fix.',
     leverageWillPass: (to: string) => `Passes once the leverage is set to ${to}×.`,
     summaryTitle: 'In one sentence',
+    /** "182.7 contracts (18,270.0 ADA)" */
+    sizeText: (contracts: string, coin: string) => `${contracts} contracts (${coin})`,
+    sizeMissing: (proposal: string) => `contracts not filled in${proposal === '' ? '' : ` (suggested ${proposal})`}`,
+    /** "stop 0.2366 (13.11% below), at risk 652.24 USDT (0.65% of equity)" */
+    stopLine: (s: StopLineText) => `stop ${s.stop}${s.stopPct === '' ? '' : ` (${s.stopPct} below)`}${s.risk === '' ? '' : `, at risk ${s.risk} USDT${s.riskPct === '' ? '' : ` (${s.riskPct} of equity)`}`}`,
+    /** No stop attached, but channel trailing puts one at its level once the order has filled */
+    stopByChannel: (s: StopLineText) =>
+      `no stop attached; channel trailing puts one at ${s.stop} after the fill${s.stopPct === '' ? '' : ` (${s.stopPct} below)`}${
+        s.risk === '' ? '' : `, at risk ${s.risk} USDT${s.riskPct === '' ? '' : ` (${s.riskPct} of equity)`}`
+      }`,
+    /** No stop attached, but the callback trailing stop stands at its trigger once the order has filled */
+    stopByCallback: (s: StopLineText) =>
+      `no stop attached; the callback trailing stop stands at ${s.stop} after the fill${s.stopPct === '' ? '' : ` (${s.stopPct} below)`}${
+        s.risk === '' ? '' : `, at risk ${s.risk} USDT${s.riskPct === '' ? '' : ` (${s.riskPct} of equity)`}`
+      }`,
+    stopWrongLine: (stop: string) => `stop ${stop} not below the entry (the server refuses it)`,
+    /** The stop field holds something that is not a price */
+    stopInvalidLine: (text: string) => `stop "${text}" is not a price (enter one, or leave it empty)`,
+    noStopLine: 'no stop: the loss is not bounded',
     summary: (s: FollowSummaryText) =>
-      `Buy ${s.contracts} contracts (${s.coin}) of ${s.instId} ${s.limitPx === '' ? 'at market' : `at limit ${s.limitPx}`}, ${s.mgnMode} ${s.leverage}×; stop ${s.stop}${
-        s.stopPct === '' ? '' : ` (${s.stopPct} below)`
-      }, at risk ${s.risk} USDT${s.riskPct === '' ? '' : ` (${s.riskPct} of equity)`}; ${s.exits}.`,
+      `Buy ${s.size} of ${s.instId} ${s.ordType === 'market' ? 'at market' : s.limitPx === '' ? 'at a limit price not filled in yet' : `at limit ${s.limitPx}`}, ${s.mgnMode} ${
+        s.leverage === '' ? 'leverage not filled in' : `${s.leverage}×`
+      }; ${s.stop}; ${s.exits}.`,
     confirm: 'Confirm order',
     sending: 'Sending…',
     settingLeverage: 'Setting the leverage…',
@@ -638,6 +797,24 @@ export const en = {
     placed: (contracts: string, instId: string, state: string) => `Signal followed: buy ${contracts} contracts of ${instId} (${state}).`,
     leverageFailed: (err: string) => `The leverage could not be set, so no order was sent: ${err}`,
     incomplete: 'Complete the form',
+    suggest: 'Suggest',
+    suggestStopTitle: "Fill in the plan's stop: the exit line of the rule",
+    /** Why the confirm button is disabled, printed beside it */
+    whyLeverage: 'Leverage: enter a positive number.',
+    whyNoSize: (proposal: string) => `Contracts: not filled in${proposal === '' ? '' : `; suggested ${proposal}`}.`,
+    whySizeBelowMin: (minSz: string, proposal: string) => `Contracts: below the minimum order of ${minSz}${proposal === '' ? '' : `; suggested ${proposal}`}.`,
+    whyNoPx: 'Limit price: enter one.',
+    /** Under the plan's warnings on the sheet: they are the plan's figures, the live check follows the form */
+    planFigures: "The plan's warnings, at its own leverage, stop and the mark price; the live check on the right follows the form.",
+    /** The stop typed is not below the entry: the sheet does not send it for the check, the server would refuse the order */
+    whyStopWrong: 'Stop: not below the entry (the server refuses it); lower it, or leave it empty.',
+    whyStopInvalid: 'Stop: enter a price, or leave it empty.',
+    whyExits: (text: string) => `Exit plan: ${text}`,
+    whyLiquidation: (safeLeverage: string) => `Liquidation before the stop${safeLeverage === '' ? '' : `: lower the leverage to ${safeLeverage}×`}.`,
+    whyRefused: (code: string, text: string) => `Refused by the risk check (${code}): ${text}`,
+    whyError: (text: string) => `Refused by the server: ${text}`,
+    /** The live check's figures come from the form until the server has answered */
+    estimated: 'estimated from the form; the server checks it next',
   },
 
   /** Take-profits and trailing stops: the editor of an order's exit plan and the exits of an open position. */
@@ -648,33 +825,77 @@ export const en = {
     unknown: 'Whether exits are offered here could not be checked.',
     tp: 'Take-profit',
     tpMode: { none: 'None', single: 'Single', ladder: 'Ladder' } satisfies Record<TpMode, string>,
-    basis: { price: 'Price', r: 'R' },
-    basisTitle: 'R: multiples of the distance from the entry to the stop',
-    value: 'Price or R',
+    basis: { price: 'Price', r: 'R', pct: '%' } satisfies Record<TpBasis, string>,
+    basisTitle: 'R: multiples of the distance from the entry to the stop; %: percent from the entry; the value is converted when the basis changes',
+    value: 'Price, R or %',
     atPrice: (px: string) => `= ${px}`,
+    /** A typed price off the tick: the price it is rounded to (towards the entry, as the API rounds it) */
+    onTick: (px: string, tick: string) => `= ${px} (rounded to the tick ${tick})`,
     asR: (r: string) => `${r}R`,
+    /** The gain from the entry, "+26.22%" */
+    gain: (pct: string) => `+${pct}`,
+    legSize: (contracts: string) => `${contracts} ct`,
+    legProfit: (usdt: string) => `+${usdt} USDT`,
+    suggest: 'Suggest',
+    suggestTitle: "Fill in the program's level: 2R with a stop (1.5R and 3R for a ladder), else 10% from the entry (5% and 10%)",
+    /** The program's proposal for a level: "0.3437 (2R)" */
+    proposal: (px: string, label: string) => `${px} (${label})`,
+    /** The level (a price, an R multiple or a percentage) is not filled in */
+    needPrice: (leg: number, proposal: string) => `Take-profit ${leg}: no level yet${proposal === '' ? '' : `; suggested ${proposal}`}.`,
+    needShare: (leg: number, share: string) => `Take-profit ${leg}: no share yet${share === '' ? '' : `; suggested ${share}%`}.`,
+    /** The level typed comes to a price on the losing side of the entry; the program's proposal ('' when none) */
+    wrongSide: (leg: number, px: string, entry: string, short: boolean, proposal: string) =>
+      `Take-profit ${leg}: ${px} is not ${short ? 'below' : 'above'} the entry ${entry} (a ${short ? 'short' : 'long'} takes profit ${short ? 'below' : 'above'} it)${proposal === '' ? '' : `; suggested ${proposal}`}.`,
+    /** The leg's contracts, in whole lots, come to less than the minimum order: the server refuses the plan */
+    legTooSmall: (leg: number, sz: string, minSz: string) => `Take-profit ${leg}: its share comes to ${sz} contracts, below the minimum order of ${minSz}: a larger share, fewer legs or a larger order.`,
+    /** A position's resting take-profits: what they cover and the level the proposals are lifted beyond */
+    restingCover: (covered: string, total: string, beyond: string) => `Take-profits resting for ${covered} of the ${total} contracts: a new leg is proposed for the rest, beyond ${beyond}.`,
+    restingCoverAll: (total: string) => `The resting take-profits already cover the whole position (${total} contracts): cancel one to add a leg.`,
+    howProposed: 'With a stop the levels are proposed in R (multiples of the distance from the entry to the stop); without one, as percentages from the entry.',
+    /** A market order's levels are measured from the last price at the moment the exits section was opened */
+    entryFrozen: (px: string) => `R and % are measured from ${px}, the last price when this section was opened; close and reopen it to measure from the price now.`,
+    /** A stop is typed but not on the losing side: it does not count for the levels */
+    stopWrongSide: (stop: string, short: boolean) =>
+      `The stop ${stop} is not on the losing side of the entry (${short ? 'above it for a short' : 'below it for a long'}), so it does not count: the levels are proposed as percentages from the entry.`,
     pctOfSize: '% of size',
     pctOfPosition: '% of position',
     rest: 'rest',
     addLeg: '+ leg',
     removeLeg: 'Remove leg',
     breakeven: 'After the first take-profit, move the stop to the entry price',
-    breakevenNeeds: 'needs a stop and two legs or more',
+    breakevenNeeds: 'needs a stop attached to the order and two legs or more',
     wholeOrderHint:
       'On an opening order the legs cover the whole order: the last one takes what the others leave. To take profit on part and let the rest trail, add take-profits to the position after the fill (Positions tab).',
     trailing: 'Trailing stop',
     trailingMode: { none: 'None', channel: 'Channel', callback: 'Callback' } satisfies Record<TrailingMode, string>,
     channelBars: 'Days',
-    channelHint: (bars: string) =>
-      `The stop is kept at the lowest low of the last ${bars} daily bars (the highest high for a short), moved after every 00:00 UTC close, never against the position.`,
+    /** Channel trailing with its level known now */
+    channelNow: (level: string, bars: string, short: boolean) =>
+      `The stop is now at ${level} (the ${short ? 'highest high' : 'lowest low'} of the last ${bars} daily bars) and moves ${short ? 'down' : 'up'} only, after every 00:00 UTC close.`,
+    /** Channel trailing whose level is computed when the order is placed */
+    channelLater: (bars: string, short: boolean) =>
+      `The stop will be the ${short ? 'highest high' : 'lowest low'} of the last ${bars} daily bars when the order is placed, and moves ${short ? 'down' : 'up'} only, after every 00:00 UTC close.`,
+    /** The channel level now is not on the losing side of the entry: a stop there fires at once */
+    channelWrongSide: (level: string, short: boolean) => `The level ${level} is not ${short ? 'above' : 'below'} the entry: a stop there would fire at once. Choose more days, or no channel trailing.`,
     callbackPct: 'Callback %',
     activePx: 'Activation price',
     optional: 'optional',
-    callbackHint: 'The exchange closes the position once the price comes back this far from its best since activation.',
+    /**
+     * The callback trailing stop with where it would trigger ('' when unknown): at the current price, or at the
+     * earliest once the price reaches the activation price (`pending`), and its activation price ('' when none)
+     */
+    callbackNow: (pct: string, px: string, activePx: string, short: boolean, pending: boolean) =>
+      `Closes once the price comes back ${pct} from its ${short ? 'lowest' : 'highest'} since activation${
+        px === '' ? '' : pending ? `; the earliest trigger is then ${px}` : `; at the current price that is ${px}`
+      }${activePx === '' ? '' : `. Activates at ${activePx}`}.`,
     error: {
-      TP_VALUE: (leg: number) => `Take-profit ${leg}: enter a price, or an R multiple, above 0.`,
+      TP_VALUE: (leg: number) => `Take-profit ${leg}: enter a price, an R multiple or a percentage above 0.`,
+      TP_NEEDS_ENTRY: (leg: number) => `Take-profit ${leg}: an R multiple or a percentage needs an entry price (the limit price, or the last price for a market order).`,
       TP_R_NEEDS_STOP: (leg: number) => `Take-profit ${leg}: an R multiple needs an entry and a stop on the losing side.`,
+      TP_WRONG_SIDE: (leg: number) => `Take-profit ${leg}: not on the profit side of the entry (above it for a long, below it for a short).`,
+      TP_ORDER: (leg: number) => `Take-profit ${leg}: must be beyond take-profit ${leg - 1} (higher for a long, lower for a short): the legs fill in their order.`,
       TP_PCT: (leg: number) => `Take-profit ${leg}: enter its share as a percentage above 0 and at most 100.`,
+      TP_LEG_TOO_SMALL: (leg: number) => `Take-profit ${leg}: its share comes to less than the minimum order: a larger share, fewer legs or a larger order.`,
       TP_REST: () => 'The legs before the last take 100% or more: nothing is left for the last one.',
       TP_OVER_100: () => 'The take-profit shares add up to more than 100%.',
       BREAKEVEN: () => 'The cost-price stop needs a stop and two take-profit legs or more.',
@@ -682,16 +903,35 @@ export const en = {
       CALLBACK_RATIO: () => 'Callback: from 0.1% to 20%.',
       ACTIVE_PX: () => 'Activation price: a positive number, or empty.',
     } satisfies Record<ExitFormError['code'], (leg: number) => string>,
+    /** What is missing or wrong with a take-profit leg, for the summary ("leg 2 not filled in, suggested 0.3794 (3R)") */
+    legProblem: {
+      missing: (proposal: string) => `not filled in${proposal === '' ? '' : `, suggested ${proposal}`}`,
+      missingShare: (share: string) => `share not filled in${share === '' ? '' : `, suggested ${share}%`}`,
+      TP_VALUE: 'not a valid level',
+      TP_NEEDS_ENTRY: 'needs the entry price',
+      TP_R_NEEDS_STOP: 'in R without a stop on the losing side',
+      TP_WRONG_SIDE: 'not on the profit side of the entry',
+      TP_ORDER: 'not beyond the leg before it',
+      TP_PCT: 'share not valid',
+      TP_LEG_TOO_SMALL: 'below the minimum order',
+    },
+    tpSharesProblem: 'take-profit shares to fix (100% or more before the last leg)',
+    channelProblem: 'channel trailing stop: days to fix (2 to 100)',
+    callbackProblem: 'callback trailing stop to fix (callback 0.1% to 20%, activation price a positive number or empty)',
     // the exit plan in words
     joinParts: (parts: string[]) => parts.join('; '),
     stopText: (px: string) => `stop ${px}`,
     tpNone: 'no take-profit',
-    tpLegs: (legs: Array<{ px: string; pct: string }>) => legs.map((l) => `${l.px} (${l.pct})`).join(', '),
-    tpList: (legs: Array<{ px: string; pct: string }>) => `take-profit ${legs.map((l) => `${l.px} (${l.pct})`).join(', ')}`,
+    /** "2.00R 0.3437 (+26.22%, 100%)": the R and the gain when known; a leg with a problem says it instead */
+    tpLegs: (legs: TpLegText[]) => legs.map((l, i) => (l.problem !== '' ? `leg ${i + 1} ${l.problem}` : `${l.r === '' ? '' : `${l.r} `}${l.px} (${[l.gain, l.pct].filter((s) => s !== '').join(', ')})`)).join(', '),
+    tpList: (legs: TpLegText[]) =>
+      `take-profit ${legs.map((l, i) => (l.problem !== '' ? `leg ${i + 1} ${l.problem}` : `${l.r === '' ? '' : `${l.r} `}${l.px} (${[l.gain, l.pct].filter((s) => s !== '').join(', ')})`)).join(', ')}`,
     breakevenOn: 'stop to the entry after the first take-profit',
     trailingNone: 'no trailing stop',
-    trailingChannelText: (bars: number) => `trailing stop at the ${bars}-day low`,
-    trailingCallbackText: (ratio: string, activePx: string | null) => `trailing stop ${ratio} callback${activePx === null ? '' : ` from ${activePx}`}`,
+    trailingChannelText: (bars: number, level: string | null) => `trailing stop at the ${bars}-day low${level === null ? '' : `, now ${level}`}`,
+    /** The callback trailing stop with its activation price and where it would trigger: at the current price, or, while the activation price is not reached (`pending`), at the earliest once it is */
+    trailingCallbackText: (ratio: string, activePx: string | null, trigger: string | null, pending: boolean) =>
+      `trailing stop ${ratio} callback${activePx === null ? '' : ` from ${activePx}`}${trigger === null ? '' : pending ? ` (${trigger} at the earliest)` : ` (${trigger} at the current price)`}`,
     // the exits of a position
     tpCount: (n: number) => `${n} legs`,
     channelShort: (bars: number, level: string) => `channel ${bars}d · ${level}`,
@@ -1093,6 +1333,9 @@ export const en = {
   errorWithMessage: (code: string, known: string, message: string) => `${code}: ${known} (${message})`,
   /** A risk rejection in words, by RiskCheckResult.code, from its details and the server's message. The older codes are worded by the server in English. */
   riskReject: {
+    MAX_ORDER_NOTIONAL: (d: RiskDetails) => `the order's notional ${usdtOf(d, 'notional')} is over the per-order limit of ${usdtOf(d, 'limit')}`,
+    MAX_POSITION_NOTIONAL: (d: RiskDetails) => `the coin's positions would come to ${usdtOf(d, 'projected')}, over its limit of ${usdtOf(d, 'limit')}`,
+    MAX_TOTAL_NOTIONAL: (d: RiskDetails) => `all positions would come to ${usdtOf(d, 'projected')}, over the total limit of ${usdtOf(d, 'limit')}`,
     TP_WRONG_SIDE: (d: RiskDetails) =>
       `Take-profit ${val(d, 'leg')} at ${val(d, 'triggerPx')} is on the wrong side: a long's take-profit must be above both the entry ${val(d, 'entryPx')} and the mark ${val(d, 'markPx')} (a short's below both).`,
     CALLBACK_RATIO: (d: RiskDetails) => `The callback ${val(d, 'callbackRatio')} is outside the allowed 0.1% to 20%.`,

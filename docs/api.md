@@ -893,23 +893,41 @@ by the page.
 - `plan` (`CampaignFollowPlan`), for `entry` and `add`: an isolated market buy at about the mark (`entryPx`), its stop
   `stopPx` at the exit line `nextExit` (what the next daily close is measured against, and where the channel
   trailing exit keeps the stop), `trailing` `{ kind: 'channel', bars: exitChannel }` and `takeProfits` `[]` (the rule
-  exits on the channel only). Sized so that a fill at `entryPx` stopped at `stopPx` loses `riskTarget` = equity x
-  `riskPct`: `contracts` in whole lots rounded down, at least the minimum order (`riskAmount` is what they risk),
-  `coin`, `notional`, `margin` = notional / leverage. `leverage` for an entry: the highest whole number up to the
-  campaign's leverage (10), `RISK_MAX_LEVERAGE` and the instrument's maximum that keeps the estimated isolated
-  liquidation price (`isolatedLongLiquidationPrice` with `campaignMaintenanceRate`: the first tier's maintenance rate
-  plus the taker fee, `maintenanceRate`) at or below `stopPx` x (1 - 0.01); `liqPx` is that estimate. An add posts at
-  the position's own leverage setting and `after` estimates the position after it (contracts, average, margin and
-  liquidation price of an isolated position). Linear contracts only. Without equity the size fields are null.
+  exits on the channel only); `spec` is the contract's `Instrument` (its size, lot, minimum order, tick and maximum
+  leverage), so a coin the terminal does not track can still be shown. Sized so that a fill at `entryPx` stopped at
+  `stopPx` loses `riskTarget` = equity x `riskPct`: `riskContracts` in whole lots rounded down, at least the minimum
+  order; then `contracts` is that, or less when a risk limit allows less: the per-order notional
+  (`RISK_MAX_ORDER_NOTIONAL`), the coin's position limit less what is held on it and the total limit less what is held
+  (`RISK_MAX_POSITION_NOTIONAL_PER_INSTRUMENT`, `RISK_MAX_TOTAL_POSITION_NOTIONAL`, counted on the positions held
+  now), each contract valued at the mark plus `RISK_MAX_SLIPPAGE_PCT` (the engine values a market buy at its
+  estimated fill, measured from the best ask, and refuses one that slips more than that from it; the headroom makes a
+  size within the cap pass the notional rules unless the best ask itself stands above the mark, and the engine's
+  check of the order stays the final word), in whole lots
+  (`riskAmount` is what `contracts` risk), `coin`, `notional`, `margin` = notional / leverage. `leverage` for an entry:
+  the highest whole number up to the campaign's leverage (10), `RISK_MAX_LEVERAGE` and the instrument's maximum that
+  keeps the estimated isolated liquidation price (`isolatedLongLiquidationPrice` with `campaignMaintenanceRate`: the
+  first tier's maintenance rate plus the taker fee, `maintenanceRate`) at or below `stopPx` x (1 - 0.01); `liqPx` is
+  that estimate. An add posts at the position's own leverage setting and `after` estimates the position after it
+  (contracts, average, margin and liquidation price of an isolated position). Linear contracts only. Without equity
+  the size fields are null; when even the minimum order breaks a risk limit `contracts` and the fields after it are
+  null too (`riskContracts` stays).
 - `warnings` (codes and their `params`): `STOP_NOT_BELOW_ENTRY` { stopPx, entryPx } (no size), `STOP_TOO_WIDE` /
   `STOP_TOO_NARROW` { stopDistancePct, limit } (more than 20% / less than 2%), `BELOW_MIN_ORDER` { sized, minSz,
-  riskAmount }, `OVER_ORDER_NOTIONAL` { notional, limit }, `OVER_POSITION_NOTIONAL` { projected, limit },
-  `OVER_TOTAL_NOTIONAL` { projected, limit } (the risk limits, counted on the positions held now: the risk engine would
-  refuse the order), `SIGNAL_STALE` { barTs, closedAt, ageMs } (the signal's bar closed more than one bar ago),
-  `PRICE_FAR_ABOVE_SIGNAL` { markPx, close, risePct, limit } (more than 5% above the signal's close),
-  `EQUITY_UNKNOWN` {}, `LINEAR_ONLY` {}, `LEVERAGE_REDUCED` { leverage, maxLeverage }, `LIQUIDATION_NEAR_STOP` { liqPx,
-  stopPx } (an add), `NOT_TRACKED` {} (an order on it is refused with `UNKNOWN_INSTRUMENT` until it is in
-  `INSTRUMENTS`), `CAMPAIGN_ACCOUNT` {}, `KILL_SWITCH` {}.
+  riskAmount } (the plan holds the minimum order; not raised together with an `OVER_*`, which leaves no size),
+  `LIMITED_BY_ORDER_NOTIONAL` / `LIMITED_BY_POSITION_NOTIONAL` / `LIMITED_BY_TOTAL_NOTIONAL`
+  { riskContracts, contracts, notional, limit, riskAmount, perContract, slippagePct } (the risk sizes
+  `riskContracts`, that limit allows `contracts`, which the plan holds, each contract counted at `perContract` = the
+  mark plus `slippagePct` = `RISK_MAX_SLIPPAGE_PCT`; the tightest limit speaks), `OVER_ORDER_NOTIONAL` { notional,
+  limit }, `OVER_POSITION_NOTIONAL` { projected, limit }, `OVER_TOTAL_NOTIONAL` { projected, limit } (even the
+  minimum order breaks that limit, `notional` / `projected` being the minimum order's, counted at the mark plus
+  `RISK_MAX_SLIPPAGE_PCT` as the room is: no size), `SIGNAL_STALE` { barTs, closedAt,
+  ageMs } (the signal's bar closed more than one bar ago), `PRICE_FAR_ABOVE_SIGNAL` { markPx, close, risePct, limit }
+  (more than 5% above the signal's close), `EQUITY_UNKNOWN` {}, `LINEAR_ONLY` {}, `LEVERAGE_REDUCED` { leverage,
+  maxLeverage, liqPx, liqPxAtMax, stopPx, limitPx } (the estimated liquidation at `maxLeverage` would be `liqPxAtMax`,
+  above `limitPx` = stopPx x (1 - liqBufferPct); at `leverage` it is `liqPx`), `LIQUIDATION_NEAR_STOP` { liqPx, stopPx,
+  limitPx, leverage } (an add: the position's liquidation after it, at its leverage setting, is above `limitPx`),
+  `NOT_TRACKED` {} (an order on it is refused with `UNKNOWN_INSTRUMENT` until it is in `INSTRUMENTS`),
+  `CAMPAIGN_ACCOUNT` {}, `KILL_SWITCH` {}.
 - The response: `{ generatedAt, params, thresholds, riskPct, equity, equitySource, campaign, rows }`. `thresholds`:
   `{ nearPct: '0.03', stopWidePct: '0.2', stopNarrowPct: '0.02', farAbovePct: '0.05', liqBufferPct: '0.01' }`.
   `equitySource` is `request`, `account` or null. `campaign`: `{ enabled, status, ownAccount }`; `ownAccount` is true

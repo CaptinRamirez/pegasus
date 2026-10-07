@@ -83,6 +83,13 @@ export function fmtCoin(
   }
 }
 
+/** A coin amount (not contracts) written to the decimals fmtCoin uses for the instrument; the exact value without one. */
+export function fmtCoinAmount(coin: DecimalInput | null | undefined, inst: Instrument | null | undefined): string {
+  const d = safeDecimal(coin);
+  if (d === null) return DASH;
+  return groupThousands(inst === null || inst === undefined ? d.toFixed() : d.toFixed(coinDecimals(inst)));
+}
+
 /** Generic fixed-decimals formatting with thousands separators. */
 export function fmtNum(v: DecimalInput | null | undefined, dp = 2): string {
   const d = safeDecimal(v);
@@ -98,12 +105,23 @@ export function fmtSigned(v: DecimalInput | null | undefined, dp = 2): string {
   return d.gt(0) ? `+${s}` : s;
 }
 
-/** Formats a fraction (0.0123) as a percentage ("1.23%"). */
+/** Formats a fraction (0.0123) as a percentage ("1.23%"), with thousands separators ("6,555.27%"). */
 export function fmtPct(fraction: DecimalInput | null | undefined, dp = 2, signed = false): string {
   const d = safeDecimal(fraction);
   if (d === null) return DASH;
-  const pct = d.mul(100).toFixed(dp);
+  const pct = groupThousands(d.mul(100).toFixed(dp));
   return `${signed && d.gt(0) ? '+' : ''}${pct}%`;
+}
+
+/**
+ * A share of the equity as a percentage: two decimals, or four when two would print a loss that is not zero as
+ * "0.00%" (3.57 USDT of 99,960 is 0.0036%).
+ */
+export function fmtShare(fraction: DecimalInput | null | undefined): string {
+  const d = safeDecimal(fraction);
+  if (d === null) return DASH;
+  const two = fmtPct(d, 2);
+  return two === '0.00%' && !d.isZero() ? fmtPct(d, 4) : two;
 }
 
 /** Formats a fraction (0.00003) as basis points ("0.3 bp"). */

@@ -1,10 +1,10 @@
 import type { ReactNode } from 'react';
-import type { CampaignFollowPlan, CampaignSignalRow, CampaignSignalsResponse, Instrument } from '@pegasus/shared';
+import type { CampaignFollowPlan, CampaignPlanWarningCode, CampaignSignalRow, CampaignSignalsResponse, Instrument } from '@pegasus/shared';
 import { useT, type Messages } from '../../i18n';
 import type { SignalContext } from '../../i18n/en';
 import { utcLocal } from '../../lib/describe';
-import { DASH, fmtContracts, fmtNum, fmtPct, fmtPx, safeDecimal } from '../../lib/format';
-import { addTriggerAfter, changeFrom, coinOf, nextDailyClose, reasonText, shareOf, signalCloseTs, warningText, type FollowBlock } from '../../lib/signals';
+import { DASH, fmtCoin, fmtContracts, fmtNum, fmtPct, fmtPx, safeDecimal } from '../../lib/format';
+import { addTriggerAfter, changeFrom, coinOf, completeWarning, nextDailyClose, reasonText, shareOf, signalCloseTs, warningText, type FollowBlock } from '../../lib/signals';
 import { StateBadge } from './CoinList';
 import { SignalChart } from './SignalChart';
 
@@ -67,7 +67,8 @@ function PlanView({ plan, res, inst }: { plan: CampaignFollowPlan; res: Campaign
         <div className="sig-group">
           <div className="sig-group-title">{t.signals.groupSize}</div>
           <Kv k={t.signals.contracts} v={plan.contracts === null ? t.signals.noSize : t.common.ct(fmtContracts(plan.contracts, inst))} />
-          <Kv k={t.signals.coin} v={plan.coin === null ? DASH : `${fmtNum(plan.coin, 4)} ${coinOf(plan.instId)}`} />
+          {/* the coin as the sheet writes it: to the decimals the contract size and the lot make, from the contracts */}
+          <Kv k={t.signals.coin} v={plan.contracts === null ? DASH : `${fmtCoin(plan.contracts, inst ?? plan.spec)} ${coinOf(plan.instId)}`} />
           <Kv k={t.signals.notional} v={usdt(plan.notional)} />
           <Kv k={t.signals.leverage} v={`${plan.leverage}×`} />
           <Kv k={t.signals.margin} v={usdt(plan.margin)} />
@@ -94,20 +95,39 @@ function PlanView({ plan, res, inst }: { plan: CampaignFollowPlan; res: Campaign
   );
 }
 
-/** What the plan warns about, in words; the ones that stop a follow in the danger colour. Nothing without a warning. */
-export function PlanWarnings({ plan, inst }: { plan: CampaignFollowPlan; inst: Instrument | undefined }) {
+/**
+ * What the plan warns about, in words, every figure named (the liquidation prices of a reduced leverage are computed
+ * from the plan when the API did not send them); the ones that stop a follow in the danger colour. Nothing without a
+ * warning. `omit`: codes said elsewhere on the page (the sheet's size note says the cap with its own figures).
+ */
+export function PlanWarnings({
+  plan,
+  inst,
+  liqBufferPct,
+  omit = [],
+  note = null,
+}: {
+  plan: CampaignFollowPlan;
+  inst: Instrument | undefined;
+  liqBufferPct: string;
+  omit?: readonly CampaignPlanWarningCode[];
+  /** A line under the list saying what the figures are (the sheet: the plan's, not the form's); none when null */
+  note?: string | null;
+}) {
   const t = useT();
-  if (plan.warnings.length === 0) return null;
+  const warnings = plan.warnings.filter((w) => !omit.includes(w.code));
+  if (warnings.length === 0) return null;
   return (
     <div className="sig-warnings">
       <div className="sig-group-title">{t.signals.warnings}</div>
       <ul>
-        {plan.warnings.map((w) => (
+        {warnings.map((w) => (
           <li key={w.code} className={BLOCKING.has(w.code) ? 'neg' : 'warn'} data-code={w.code}>
-            {t.signals.warning[w.code](warningText(w.code, w.params, inst))}
+            {t.signals.warning[w.code](warningText(w.code, completeWarning(w, plan, inst, liqBufferPct), inst))}
           </li>
         ))}
       </ul>
+      {note !== null && <div className="dim sig-warnings-note">{note}</div>}
     </div>
   );
 }
@@ -164,7 +184,7 @@ export function CoinCard({ row, res, inst, block, manualBlock, onFollow, onManua
         {block !== null && followable && <span className="sig-block warn">{t.signals.block[block]}</span>}
         {manualBlock !== null && <span className="sig-block dim">{manualBlock}</span>}
       </div>
-      {row.plan !== null && <PlanWarnings plan={row.plan} inst={inst} />}
+      {row.plan !== null && <PlanWarnings plan={row.plan} inst={inst} liqBufferPct={res.thresholds.liqBufferPct} />}
 
       <div className="sig-facts">
         <Fact label={t.signals.signalTime}>

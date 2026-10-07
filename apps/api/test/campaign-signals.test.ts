@@ -126,8 +126,10 @@ describe('the plan to follow a signal', () => {
   it('sizes the risk to the stop in whole lots, at the highest leverage that keeps the liquidation below the stop', () => {
     const p = plan();
     // 1% of 1000 = 10 over 8 a contract: 1.25, one whole lot
-    expect(p).toMatchObject({ kind: 'entry', side: 'buy', tdMode: 'isolated', entryPx: '100', stopPx: '92', stopDistance: '8', stopDistancePct: '0.08', riskTarget: '10', riskAmount: '8', contracts: '1', coin: '1', notional: '100', leverage: '10', margin: '10', maintenanceRate: '0.007', takeProfits: [], after: null, signal: SIGNAL });
+    expect(p).toMatchObject({ kind: 'entry', side: 'buy', tdMode: 'isolated', entryPx: '100', stopPx: '92', stopDistance: '8', stopDistancePct: '0.08', riskTarget: '10', riskAmount: '8', riskContracts: '1', contracts: '1', coin: '1', notional: '100', leverage: '10', margin: '10', maintenanceRate: '0.007', takeProfits: [], after: null, signal: SIGNAL });
     expect(p.trailing).toEqual({ kind: 'channel', bars: 10 });
+    // the contract's spec travels with the plan, for a coin the terminal does not track
+    expect(p.spec).toBe(LINK);
     // (100 - 10) / (1 - 0.007)
     expect(D(p.liqPx ?? '0').toFixed(3)).toBe('90.634');
     expect(p.warnings).toEqual([]);
@@ -138,7 +140,13 @@ describe('the plan to follow a signal', () => {
     const p = plan({ stopPx: '91' });
     expect(p.leverage).toBe('9');
     expect(D(p.liqPx ?? '0').lte(D('91').mul('0.99'))).toBe(true);
-    expect(p.warnings).toContainEqual({ code: 'LEVERAGE_REDUCED', params: { leverage: 9, maxLeverage: 10 } });
+    // the warning names both liquidation prices, the stop and the line the liquidation must stay below
+    const reduced = p.warnings.find((w) => w.code === 'LEVERAGE_REDUCED');
+    expect(reduced?.params).toMatchObject({ leverage: 9, maxLeverage: 10, stopPx: '91', limitPx: '90.09' });
+    expect(D(reduced?.params['liqPxAtMax'] ?? '0').toFixed(3)).toBe('90.634');
+    // (100 - 100 / 9) / (1 - 0.007)
+    expect(D(reduced?.params['liqPx'] ?? '0').toFixed(3)).toBe('89.515');
+    expect(reduced?.params['liqPx']).toBe(p.liqPx);
     // never more than RISK_MAX_LEVERAGE or the instrument's maximum
     expect(plan({ risk: { ...RISK, maxLeverage: '5' } }).leverage).toBe('5');
     expect(plan({ inst: { ...LINK, maxLever: '3' } }).leverage).toBe('3');
@@ -160,8 +168,14 @@ describe('the plan to follow a signal', () => {
     const small = plan({ equity: '100' });
     expect(small).toMatchObject({ contracts: '1', riskAmount: '8' });
     expect(small.warnings).toContainEqual({ code: 'BELOW_MIN_ORDER', params: { sized: '0', minSz: '1', riskAmount: '8' } });
-    expect(codes(plan({ risk: { ...RISK, maxOrderNotional: '50' } }))).toContain('OVER_ORDER_NOTIONAL');
-    expect(codes(plan({ instrumentNotional: '19950' }))).toContain('OVER_POSITION_NOTIONAL');
+    // a limit that leaves no room for even the minimum order: no size, as without a stop
+    const over = plan({ risk: { ...RISK, maxOrderNotional: '50' } });
+    expect(over).toMatchObject({ riskContracts: '1', contracts: null, notional: null, margin: null });
+    // the minimum order counted as the room is: at the mark plus the slippage the engine tolerates
+    expect(over.warnings).toContainEqual({ code: 'OVER_ORDER_NOTIONAL', params: { notional: '100.5', limit: '50' } });
+    // a plan without a size does not also say it holds the minimum
+    expect(codes(over)).not.toContain('BELOW_MIN_ORDER');
+    expect(plan({ instrumentNotional: '19950' }).warnings).toContainEqual({ code: 'OVER_POSITION_NOTIONAL', params: { projected: '20050.5', limit: '20000' } });
     expect(codes(plan({ totalNotional: '49990' }))).toContain('OVER_TOTAL_NOTIONAL');
     expect(plan({ now: lastDay + 2 * DAY_MS + 1 }).warnings[0]).toMatchObject({ code: 'SIGNAL_STALE', params: { barTs: lastDay, closedAt: lastDay + DAY_MS } });
     expect(plan({ signal: { ...SIGNAL, close: '94' } }).warnings).toContainEqual({ code: 'PRICE_FAR_ABOVE_SIGNAL', params: { markPx: '100', close: '94', risePct: '0.0638297872340426', limit: '0.05' } });
@@ -173,6 +187,27 @@ describe('the plan to follow a signal', () => {
     expect(unknown.liqPx).not.toBeNull();
     // a mark at or below the exit line: nothing to size with
     expect(plan({ stopPx: '100' })).toMatchObject({ contracts: null, warnings: [{ code: 'STOP_NOT_BELOW_ENTRY', params: { stopPx: '100', entryPx: '100' } }] });
+  });
+
+  it('cuts the size to what the risk limits allow, each contract valued at the mark plus the slippage the engine tolerates', () => {
+    // 1% of 10,000 = 100 over 8 a contract: 12 contracts; the per-order limit 500 over 100 x 1.005 a contract: 4.97, so 4
+    const p = plan({ equity: '10000', risk: { ...RISK, maxOrderNotional: '500' } });
+    expect(p).toMatchObject({ riskTarget: '100', riskContracts: '12', contracts: '4', coin: '4', notional: '400', riskAmount: '32', margin: '40' });
+    expect(p.warnings).toContainEqual({ code: 'LIMITED_BY_ORDER_NOTIONAL', params: { riskContracts: '12', contracts: '4', notional: '400', limit: '500', riskAmount: '32', perContract: '100.5', slippagePct: '0.005' } });
+    expect(p.warnings.map((w) => w.code)).not.toContain('OVER_ORDER_NOTIONAL');
+    // the coin's limit less what is held on it, and the total less what is held
+    const coin = plan({ equity: '10000', instrumentNotional: '19300' });
+    expect(coin).toMatchObject({ riskContracts: '12', contracts: '6' });
+    expect(coin.warnings).toContainEqual({ code: 'LIMITED_BY_POSITION_NOTIONAL', params: { riskContracts: '12', contracts: '6', notional: '600', limit: '20000', riskAmount: '48', perContract: '100.5', slippagePct: '0.005' } });
+    const total = plan({ equity: '10000', totalNotional: '49000' });
+    expect(total).toMatchObject({ contracts: '9' });
+    expect(total.warnings.map((w) => w.code)).toContain('LIMITED_BY_TOTAL_NOTIONAL');
+    // the tightest limit speaks; within every limit nothing is said
+    expect(plan({ equity: '10000', risk: { ...RISK, maxOrderNotional: '500' }, totalNotional: '49000' }).warnings.map((w) => w.code)).toEqual(['LIMITED_BY_ORDER_NOTIONAL']);
+    expect(plan({ equity: '10000' })).toMatchObject({ riskContracts: '12', contracts: '12', warnings: [] });
+    // an add is cut the same way, on top of what the position holds
+    const add = plan({ kind: 'add', equity: '10000', held: held({ contracts: '2', avgPx: '90', margin: '18', lever: '10' }), signal: { ...SIGNAL, kind: 'add' }, instrumentNotional: '19300' });
+    expect(add).toMatchObject({ contracts: '6', after: { contracts: '8' } });
   });
 
   it("an add posts at the position's leverage and estimates the position after it", () => {

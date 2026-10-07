@@ -109,9 +109,11 @@ export function SignalsPanel() {
   if (killSwitch) banners.push({ key: 'kill', cls: 'notice-danger', text: t.signals.banner.killSwitch });
   if (exits.available === false && !ownAccount) banners.push({ key: 'exits', cls: 'notice-warn', text: t.signals.banner.exitsUnavailable });
 
-  const inst = selected === null ? undefined : instruments.find((i) => i.instId === selected.instId);
+  // The contract's spec: the terminal's own for a tracked coin, else the one the plan carries (for the figures of the card)
+  const tracked = selected === null ? undefined : instruments.find((i) => i.instId === selected.instId);
+  const inst = tracked ?? selected?.plan?.spec;
   const block = selected === null ? null : followBlock(selected, { ownAccount, killSwitch, exits: exits.available, tradingBlocked: tradingBlock !== null });
-  const manualBlock = tradingBlock !== null ? tradingBlock[lang] : inst === undefined ? t.signals.manualUntracked : null;
+  const manualBlock = tradingBlock !== null ? tradingBlock[lang] : tracked === undefined ? t.signals.manualUntracked : null;
 
   return (
     <div className={`sig${outdated ? ' sig-outdated' : ''}`}>

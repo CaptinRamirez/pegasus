@@ -2,7 +2,7 @@ import type { Instrument } from '@pegasus/shared';
 import { errorText, rejectionText, riskText, useT, type Messages } from '../../i18n';
 import type { OrderPreview } from '../../lib/api';
 import { isApiError } from '../../lib/http';
-import { fmtContracts, fmtNum, fmtPct, fmtPx } from '../../lib/format';
+import { fmtCoinAmount, fmtContracts, fmtNum, fmtPct, fmtPx } from '../../lib/format';
 import { intentOf } from './form';
 
 interface Props {
@@ -10,6 +10,10 @@ interface Props {
   error: unknown;
   isFetching: boolean;
   inst: Instrument | null;
+  /** What the form still lacks for a preview (the size when not given) */
+  hint?: string;
+  /** A part of the exit plan still to fix: the order was previewed without it, so a pass is partial; null when none */
+  problem?: string | null;
 }
 
 function details(e: unknown, t: Messages): string | null {
@@ -20,7 +24,7 @@ function details(e: unknown, t: Messages): string | null {
   return null;
 }
 
-export function PreviewPanel({ preview, error, isFetching, inst }: Props) {
+export function PreviewPanel({ preview, error, isFetching, inst, hint, problem = null }: Props) {
   const t = useT();
   if (error !== null && error !== undefined) {
     const extra = details(error, t);
@@ -34,7 +38,7 @@ export function PreviewPanel({ preview, error, isFetching, inst }: Props) {
     );
   }
   if (preview === undefined) {
-    return <div className="preview dim">{isFetching ? t.preview.previewing : t.preview.enterSize}</div>;
+    return <div className="preview dim">{isFetching ? t.preview.previewing : (hint ?? t.preview.enterSize)}</div>;
   }
   const quote = inst?.quoteCcy ?? 'USD';
   const isMarket = preview.ordType === 'market';
@@ -53,12 +57,13 @@ export function PreviewPanel({ preview, error, isFetching, inst }: Props) {
       )}
       <div className="kv num">
         <span>{t.preview.contracts}</span>
-        <span>{preview.sz}</span>
+        <span>{fmtContracts(preview.sz, inst)}</span>
       </div>
       <div className="kv num">
         <span>{t.preview.coin}</span>
         <span>
-          {preview.coin} {inst?.baseCcy ?? ''}
+          {/* as the sheet and the plan card write it: to the decimals the contract size and the lot make */}
+          {fmtCoinAmount(preview.coin, inst)} {inst?.baseCcy ?? ''}
         </span>
       </div>
       <div className="kv num">
@@ -98,12 +103,12 @@ export function PreviewPanel({ preview, error, isFetching, inst }: Props) {
           <div className="kv num" key={i}>
             <span>{t.follow.tpLeg(i + 1)}</span>
             <span>
-              {fmtPx(leg.triggerPx, inst)} · {fmtContracts(leg.sz, inst)} · <span className="pos">+{fmtNum(leg.profitQuote)} {quote}</span>
+              {fmtPx(leg.triggerPx, inst)} · {t.common.ct(fmtContracts(leg.sz, inst))} · <span className="pos">+{fmtNum(leg.profitQuote)} {quote}</span>
             </span>
           </div>
         ))}
-      <div className={`risk-msg ${preview.risk.ok ? 'good' : 'bad'}`}>
-        {preview.risk.ok ? (closing ? t.preview.closingOk : t.preview.riskOk) : `${preview.risk.code}: ${riskText(preview.risk, t)}`}
+      <div className={`risk-msg ${preview.risk.ok ? (problem === null ? 'good' : 'warn') : 'bad'}`}>
+        {preview.risk.ok ? (closing ? t.preview.closingOk : problem === null ? t.preview.riskOk : t.follow.riskOkPartial) : `${preview.risk.code}: ${riskText(preview.risk, t)}`}
       </div>
     </div>
   );
