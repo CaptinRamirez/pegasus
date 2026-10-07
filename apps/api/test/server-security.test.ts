@@ -10,7 +10,7 @@ import type { ConnectionStatus } from '@pegasus/shared';
 import type { FastifyInstance } from 'fastify';
 import { loadConfig } from '../src/config.js';
 import type { Deps } from '../src/deps.js';
-import { buildServer } from '../src/server.js';
+import { AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW_MS, AuthFailures, buildServer } from '../src/server.js';
 
 const TOKEN = 'test-token';
 const WEB = 'http://localhost:5174';
@@ -26,11 +26,18 @@ const fullStatus: ConnectionStatus = {
   staleStreams: ['SOL-USDT-SWAP:book'],
 };
 
-async function build(env: Record<string, string> = {}): Promise<FastifyInstance> {
+async function build(env: Record<string, string> = {}, authFailures?: AuthFailures): Promise<FastifyInstance> {
   const config = loadConfig({ API_TOKEN: TOKEN, OKX_DEMO: '0', ...env });
   const hub = { size: 2, connectionStatus: () => fullStatus, attach: (socket: WebSocket) => socket.send('attached') };
   const account = { config: null, balance: null };
-  return buildServer({ config, log, hub, account, store: { kind: 'memory' } } as unknown as Deps);
+  const deps = { config, log, hub, account, store: { kind: 'memory' } } as unknown as Deps;
+  return authFailures ? buildServer(deps, authFailures) : buildServer(deps);
+}
+
+async function listen(app: FastifyInstance): Promise<number> {
+  await app.listen({ host: '127.0.0.1', port: 0 });
+  const addr = app.server.address();
+  return typeof addr === 'object' && addr ? addr.port : 0;
 }
 
 /** One request written by hand, so the request line and the Host header are exactly what the test says. */
@@ -72,9 +79,7 @@ describe('API access control', () => {
 
   beforeAll(async () => {
     app = await build();
-    await app.listen({ host: '127.0.0.1', port: 0 });
-    const addr = app.server.address();
-    port = typeof addr === 'object' && addr ? addr.port : 0;
+    port = await listen(app);
   });
 
   afterAll(async () => {
@@ -118,6 +123,55 @@ describe('API access control', () => {
       expect(await upgrade(port, '/ws?token=wrong')).toBe('http:401');
       expect(await upgrade(port, '/ws')).toBe('http:401');
       expect(await upgrade(port, `/ws?token=${TOKEN}`)).toBe('open');
+    });
+  });
+
+  describe('failed token attempts', () => {
+    const wrong = { authorization: 'Bearer wrong' };
+
+    it('after AUTH_FAIL_LIMIT wrong tokens the address is refused with 429, the right token included, until the window has passed', async () => {
+      let now = 1_700_000_000_000;
+      const limited = await build({}, new AuthFailures(AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW_MS, () => now));
+      const limitedPort = await listen(limited);
+      for (let i = 0; i < AUTH_FAIL_LIMIT; i++) {
+        const res = await limited.inject({ method: 'GET', url: '/api/account', headers: wrong });
+        expect([i, res.statusCode]).toEqual([i, 401]);
+      }
+      const blocked = await limited.inject({ method: 'GET', url: '/api/account', headers: wrong });
+      expect(blocked.statusCode).toBe(429);
+      expect(blocked.json()).toMatchObject({ ok: false, error: { code: 'TOO_MANY_ATTEMPTS' } });
+      // guessing right inside the window is not rewarded, on the routes and on the WebSocket upgrade alike
+      expect((await limited.inject({ method: 'GET', url: '/api/account', headers: auth })).statusCode).toBe(429);
+      expect((await limited.inject({ method: 'POST', url: '/api/orders', headers: auth, payload: {} })).statusCode).toBe(429);
+      expect(await upgrade(limitedPort, `/ws?token=${TOKEN}`)).toBe('http:429');
+      // what never needed the token is not blocked
+      expect((await limited.inject({ method: 'GET', url: '/api/health' })).statusCode).toBe(200);
+      now += AUTH_FAIL_WINDOW_MS - 1;
+      expect((await limited.inject({ method: 'GET', url: '/api/account', headers: auth })).statusCode).toBe(429);
+      now += 1;
+      expect((await limited.inject({ method: 'GET', url: '/api/account', headers: auth })).statusCode).toBe(200);
+      expect(await upgrade(limitedPort, `/ws?token=${TOKEN}`)).toBe('open');
+      await limited.close();
+    });
+
+    it('a request with the right token clears the count, and a wrong /ws token counts like a wrong header', async () => {
+      const limited = await build({}, new AuthFailures(AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW_MS));
+      const limitedPort = await listen(limited);
+      for (let i = 0; i < AUTH_FAIL_LIMIT - 1; i++) {
+        expect((await limited.inject({ method: 'GET', url: '/api/account', headers: wrong })).statusCode).toBe(401);
+      }
+      expect((await limited.inject({ method: 'GET', url: '/api/account', headers: auth })).statusCode).toBe(200);
+      for (let i = 0; i < AUTH_FAIL_LIMIT - 1; i++) {
+        expect(await upgrade(limitedPort, '/ws?token=wrong')).toBe('http:401');
+      }
+      expect((await limited.inject({ method: 'GET', url: '/api/account', headers: wrong })).statusCode).toBe(401);
+      expect((await limited.inject({ method: 'GET', url: '/api/account', headers: wrong })).statusCode).toBe(429);
+      expect(await upgrade(limitedPort, '/ws?token=wrong')).toBe('http:429');
+      await limited.close();
+    });
+
+    it('the shared server of this file is never close to the limit', () => {
+      expect(AUTH_FAIL_LIMIT).toBeGreaterThanOrEqual(20);
     });
   });
 

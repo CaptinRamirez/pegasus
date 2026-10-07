@@ -34,7 +34,7 @@ interface LaunchOptions {
   stackPorts(flags: { campaign: boolean }, env: Record<string, string | undefined>): StackPorts;
   webOutDir(flags: { campaign: boolean }): string;
   webOrigins(webPort: number): string;
-  webServerOptions(webPort: number, apiPort: number): { port: number; strictPort: boolean; proxy: Record<string, { target: string; ws?: boolean; changeOrigin?: boolean }> };
+  webServerOptions(webPort: number, apiPort: number): { port: number; strictPort: boolean; headers: Record<string, string>; proxy: Record<string, { target: string; ws?: boolean; changeOrigin?: boolean }> };
   webEnv(ports: StackPorts): Record<string, string>;
 }
 const options = (await import(pathToFileURL(join(scripts, 'launch-options.mjs')).href)) as LaunchOptions;
@@ -163,6 +163,8 @@ describe('the campaign stack beside another one', () => {
     expect(options.webServerOptions(5175, 8788)).toEqual({
       port: 5175,
       strictPort: true,
+      // the page is never served inside another site's frame
+      headers: { 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "frame-ancestors 'none'" },
       proxy: { '/api': { target: 'http://127.0.0.1:8788', changeOrigin: true }, '/ws': { target: 'ws://127.0.0.1:8788', ws: true } },
     });
     // the origins the page is served under are the ones its API accepts

@@ -22,6 +22,49 @@ function tokenMatches(expected: string, provided: string | undefined): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/**
+ * Failed token attempts per client address. A wrong token is rejected as before; after AUTH_FAIL_LIMIT failures
+ * within AUTH_FAIL_WINDOW_MS every request from that address is refused with 429 until the window has passed,
+ * which turns guessing a short token from thousands of tries per second into a few per hour.
+ */
+export const AUTH_FAIL_LIMIT = 20;
+export const AUTH_FAIL_WINDOW_MS = 10 * 60_000;
+
+export class AuthFailures {
+  private readonly byIp = new Map<string, { count: number; windowStart: number }>();
+
+  constructor(
+    private readonly limit = AUTH_FAIL_LIMIT,
+    private readonly windowMs = AUTH_FAIL_WINDOW_MS,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  /** True when this address has exhausted its attempts for the current window. */
+  blocked(ip: string): boolean {
+    const entry = this.byIp.get(ip);
+    if (!entry) return false;
+    if (this.now() - entry.windowStart >= this.windowMs) {
+      this.byIp.delete(ip);
+      return false;
+    }
+    return entry.count >= this.limit;
+  }
+
+  record(ip: string): void {
+    const t = this.now();
+    const entry = this.byIp.get(ip);
+    if (!entry || t - entry.windowStart >= this.windowMs) this.byIp.set(ip, { count: 1, windowStart: t });
+    else entry.count += 1;
+    if (this.byIp.size > 10_000) {
+      for (const [key, value] of this.byIp) if (t - value.windowStart >= this.windowMs) this.byIp.delete(key);
+    }
+  }
+
+  reset(ip: string): void {
+    this.byIp.delete(ip);
+  }
+}
+
 function bearer(req: FastifyRequest): string | undefined {
   const h = req.headers.authorization;
   if (!h || !h.startsWith('Bearer ')) return undefined;
@@ -37,7 +80,7 @@ function hostnameOf(host: string | undefined): string {
   return m?.[1] ?? '';
 }
 
-export async function buildServer(deps: Deps): Promise<FastifyInstance> {
+export async function buildServer(deps: Deps, authFailures: AuthFailures = new AuthFailures()): Promise<FastifyInstance> {
   // The pino logger generic makes FastifyInstance incompatible with the default type used by the route modules; the cast is type-only.
   const app = Fastify({ loggerInstance: deps.log.child({ component: 'http' }), disableRequestLogging: true, trustProxy: false }) as unknown as FastifyInstance;
 
@@ -69,9 +112,14 @@ export async function buildServer(deps: Deps): Promise<FastifyInstance> {
     const route = req.routeOptions.url;
     // /ws checks its own query token below.
     if (route === '/api/health' || route === '/ws') return;
+    if (authFailures.blocked(req.ip)) {
+      return reply.code(429).send(apiErr('TOO_MANY_ATTEMPTS', 'too many failed token attempts from this address; try again later'));
+    }
     if (!tokenMatches(deps.config.server.token, bearer(req))) {
+      authFailures.record(req.ip);
       return reply.code(401).send(apiErr('UNAUTHORIZED', 'missing or invalid API token'));
     }
+    authFailures.reset(req.ip);
   });
 
   app.setErrorHandler((error: unknown, _req, reply) => {
@@ -104,9 +152,16 @@ export async function buildServer(deps: Deps): Promise<FastifyInstance> {
     websocket: true,
     preValidation: async (req, reply) => {
       const token = (req.query as { token?: string }).token;
-      if (!tokenMatches(deps.config.server.token, token)) {
-        await reply.code(401).send(apiErr('UNAUTHORIZED', 'missing or invalid API token'));
+      if (authFailures.blocked(req.ip)) {
+        await reply.code(429).send(apiErr('TOO_MANY_ATTEMPTS', 'too many failed token attempts from this address; try again later'));
+        return;
       }
+      if (!tokenMatches(deps.config.server.token, token)) {
+        authFailures.record(req.ip);
+        await reply.code(401).send(apiErr('UNAUTHORIZED', 'missing or invalid API token'));
+        return;
+      }
+      authFailures.reset(req.ip);
     },
   }, (socket) => {
     deps.hub.attach(socket);

@@ -546,14 +546,18 @@ export interface OkxWsOpResponse<T = unknown> {
 
 export type OkxWsMessage = OkxWsEvent | OkxWsData | OkxWsOpResponse;
 
-export function isWsEvent(m: OkxWsMessage): m is OkxWsEvent {
-  return typeof (m as OkxWsEvent).event === 'string';
+function isRecord(m: unknown): m is Record<string, unknown> {
+  return typeof m === 'object' && m !== null && !Array.isArray(m);
 }
 
-export function isWsData(m: OkxWsMessage): m is OkxWsData {
-  return (m as OkxWsData).arg !== undefined && Array.isArray((m as OkxWsData).data) && (m as OkxWsEvent).event === undefined;
+export function isWsEvent(m: unknown): m is OkxWsEvent {
+  return isRecord(m) && typeof m['event'] === 'string';
 }
 
-export function isWsOpResponse(m: OkxWsMessage): m is OkxWsOpResponse {
-  return typeof (m as OkxWsOpResponse).op === 'string' && typeof (m as OkxWsOpResponse).id === 'string';
+export function isWsData(m: unknown): m is OkxWsData {
+  return isRecord(m) && isRecord(m['arg']) && typeof m['arg']['channel'] === 'string' && Array.isArray(m['data']) && m['event'] === undefined;
+}
+
+export function isWsOpResponse(m: unknown): m is OkxWsOpResponse {
+  return isRecord(m) && typeof m['op'] === 'string' && typeof m['id'] === 'string';
 }

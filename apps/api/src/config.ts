@@ -32,6 +32,11 @@ const envSchema = z.object({
    * Market data stays on OKX (the live hosts); every signed request and the private socket go here instead.
    */
   PAPER_EXCHANGE_URL: endpoint,
+  /**
+   * The launcher (pnpm start, start*.bat) turns '1' into PAPER_EXCHANGE_URL and placeholder keys. The API itself
+   * does not switch to paper on this flag; it refuses to start on an OKX account while it is set (see loadConfig).
+   */
+  PAPER_TRADING: z.enum(['0', '1']).default('0'),
   /** Must stay '0' (REST): '1' used to send order operations over the private WebSocket, see loadConfig. */
   OKX_WS_TRADING: z.enum(['0', '1']).default('0'),
 
@@ -97,6 +102,14 @@ export interface ExitsConfig {
 }
 
 /** Whether a URL names this machine. */
+export const DEFAULT_API_TOKEN = 'change-me';
+
+/** `[::1]` and bare IPv6 addresses need brackets inside a URL. */
+function hostForUrl(host: string): string {
+  const h = host.trim();
+  return h.includes(':') && !h.startsWith('[') ? `[${h}]` : h;
+}
+
 function isLoopback(url: string): boolean {
   try {
     const host = new URL(url).hostname.toLowerCase();
@@ -244,7 +257,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     endpoints.wsPrivate = `${base.protocol === 'https:' ? 'wss' : 'ws'}://${base.host}/ws/v5/private`;
   }
   // The exits of this stage never reach an OKX account: the paper exchange, or a mock on this machine.
-  const exitsEnabled = paper || (overridden && ENDPOINT_OVERRIDES.every((name) => isLoopback(e[name])));
+  const localExchange = paper || (overridden && ENDPOINT_OVERRIDES.every((name) => isLoopback(e[name])));
+  const exitsEnabled = localExchange;
+  // PAPER_TRADING=1 is applied by the launcher only. Honouring it here is impossible (the paper exchange is a
+  // separate process), so the API must not quietly go live on the OKX account when it is started directly.
+  if (e.PAPER_TRADING === '1' && !localExchange) {
+    throw new Error('invalid configuration: PAPER_TRADING=1 is only applied by the launcher (pnpm start, start-paper.bat); started directly, the API would trade on the OKX account. Start it with pnpm start --paper, or set PAPER_EXCHANGE_URL to the paper exchange yourself');
+  }
+  // The shared secret is the only barrier for a client that is not a browser. A known default is acceptable only
+  // while nothing real can be reached through it: no OKX account behind the API and the API bound to loopback.
+  if (e.API_TOKEN === DEFAULT_API_TOKEN) {
+    if (!isLoopback(`http://${hostForUrl(e.API_HOST)}`)) {
+      throw new Error(`invalid configuration: API_TOKEN is the default value while API_HOST=${e.API_HOST} is reachable from other machines; set a random secret (openssl rand -hex 32) in .env`);
+    }
+    if (credentials && !localExchange) {
+      throw new Error('invalid configuration: API_TOKEN is the default value while OKX credentials are configured; anyone on this machine could trade with them. Set a random secret (openssl rand -hex 32) in .env');
+    }
+  }
   const stateFile = resolve(REPO_ROOT, e.STATE_FILE);
   const trailingFile = e.TRAILING_STATE_FILE !== '' ? resolve(REPO_ROOT, e.TRAILING_STATE_FILE) : `${stateFile.replace(/\.json$/i, '')}.trailing.json`;
   return {

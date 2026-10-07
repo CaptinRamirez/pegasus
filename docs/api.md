@@ -2,7 +2,11 @@
 
 All routes live under `/api`. Every route except `GET /api/health` requires
 `Authorization: Bearer <API_TOKEN>`; the check is made on the route the request was matched to, so a
-percent-encoded or absolute-form spelling of a path needs the token like the plain one.
+percent-encoded or absolute-form spelling of a path needs the token like the plain one. After 20 wrong tokens from
+one address within 10 minutes every request from that address, the `/ws` upgrade included and whatever token it
+carries, is answered `429 TOO_MANY_ATTEMPTS` until the 10 minutes have passed; a request with the right token
+clears the count. The API refuses to start with the default token (`change-me`) once OKX credentials are
+configured or `API_HOST` is not loopback.
 
 The API is meant for the terminal page only, which reaches it same-origin through the Vite proxy.
 Every request, including `/api/health`, the `/ws` upgrade and unknown paths, is checked first for where it comes from:
@@ -981,6 +985,7 @@ Error codes returned by the API:
 | code | meaning |
 | --- | --- |
 | `UNAUTHORIZED` | missing/invalid token |
+| `TOO_MANY_ATTEMPTS` | 20 wrong tokens from this address within 10 minutes; every request from it is refused for the rest of the window (429) |
 | `FORBIDDEN_HOST` | the `Host` header does not name this machine (403) |
 | `FORBIDDEN_ORIGIN` | the `Origin` header is not one of `WEB_ORIGINS` (403) |
 | `VALIDATION` | request body failed schema validation (`details.issues`); or an attached stop-loss was refused: on a closing order, on a net-mode order against the open net position, or on the wrong side of the order price or the mark price (`details`: `slTriggerPx`, `refPrice`, `markPx`); take-profits or a trailing exit on such an order; a `clOrdId` whose `ps` prefix does not fit the order's `source`; an exit route without an open position |

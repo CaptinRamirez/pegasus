@@ -6,7 +6,7 @@ import { loadConfig } from '../src/config.js';
 
 describe('loadConfig OKX credentials', () => {
   it('uses the credentials when all three are set and none when all three are empty', () => {
-    expect(loadConfig({ OKX_API_KEY: 'k', OKX_API_SECRET: 's', OKX_API_PASSPHRASE: 'p' }).okx.credentials).toEqual({ apiKey: 'k', apiSecret: 's', passphrase: 'p' });
+    expect(loadConfig({ OKX_API_KEY: 'k', OKX_API_SECRET: 's', OKX_API_PASSPHRASE: 'p', API_TOKEN: 's3cret' }).okx.credentials).toEqual({ apiKey: 'k', apiSecret: 's', passphrase: 'p' });
     expect(loadConfig({}).okx.credentials).toBeUndefined();
     expect(loadConfig({ OKX_API_KEY: '', OKX_API_SECRET: '', OKX_API_PASSPHRASE: '' }).okx.credentials).toBeUndefined();
   });
@@ -121,6 +121,53 @@ describe('loadConfig paper trading', () => {
   });
 });
 
+describe('loadConfig API_TOKEN', () => {
+  const live = { OKX_API_KEY: 'k', OKX_API_SECRET: 's', OKX_API_PASSPHRASE: 'p' };
+  const mock = { OKX_REST_URL: 'http://127.0.0.1:9100', OKX_WS_PUBLIC_URL: 'ws://127.0.0.1:9100/ws/v5/public', OKX_WS_PRIVATE_URL: 'ws://127.0.0.1:9100/ws/v5/private', OKX_WS_BUSINESS_URL: 'ws://127.0.0.1:9100/ws/v5/business' };
+
+  it('the default is refused once an OKX key is configured: a known secret would let any process on this machine trade', () => {
+    expect(() => loadConfig(live)).toThrow(/^invalid configuration: API_TOKEN is the default value while OKX credentials are configured.*openssl rand -hex 32/);
+    expect(() => loadConfig({ ...live, API_TOKEN: 'change-me' })).toThrow(/API_TOKEN is the default value/);
+    expect(() => loadConfig({ ...live, OKX_DEMO: '1' })).toThrow(/API_TOKEN is the default value/);
+    expect(loadConfig({ ...live, API_TOKEN: 's3cret' }).server.token).toBe('s3cret');
+  });
+
+  it('the default is allowed while nothing real is behind the API: no key, the paper exchange, or a mock on this machine', () => {
+    expect(loadConfig({}).server.token).toBe('change-me');
+    expect(loadConfig({ ...live, PAPER_EXCHANGE_URL: 'http://127.0.0.1:9200' }).server.token).toBe('change-me');
+    expect(loadConfig({ ...live, ...mock }).server.token).toBe('change-me');
+    expect(loadConfig({ OKX_API_KEY: 'mock', OKX_API_SECRET: 'mock', OKX_API_PASSPHRASE: 'mock', ...mock }).server.token).toBe('change-me');
+    // a mock that is not on this machine is an exchange like any other
+    expect(() => loadConfig({ ...live, ...mock, OKX_REST_URL: 'http://192.168.1.9:9100' })).toThrow(/API_TOKEN is the default value/);
+  });
+
+  it('the default is refused on an address other machines can reach, with or without a key', () => {
+    for (const host of ['0.0.0.0', '192.168.1.5', '::', 'fd00::1', 'box.lan']) {
+      expect(() => loadConfig({ API_HOST: host })).toThrow(/^invalid configuration: API_TOKEN is the default value while API_HOST=.* is reachable from other machines/);
+      expect(loadConfig({ API_HOST: host, API_TOKEN: 's3cret' }).server.host).toBe(host);
+    }
+    for (const host of ['127.0.0.1', 'localhost', '::1', '127.0.0.2']) {
+      expect(loadConfig({ API_HOST: host }).server.host).toBe(host);
+    }
+  });
+});
+
+describe('loadConfig PAPER_TRADING', () => {
+  const mock = { OKX_REST_URL: 'http://127.0.0.1:9100', OKX_WS_PUBLIC_URL: 'ws://127.0.0.1:9100/ws/v5/public', OKX_WS_PRIVATE_URL: 'ws://127.0.0.1:9100/ws/v5/private', OKX_WS_BUSINESS_URL: 'ws://127.0.0.1:9100/ws/v5/business' };
+
+  it('is applied by the launcher only: an API started directly with it, which would reach OKX, refuses to start', () => {
+    expect(() => loadConfig({ PAPER_TRADING: '1' })).toThrow(/^invalid configuration: PAPER_TRADING=1 is only applied by the launcher.*pnpm start --paper/);
+    expect(() => loadConfig({ PAPER_TRADING: '1', OKX_API_KEY: 'k', OKX_API_SECRET: 's', OKX_API_PASSPHRASE: 'p', API_TOKEN: 's3cret' })).toThrow(/PAPER_TRADING=1 is only applied by the launcher/);
+    expect(() => loadConfig({ PAPER_TRADING: 'yes' })).toThrow(/PAPER_TRADING/);
+  });
+
+  it('passes once the private side goes to the paper exchange or a mock on this machine, which is what the launcher sets', () => {
+    expect(loadConfig({ PAPER_TRADING: '1', PAPER_EXCHANGE_URL: 'http://127.0.0.1:9200' }).okx.paper).toBe(true);
+    expect(loadConfig({ PAPER_TRADING: '1', ...mock }).okx.paper).toBe(false);
+    expect(loadConfig({ PAPER_TRADING: '0' }).okx.paper).toBe(false);
+  });
+});
+
 describe('loadConfig campaign', () => {
   const PAPER = { PAPER_EXCHANGE_URL: 'http://127.0.0.1:9200' };
   const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -150,7 +197,7 @@ describe('loadConfig campaign', () => {
   });
 
   it('refuses to start enabled anywhere but on the paper exchange: this stage is paper only', () => {
-    const live = { OKX_API_KEY: 'k', OKX_API_SECRET: 's', OKX_API_PASSPHRASE: 'p', OKX_DEMO: '0' };
+    const live = { OKX_API_KEY: 'k', OKX_API_SECRET: 's', OKX_API_PASSPHRASE: 'p', OKX_DEMO: '0', API_TOKEN: 's3cret' };
     const mock = { OKX_REST_URL: 'http://127.0.0.1:9100', OKX_WS_PUBLIC_URL: 'ws://127.0.0.1:9100/ws/v5/public', OKX_WS_PRIVATE_URL: 'ws://127.0.0.1:9100/ws/v5/private', OKX_WS_BUSINESS_URL: 'ws://127.0.0.1:9100/ws/v5/business' };
     for (const env of [{}, live, { ...live, OKX_DEMO: '1' }, { ...live, ...mock }]) {
       expect(() => loadConfig({ ...env, CAMPAIGN_ENABLED: '1' })).toThrow(/^invalid configuration: CAMPAIGN_ENABLED=1 is refused: this stage of the campaign is paper only.*pnpm start --paper.*CAMPAIGN_ENABLED=0/);

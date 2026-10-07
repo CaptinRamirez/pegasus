@@ -444,13 +444,23 @@ export class OkxWsClient extends EventEmitter<OkxWsClientEvents> {
 
   private handleRaw(text: string): void {
     if (text === 'pong') return;
-    let msg: OkxWsMessage;
+    let msg: unknown;
     try {
-      msg = JSON.parse(text) as OkxWsMessage;
+      msg = JSON.parse(text);
     } catch {
       this.opts.logger.warn(`${this.opts.name} ws non-JSON message`, { text: text.slice(0, 200) });
       return;
     }
+    // A frame the exchange should never send (null, a number, a shape nobody expects) or a listener that throws
+    // must not take the process down with it: the socket stays up and the frame is logged.
+    try {
+      this.dispatch(msg, text);
+    } catch (err) {
+      this.opts.logger.error(`${this.opts.name} ws message handler failed`, { error: (err as Error).message, text: text.slice(0, 200) });
+    }
+  }
+
+  private dispatch(msg: unknown, text: string): void {
     if (isWsOpResponse(msg)) {
       const pending = this.pendingOps.get(msg.id);
       if (pending) {

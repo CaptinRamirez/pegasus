@@ -75,6 +75,32 @@ describe('OkxWsClient', () => {
     expect(msg.data[0]).toMatchObject({ instId: 'BTC-USDT-SWAP' });
   });
 
+  it('survives frames the exchange should never send and keeps dispatching after them', async () => {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    const logger: OkxWsLogger = { debug() {}, info() {}, warn: (msg) => void warnings.push(msg), error: (msg) => void errors.push(msg) };
+    client = new OkxWsClient({ url: server.url, name: 'public', logger });
+    const ready = once(client, 'ready');
+    client.connect();
+    await ready;
+    const socket = server.sockets[0];
+    if (!socket) throw new Error('no server socket');
+    const frames = [
+      'null', '1', '"text"', '[]', '{}', 'not json',
+      '{"arg":null,"data":[]}', '{"arg":"tickers","data":[]}', '{"arg":{},"data":[]}', '{"arg":{"instId":"X"},"data":[{}]}', '{"arg":{"channel":"tickers"},"data":null}',
+      '{"event":null}', '{"event":{}}', '{"event":"subscribe","arg":null}', '{"event":"subscribe","arg":{}}', '{"event":"error"}',
+      '{"id":5,"op":"order"}', '{"id":"x","op":null}', '{"data":[1]}',
+    ];
+    for (const frame of frames) socket.send(frame);
+    const dataP = once(client, 'data');
+    await client.subscribe([{ channel: 'tickers', instId: 'BTC-USDT-SWAP' }]);
+    const [msg] = (await dataP) as [OkxWsData];
+    expect(msg.data[0]).toMatchObject({ instId: 'BTC-USDT-SWAP' });
+    expect(client.isReady).toBe(true);
+    expect(errors).toEqual([]);
+    expect(warnings.filter((w) => w.includes('non-JSON'))).toHaveLength(1);
+  });
+
   it('never writes the login frame to the log: only its op', async () => {
     const lines: string[] = [];
     const capture = (msg: string, meta?: Record<string, unknown>): void => void lines.push(`${msg} ${JSON.stringify(meta ?? {})}`);

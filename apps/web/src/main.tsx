@@ -5,6 +5,12 @@ import { App } from './App';
 import { useLangStore } from './i18n';
 import './styles.css';
 
+// Defence in depth behind the frame-ancestors header: a framed terminal renders nothing and takes no clicks.
+if (window.top !== window.self) {
+  document.body.textContent = 'Pegasus must not be opened inside another page.';
+  throw new Error('Pegasus must not be framed');
+}
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: { retry: 1, refetchOnWindowFocus: false },

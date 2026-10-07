@@ -56,6 +56,8 @@ const ATTACH_SL_PREFIX = 'sl';
 const TP_PREFIX = 'tp';
 /** Prefix of the client id of a trailing stop (OKX move_order_stop) placed by Pegasus. */
 const TRAIL_PREFIX = 'tr';
+/** Pause between the two "does not exist" answers a retry needs before it may send again. */
+const EARLIER_ATTEMPT_RECHECK_MS = 1_000;
 /** How many submitted client order ids are remembered for the retry lookup. */
 const MAX_SENT_IDS = 200;
 
@@ -550,13 +552,24 @@ export class OrderService {
    * when OKX says it does not exist (51603). Any other answer leaves the outcome unknown, and nothing may be sent.
    */
   private async findEarlierAttempt(instId: string, clOrdId: string): Promise<Order | null> {
-    try {
-      return mapOrder(await this.clients.rest.getOrder({ instId, clOrdId }));
-    } catch (err) {
-      if (err instanceof OkxApiError && err.code === '51603') return null;
-      this.log.warn({ err: (err as Error).message, clOrdId }, 'lookup of the earlier attempt failed; the retry is not sent');
-      throw new AppError('ORDER_STATUS_UNKNOWN', 'the earlier attempt could not be looked up, so this retry was not sent; it may have filled or still be live. Check positions, fills and open orders before retrying', 504, { clOrdId });
+    // "Does not exist" once is not proof: the earlier attempt may still be in flight at the exchange. Only a
+    // second answer of 51603 after a pause lets the retry go out.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return mapOrder(await this.clients.rest.getOrder({ instId, clOrdId }));
+      } catch (err) {
+        if (err instanceof OkxApiError && err.code === '51603') {
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, EARLIER_ATTEMPT_RECHECK_MS));
+            continue;
+          }
+          return null;
+        }
+        this.log.warn({ err: (err as Error).message, clOrdId }, 'lookup of the earlier attempt failed; the retry is not sent');
+        throw new AppError('ORDER_STATUS_UNKNOWN', 'the earlier attempt could not be looked up, so this retry was not sent; it may have filled or still be live. Check positions, fills and open orders before retrying', 504, { clOrdId });
+      }
     }
+    return null;
   }
 
   /** The preview of an order that is already at the exchange, from its own values: no rule is checked again. */

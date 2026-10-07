@@ -375,7 +375,9 @@ describe('OrderService order path against a stubbed exchange', () => {
     h.exchange.answer = () => {
       throw new OkxApiError('51016', 'Client order ID already exists', '/api/v5/trade/order');
     };
-    expect(await settle(h.orders.place(order({ clOrdId: 'retry1' })))).toMatchObject({ code: 'EXCHANGE', details: { okxCode: '51016' } });
+    const duplicate = settle(h.orders.place(order({ clOrdId: 'retry1' })));
+    await vi.advanceTimersByTimeAsync(1_000); // the retry looks the first attempt up twice, a pause apart, before it goes out
+    expect(await duplicate).toMatchObject({ code: 'EXCHANGE', details: { okxCode: '51016' } });
     expect((await h.orders.preview(order())).risk.ok).toBe(false);
 
     // no push ever arrives: the reservation still cannot leak
@@ -415,7 +417,7 @@ describe('OrderService order path against a stubbed exchange', () => {
     await h.account.stop();
   });
 
-  it('the retry is submitted once when OKX says the first attempt does not exist; an order under a new id is never looked up first', async () => {
+  it('the retry is submitted once when OKX says twice that the first attempt does not exist; an order under a new id is never looked up first', async () => {
     const h = await harness();
     const acknowledge = h.exchange.answer;
     h.exchange.answer = () => {
@@ -427,7 +429,10 @@ describe('OrderService order path against a stubbed exchange', () => {
     expect(h.exchange.placed).toHaveLength(1);
 
     h.exchange.answer = acknowledge;
-    const retried = await h.orders.place(order({ clOrdId: 'y1' }));
+    // "does not exist" once is not proof that the first attempt is not in flight: the lookup is repeated after a pause
+    const retry = h.orders.place(order({ clOrdId: 'y1' }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    const retried = await retry;
     expect(retried.order).toMatchObject({ ordId: 'o2', clOrdId: 'y1', state: 'live' });
     expect(h.exchange.placed).toHaveLength(2);
 
@@ -466,14 +471,35 @@ describe('OrderService order path against a stubbed exchange', () => {
     expect(await settle(h.orders.place(order({ clOrdId: 'r2', retry: true })))).toMatchObject({ code: 'ORDER_STATUS_UNKNOWN', status: 504 });
     expect(h.exchange.placed).toHaveLength(0);
 
-    // OKX never had it: sent exactly once, after a single lookup and without waiting
+    // OKX never had it: nothing goes out on the first "does not exist", the lookup is repeated after a pause, then sent exactly once
     h.exchange.lookup = notFound;
     const lookups = h.exchange.lookups;
-    const sent = await h.orders.place(order({ clOrdId: 'r3', retry: true }));
-    expect(sent.order).toMatchObject({ ordId: 'o1', clOrdId: 'r3', state: 'live' });
+    const sending = h.orders.place(order({ clOrdId: 'r3', retry: true }));
+    await vi.advanceTimersByTimeAsync(999);
     expect(h.exchange.lookups).toBe(lookups + 1);
+    expect(h.exchange.placed).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    const sent = await sending;
+    expect(sent.order).toMatchObject({ ordId: 'o1', clOrdId: 'r3', state: 'live' });
+    expect(h.exchange.lookups).toBe(lookups + 2);
     expect(h.exchange.placed).toHaveLength(1);
     expect(h.exchange.placed[0]).not.toHaveProperty('retry');
+    await h.account.stop();
+  });
+
+  it('an earlier attempt that shows up only on the second lookup is answered with, and nothing is sent', async () => {
+    const h = await harness();
+    let calls = 0;
+    h.exchange.lookup = (clOrdId) => {
+      calls += 1;
+      if (calls === 1) notFound();
+      return rawOrder(clOrdId, { ordId: 'late', state: 'live' });
+    };
+    const pending = h.orders.place(order({ clOrdId: 'r9', retry: true }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect((await pending).order).toMatchObject({ ordId: 'late', clOrdId: 'r9', state: 'live' });
+    expect(h.exchange.placed).toHaveLength(0);
+    expect(h.exchange.lookups).toBe(2);
     await h.account.stop();
   });
 
