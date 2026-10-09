@@ -7,7 +7,10 @@ import { useCandleChart } from './useCandleChart';
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const chart = vi.hoisted(() => {
-  const series = () => ({ setData: vi.fn(), update: vi.fn(), applyOptions: vi.fn(), priceScale: () => ({ applyOptions: vi.fn() }) });
+  const series = () => {
+    const scale = { applyOptions: vi.fn() };
+    return { setData: vi.fn(), update: vi.fn(), applyOptions: vi.fn(), priceScale: () => scale, scale };
+  };
   return { scrollToRealTime: vi.fn(), candles: series(), volume: series() };
 });
 
@@ -75,5 +78,20 @@ describe('useCandleChart', () => {
     // straight to a cached history of another instrument
     await render([candle(300_000, '3000')], 'ETH-USDT-SWAP|5m');
     expect(chart.scrollToRealTime).toHaveBeenCalledTimes(3);
+  });
+
+  it('turns the price autoscale back on when the instrument or bar changes, not when the same history is refetched', async () => {
+    const autoScaleOn = () => chart.candles.scale.applyOptions.mock.calls.filter(([o]) => (o as { autoScale?: boolean }).autoScale === true).length;
+    const before = autoScaleOn();
+    await render([candle(60_000, '0.27')], 'DOGE-USDT-SWAP|1D');
+    expect(autoScaleOn()).toBe(before + 1);
+
+    // the trader drags the price axis (the chart turns autoscale off); a refetch keeps their range
+    await render([candle(60_000, '0.28')], 'DOGE-USDT-SWAP|1D');
+    expect(autoScaleOn()).toBe(before + 1);
+
+    // another coin: its candles must be in view, whatever range the axis was dragged to
+    await render([candle(60_000, '2499')], 'ETH-USDT-SWAP|1D');
+    expect(autoScaleOn()).toBe(before + 2);
   });
 });

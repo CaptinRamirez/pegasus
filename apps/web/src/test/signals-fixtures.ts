@@ -40,12 +40,14 @@ export const btcPlan: CampaignFollowPlan = {
   instId: 'BTC-USDT-SWAP',
   side: 'buy',
   tdMode: 'isolated',
+  spec: BTC,
   entryPx: '64180.5',
   stopPx: '58900',
   stopDistance: '5280.5',
   stopDistancePct: '0.08227',
   riskTarget: '250',
   riskAmount: '211.22',
+  riskContracts: '4',
   contracts: '4',
   coin: '0.04',
   notional: '2567.22',
@@ -108,12 +110,14 @@ const ethRow: CampaignSignalRow = {
     ...btcPlan,
     kind: 'add',
     instId: 'ETH-USDT-SWAP',
+    spec: ETH,
     entryPx: '3188.75',
     stopPx: '2905.4',
     stopDistance: '283.35',
     stopDistancePct: '0.08886',
     riskTarget: '250',
     riskAmount: '226.68',
+    riskContracts: '8',
     contracts: '8',
     coin: '0.8',
     notional: '2551',
@@ -206,12 +210,14 @@ const adaRow: CampaignSignalRow = {
   plan: {
     ...btcPlan,
     instId: 'ADA-USDT-SWAP',
+    spec: ADA,
     entryPx: '0.4571',
     stopPx: '0.342',
     stopDistance: '0.1151',
     stopDistancePct: '0.25180',
     riskTarget: '2.5',
     riskAmount: '11.51',
+    riskContracts: '1',
     contracts: '1',
     coin: '100',
     notional: '45.71',
@@ -276,6 +282,64 @@ export const campaignAccountResponse: CampaignSignalsResponse = {
   campaign: { enabled: true, status: 'running', ownAccount: true },
   rows: signalRows.map((r) => (r.plan === null ? r : { ...r, plan: { ...r.plan, warnings: [{ code: 'CAMPAIGN_ACCOUNT', params: {} }, ...r.plan.warnings] } })),
 };
+
+/** ADA as OKX lists it: lots of a tenth of a contract */
+export const ADA_TENTHS: Instrument = { ...ADA, lotSz: '0.1', minSz: '0.1', maxLever: '50' };
+const adaEntryTs = Date.UTC(2026, 9, 5);
+export const adaEntrySignal: SignalSnapshot = { rule: 'campaign', kind: 'entry', barTs: adaEntryTs, close: '0.2703', entryLevel: '0.2687', exitLevel: '0.2366' };
+
+/**
+ * The owner's ADA entry of 2026-10-06, as the API plans it: risk 0.75% of 99,960 USDT sizes 210 contracts, the
+ * per-order limit of 5,000 USDT (each contract valued at the mark plus 0.5% slippage) allows 182.7; leverage 6 instead
+ * of 10 so that the liquidation (0.2293) stays below the stop 0.2366 (at 10x it would be 0.2477).
+ */
+export const adaScenarioPlan: CampaignFollowPlan = {
+  kind: 'entry',
+  instId: 'ADA-USDT-SWAP',
+  side: 'buy',
+  tdMode: 'isolated',
+  spec: ADA_TENTHS,
+  entryPx: '0.2723',
+  stopPx: '0.2366',
+  stopDistance: '0.0357',
+  stopDistancePct: '0.131105',
+  riskTarget: '749.7',
+  riskAmount: '652.239',
+  riskContracts: '210',
+  contracts: '182.7',
+  coin: '18270',
+  notional: '4974.921',
+  leverage: '6',
+  margin: '829.1535',
+  liqPx: '0.229325',
+  maintenanceRate: '0.0105',
+  trailing: { kind: 'channel', bars: 10 },
+  takeProfits: [],
+  after: null,
+  signal: adaEntrySignal,
+  warnings: [
+    { code: 'LEVERAGE_REDUCED', params: { leverage: 6, maxLeverage: 10, liqPx: '0.229325', liqPxAtMax: '0.247671', stopPx: '0.2366', limitPx: '0.234234' } },
+    { code: 'LIMITED_BY_ORDER_NOTIONAL', params: { riskContracts: '210', contracts: '182.7', notional: '4974.921', limit: '5000', riskAmount: '652.239' } },
+  ],
+};
+
+export const adaScenarioRow: CampaignSignalRow = {
+  instId: 'ADA-USDT-SWAP',
+  state: 'entry',
+  reasons: [{ code: 'CLOSE_ABOVE_ENTRY', params: { close: '0.2703', level: '0.2687' } }],
+  tracked: true,
+  daily: { barTs: adaEntryTs, closeTs: adaEntryTs + DAY, close: '0.2703' },
+  halfDay: { barTs: adaEntryTs + HALF, closeTs: adaEntryTs + DAY, close: '0.2703' },
+  levels: { entry: '0.2687', exit: '0.2366', nextEntry: '0.2703', nextExit: '0.2366' },
+  markPx: '0.2723',
+  entryDistancePct: '-0.0073',
+  holding: null,
+  signal: adaEntrySignal,
+  plan: adaScenarioPlan,
+};
+
+/** The read behind the owner's screenshot: one coin, risk 0.75%, the account's 99,960 USDT */
+export const adaScenarioResponse: CampaignSignalsResponse = { ...signalsResponse, riskPct: '0.0075', equity: '99960', rows: [adaScenarioRow] };
 
 export const trailingOn: TrailingView = {
   enabled: true,

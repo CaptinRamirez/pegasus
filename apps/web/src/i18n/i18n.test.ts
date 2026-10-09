@@ -38,8 +38,9 @@ describe('texts of the server in the language of the page', () => {
 
   it('riskText words a rejection from its code and details in Chinese, and falls back to the server message', () => {
     const notional = { code: 'MAX_ORDER_NOTIONAL', message: 'order notional 6000.00 exceeds the limit 5000', details: { notional: '6000.00', limit: '5000' } };
-    expect(riskText(notional, en)).toBe('order notional 6000.00 exceeds the limit 5000');
-    expect(riskText(notional, zh)).toBe('订单名义价值 6000.00 超过单笔上限 5000');
+    // the notional rules are worded by the page in both languages, with the unit and separators
+    expect(riskText(notional, en)).toBe("the order's notional 6,000.00 USDT is over the per-order limit of 5,000.00 USDT");
+    expect(riskText(notional, zh)).toBe('订单名义价值 6,000.00 USDT 超过单笔上限 5,000.00 USDT');
     const band = { code: 'PRICE_BAND', message: 'x', details: { px: '70000', refPrice: '61000', deviationPct: '0.147541' } };
     expect(riskText(band, zh)).toBe('限价 70000 与标记价格 61000 相差 14.75%，超出价格偏离限制');
     expect(riskText({ code: 'FUTURE_RULE', message: 'a rule added later' }, zh)).toBe('a rule added later');
@@ -93,7 +94,7 @@ describe('the signals, the confirmation sheet, the exits and the journal in both
 
   it('words every code the API documents', () => {
     const reasons = ['CLOSE_ABOVE_ENTRY', 'NEAR_ENTRY', 'MARK_ABOVE_ENTRY', 'BELOW_ENTRY', 'HOLDING', 'CLOSE_BELOW_EXIT', 'ADD_TRIGGER_REACHED', 'ADDS_OFF', 'ADD_REF_FROM_POSITION', 'SHORT_HELD', 'NOT_ENOUGH_BARS', 'BARS_UNAVAILABLE', 'NO_MARK_PRICE'];
-    const warnings = ['STOP_NOT_BELOW_ENTRY', 'STOP_TOO_WIDE', 'STOP_TOO_NARROW', 'BELOW_MIN_ORDER', 'OVER_ORDER_NOTIONAL', 'OVER_POSITION_NOTIONAL', 'OVER_TOTAL_NOTIONAL', 'SIGNAL_STALE', 'PRICE_FAR_ABOVE_SIGNAL', 'EQUITY_UNKNOWN', 'LINEAR_ONLY', 'LEVERAGE_REDUCED', 'LIQUIDATION_NEAR_STOP', 'NOT_TRACKED', 'CAMPAIGN_ACCOUNT', 'KILL_SWITCH'];
+    const warnings = ['STOP_NOT_BELOW_ENTRY', 'STOP_TOO_WIDE', 'STOP_TOO_NARROW', 'BELOW_MIN_ORDER', 'LIMITED_BY_ORDER_NOTIONAL', 'LIMITED_BY_POSITION_NOTIONAL', 'LIMITED_BY_TOTAL_NOTIONAL', 'OVER_ORDER_NOTIONAL', 'OVER_POSITION_NOTIONAL', 'OVER_TOTAL_NOTIONAL', 'SIGNAL_STALE', 'PRICE_FAR_ABOVE_SIGNAL', 'EQUITY_UNKNOWN', 'LINEAR_ONLY', 'LEVERAGE_REDUCED', 'LIQUIDATION_NEAR_STOP', 'NOT_TRACKED', 'CAMPAIGN_ACCOUNT', 'KILL_SWITCH'];
     const errors = ['EXITS_UNAVAILABLE', 'TP_LEG_TOO_SMALL', 'TP_TRIGGERS_NOT_DISTINCT', 'BREAKEVEN_NEEDS_SPLIT_TP', 'TP_EXCEEDS_POSITION', 'TRAILING_EXCEEDS_POSITION', 'CAMPAIGN_POSITION', 'TRAILING_STATE_UNREADABLE', 'TRADE_NOT_FOUND'];
     const kinds = ['order_placed', 'order_cancelled', 'fill', 'stop_placed', 'stop_moved', 'stop_triggered', 'stop_cancelled', 'tp_placed', 'tp_moved', 'tp_triggered', 'tp_cancelled', 'trailing_placed', 'trailing_moved', 'trailing_triggered', 'trailing_cancelled', 'liquidation', 'adopted', 'reconciled'];
     for (const t of [en, zh]) {

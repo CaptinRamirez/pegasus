@@ -1,7 +1,7 @@
 import type { CampaignServiceStatus } from './campaign-api.js';
 import type { CampaignStructure } from './campaign.js';
 import type { SignalSnapshot, TakeProfitLeg, TrailingExit } from './schemas.js';
-import type { TdMode } from './types.js';
+import type { Instrument, TdMode } from './types.js';
 
 /**
  * GET /api/campaign/signals: the campaign rule (packages/shared/src/campaign.ts) read per coin for the terminal, each
@@ -53,16 +53,22 @@ export type CampaignSignalReasonCode =
  * What a plan warns about:
  * - STOP_TOO_WIDE / STOP_TOO_NARROW { stopDistancePct, limit }: the stop is unusually far from / close to the entry;
  * - STOP_NOT_BELOW_ENTRY { stopPx, entryPx }: the mark is at or below the exit line: there is no stop to size with, the plan has no size;
- * - BELOW_MIN_ORDER { sized, minSz, riskAmount }: the risk buys less than the minimum order; the plan holds the minimum, which risks riskAmount;
+ * - BELOW_MIN_ORDER { sized, minSz, riskAmount }: the risk buys less than the minimum order; the plan holds the minimum, which risks riskAmount
+ *   (not raised with an OVER_* warning, which leaves the plan without a size);
+ * - LIMITED_BY_ORDER_NOTIONAL, LIMITED_BY_POSITION_NOTIONAL, LIMITED_BY_TOTAL_NOTIONAL { riskContracts, contracts, notional, limit, riskAmount, perContract, slippagePct }:
+ *   the risk sizes riskContracts, but a risk limit (RISK_MAX_ORDER_NOTIONAL, RISK_MAX_POSITION_NOTIONAL_PER_INSTRUMENT,
+ *   RISK_MAX_TOTAL_POSITION_NOTIONAL, counted on the positions held now, each contract valued at `perContract` = the mark plus
+ *   `slippagePct` = RISK_MAX_SLIPPAGE_PCT) allows only `contracts` (`notional` at the mark, risking riskAmount): the plan holds that size;
  * - OVER_ORDER_NOTIONAL { notional, limit }, OVER_POSITION_NOTIONAL { projected, limit }, OVER_TOTAL_NOTIONAL { projected, limit }:
- *   the order would break a risk limit (RISK_MAX_ORDER_NOTIONAL, RISK_MAX_POSITION_NOTIONAL_PER_INSTRUMENT,
- *   RISK_MAX_TOTAL_POSITION_NOTIONAL), counted on the positions held now; the risk engine refuses it;
+ *   even the minimum order would break that risk limit (`notional` / `projected` with the minimum order, counted at the mark plus
+ *   RISK_MAX_SLIPPAGE_PCT as the room was): the plan has no size;
  * - SIGNAL_STALE { barTs, closedAt, ageMs }: the bar of the signal closed more than one bar ago (a newer bar is not confirmed);
  * - PRICE_FAR_ABOVE_SIGNAL { markPx, close, risePct, limit }: the mark is already far above the signal's close;
  * - EQUITY_UNKNOWN {}: no equity to size with: the plan has no size;
  * - LINEAR_ONLY {}: the plan arithmetic is for linear (USDT) contracts: an inverse swap has no size;
- * - LEVERAGE_REDUCED { leverage, maxLeverage }: below the campaign's leverage, so that the liquidation stays below the stop;
- * - LIQUIDATION_NEAR_STOP { liqPx, stopPx }: an add: the position's estimated liquidation would not stay below the stop with the buffer;
+ * - LEVERAGE_REDUCED { leverage, maxLeverage, liqPx, liqPxAtMax, stopPx, limitPx }: below the campaign's leverage (maxLeverage), so that the
+ *   estimated liquidation (liqPx at `leverage`; liqPxAtMax at maxLeverage) stays at or below limitPx = stopPx x (1 - liqBufferPct);
+ * - LIQUIDATION_NEAR_STOP { liqPx, stopPx, limitPx, leverage }: an add: the position's estimated liquidation would not stay at or below limitPx;
  * - NOT_TRACKED {}: this server does not track the coin, so an order on it is refused (UNKNOWN_INSTRUMENT); add it to INSTRUMENTS;
  * - CAMPAIGN_ACCOUNT {}: the campaign service runs on this account: its positions are the pot's, and an order here disturbs it;
  * - KILL_SWITCH {}: trading is halted.
@@ -72,6 +78,9 @@ export type CampaignPlanWarningCode =
   | 'STOP_TOO_WIDE'
   | 'STOP_TOO_NARROW'
   | 'BELOW_MIN_ORDER'
+  | 'LIMITED_BY_ORDER_NOTIONAL'
+  | 'LIMITED_BY_POSITION_NOTIONAL'
+  | 'LIMITED_BY_TOTAL_NOTIONAL'
   | 'OVER_ORDER_NOTIONAL'
   | 'OVER_POSITION_NOTIONAL'
   | 'OVER_TOTAL_NOTIONAL'
@@ -107,13 +116,15 @@ export interface CampaignSignalBar {
 /**
  * How to follow an entry or an add by hand: an isolated market buy now, with its stop at the exit line, the channel
  * trailing exit and no take-profit (the rule exits on the channel only). Sized so that a fill at `entryPx` stopped at
- * `stopPx` loses `riskTarget`, in whole lots.
+ * `stopPx` loses `riskTarget`, in whole lots, and no more than the risk limits allow.
  */
 export interface CampaignFollowPlan {
   kind: 'entry' | 'add';
   instId: string;
   side: 'buy';
   tdMode: Extract<TdMode, 'isolated'>;
+  /** The contract: its size, lot, minimum order, tick and maximum leverage, for a coin the terminal does not track */
+  spec: Instrument;
   /** The mark price now: what a market buy is expected to fill near */
   entryPx: string;
   /** The stop: the exit line, the lowest low of the last exitChannel confirmed daily bars (what the next daily close is measured against, and where the channel trailing exit keeps the stop) */
@@ -126,7 +137,9 @@ export interface CampaignFollowPlan {
   riskTarget: string | null;
   /** What `contracts` lose from entryPx to stopPx; null without equity */
   riskAmount: string | null;
-  /** Whole lots, at least the minimum order; null without equity */
+  /** The contracts the risk alone sizes (whole lots, at least the minimum order), before the risk limits; null without equity */
+  riskContracts: string | null;
+  /** riskContracts, or less when a risk limit allows less (LIMITED_BY_*); null without equity or when even the minimum order breaks a limit (OVER_*) */
   contracts: string | null;
   coin: string | null;
   notional: string | null;

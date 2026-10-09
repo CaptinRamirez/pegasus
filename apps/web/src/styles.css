@@ -298,6 +298,7 @@ a:hover { text-decoration: underline; }
 .preview .risk-msg { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); }
 .preview .risk-msg.bad { color: var(--down); }
 .preview .risk-msg.good { color: var(--up); }
+.preview .risk-msg.warn { color: var(--warn); }
 
 .kv-list { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 11.5px; }
 .kv-list .k { color: var(--fg-muted); }
@@ -499,11 +500,17 @@ a:hover { text-decoration: underline; }
 .exit-pct { display: inline-flex; align-items: center; gap: 4px; }
 .exit-pct input { width: 56px; }
 .exit-rest { color: var(--fg-muted); min-width: 60px; }
+/* what the row comes to, set off from the share's label before it ("% of position | = 0.7236 ...") */
 .exit-echo { color: var(--fg-muted); font-size: 11px; }
+.exit-echo:not(:empty) { padding-left: 8px; border-left: 1px solid var(--border); }
 .exit-add { align-self: flex-start; }
 .exit-breakeven.disabled { opacity: 0.7; }
 .exit-hint { font-size: 11px; line-height: 1.4; }
+.exit-hint.warn { color: var(--warn); }
+.exit-now { color: var(--fg-muted); }
 .exit-error { font-size: 11.5px; }
+.exit-leg-block { display: flex; flex-direction: column; gap: 3px; }
+.exit-suggest { padding: 2px 6px; color: var(--fg-muted); }
 .exit-field { display: flex; flex-direction: column; gap: 2px; font-size: 11px; }
 .exit-field input { width: 120px; }
 
@@ -513,6 +520,7 @@ a:hover { text-decoration: underline; }
 .ticket-exits-toggle { align-self: flex-start; background: none; border: 0; padding: 0; color: var(--fg-muted); font-size: 11px; font-weight: 600; }
 .ticket-exits-toggle .chev { display: inline-block; width: 10px; color: var(--fg-dim); }
 .ticket-exits .exit-row > input { width: 92px; }
+.ticket-hint { margin-top: 3px; font-size: 11px; line-height: 1.4; }
 .ticket-exits-off { font-size: 11px; }
 
 /* ---------- signals ---------- */
@@ -624,6 +632,8 @@ a:hover { text-decoration: underline; }
 .sig-warnings ul { margin: 2px 0 0; padding-left: 16px; font-size: 11.5px; line-height: 1.45; }
 .follow-sheet .sig-warnings { margin-bottom: 10px; }
 .sig-warnings li + li { margin-top: 2px; }
+.sig-warnings-note { margin-top: 4px; font-size: 11px; line-height: 1.4; }
+.exits-resting { margin-top: -2px; }
 .sig-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px; }
 .sig-actions .btn { padding: 7px 16px; font-size: 13px; font-weight: 700; }
 .sig-block { font-size: 11.5px; flex: 1 1 240px; min-width: 0; }
@@ -639,14 +649,20 @@ a:hover { text-decoration: underline; }
 .follow-field input, .follow-field select { color: var(--fg); }
 .follow-hint { min-height: 14px; font-size: 11px; color: var(--fg-muted); }
 .follow-note { font-size: 11px; }
+.follow-size-note { line-height: 1.4; }
+.follow-size-note .btn { margin-left: 8px; padding: 1px 8px; font-size: 11px; vertical-align: baseline; }
+.follow-stop-suggest { flex: 0 0 auto; }
 .follow-check.preview { padding: 10px; }
 .follow-check .kv span:last-child { text-align: right; }
 .follow-tps { margin-top: 6px; }
 .follow-tps th, .follow-tps td { padding: 2px 4px; }
 .follow-summary p { margin: 0; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: var(--radius); font-size: 12.5px; line-height: 1.5; }
 .follow-foot { display: flex; flex-direction: column; gap: 8px; }
-.follow-buttons { display: flex; justify-content: flex-end; gap: 10px; }
+.follow-buttons { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
 .follow-buttons .btn { padding: 7px 18px; font-size: 13px; font-weight: 700; }
+/* why the order cannot be sent yet, printed beside the button */
+.follow-why { flex: 1 1 200px; min-width: 0; text-align: right; font-size: 11.5px; line-height: 1.35; }
+.follow-confirm:disabled { background: var(--bg-3); border-color: var(--border); color: var(--fg-muted); opacity: 0.8; }
 
 /* ---------- the exits of a position ---------- */
 .pos-actions { display: inline-flex; gap: 4px; }
