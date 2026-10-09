@@ -137,7 +137,12 @@ export function useCandleChart(
     const switched = loadedKey.current !== key;
     loadedKey.current = key;
     applyLive(r, live, lastTs);
-    if (switched) r.chart.timeScale().scrollToRealTime();
+    if (switched) {
+      // Dragging the price axis turns its autoscale off, and the range it is left at belongs to the instrument it was
+      // dragged on: another instrument's candles would be drawn outside it and only the volume would show.
+      r.candles.priceScale().applyOptions({ autoScale: true });
+      r.chart.timeScale().scrollToRealTime();
+    }
   }, [history, key]); // live candles are applied by the effect below
 
   useEffect(() => {
