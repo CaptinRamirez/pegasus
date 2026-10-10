@@ -1170,7 +1170,7 @@ export const en = {
     acceptance: 'Paper-stage acceptance',
     ranToEnd: 'Campaigns run to their end',
     ranToEndTitle:
-      'Campaigns the program ran to their end: closed on the exit signal, liquidated, or sold whole by a harvest. Stage G0 asks for 20, with no execution error.',
+      'Campaigns the program ran to their end: closed on the exit signal, liquidated, or sold whole by a harvest. Stage G0 asks for 20, with no execution error, no missed close and a ledger the replay reproduces.',
     ofTarget: (n: number, target: number) => `${n} of ${target}`,
     notCounted: (open: number, external: number, unknown: number) =>
       `Not counted: ${open} open, ${external} closed by hand (external), ${unknown} ended without explanation (unknown).`,

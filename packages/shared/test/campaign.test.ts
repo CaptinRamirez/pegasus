@@ -6,9 +6,11 @@ import {
   campaignAddTriggered,
   campaignContracts,
   campaignEntryQuantity,
+  campaignLeverage,
   campaignMaintenanceRate,
   campaignSignals,
   campaignStake,
+  campaignStopPrice,
   D,
   DEFAULT_CAMPAIGN_PARAMS,
   DEFAULT_POT_PARAMS,
@@ -363,5 +365,27 @@ describe('signals of the same close', () => {
   it('leave one signal alone', () => {
     expect(sameCloseOrder(['BTC-USDT-SWAP'], close)).toEqual(['BTC-USDT-SWAP']);
     expect(sameCloseOrder([], close)).toEqual([]);
+  });
+});
+
+describe('the experiments: a stop and a leverage from the ATR', () => {
+  it('are off in the approved rule: no stop, the rule leverage', () => {
+    expect(campaignStopPrice(100)).toBeNull();
+    expect(campaignLeverage(100, 5, '0.0105').toFixed()).toBe('10');
+  });
+
+  it('puts the stop below the last add price', () => {
+    expect(campaignStopPrice(100, { ...DEFAULT_CAMPAIGN_PARAMS, stop: '0.06' })?.toFixed()).toBe('94');
+  });
+
+  it('sets the leverage so that the liquidation sits k ATRs below the entry, between 1 and the rule leverage', () => {
+    const p: CampaignParams = { ...DEFAULT_CAMPAIGN_PARAMS, atrLeverage: '3' };
+    const lev = campaignLeverage(100, 5, '0.0105', p);
+    expect(lev.lt(10)).toBe(true);
+    // Margin of notional / lev at an average price of 100: liquidated 3 ATRs = 15 below it.
+    expect(isolatedLongLiquidationPrice({ qty: 1, avgPx: 100, margin: D(100).div(lev) }, '0.0105').toDecimalPlaces(10).toFixed()).toBe('85');
+    expect(campaignLeverage(100, 0.1, '0.0105', p).toFixed()).toBe('10');
+    expect(campaignLeverage(100, 40, '0.0105', p).toFixed()).toBe('1');
+    expect(() => campaignLeverage(100, 0, '0.0105', p)).toThrow(/ATR/);
   });
 });

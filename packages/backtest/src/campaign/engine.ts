@@ -1,11 +1,14 @@
 import {
+  atr,
   CAMPAIGN_MAJORS,
   campaignAction,
   campaignAddQuantity,
   campaignContracts,
   campaignEntryQuantity,
+  campaignLeverage,
   campaignSignals,
   campaignStake,
+  campaignStopPrice,
   coinToContracts,
   contractsToCoin,
   D,
@@ -19,6 +22,7 @@ import {
   sameCloseOrder,
   ZERO,
   type CampaignAction,
+  type CampaignParams,
   type CampaignSignals,
   type Candle,
   type FundingRecord,
@@ -104,6 +108,18 @@ import type { Banking, CampaignConfig, CampaignEnd, CampaignInstrument, Campaign
  *      that bar has closed: the live service trades right after the close. Nothing else of the bar
  *      is known: it is not closed, no funding is charged in it, a liquidation inside it is not
  *      seen, and a campaign it opens is marked at its entry open.
+ * C15. The stop (params.stop: an experiment, the approved rule has none). The stop price is the last
+ *      add price (C6: the entry open at first) x (1 - stop). At the open of a bar (C3 a) an open at or
+ *      below it, above the liquidation price, closes the campaign at open x (1 - exit slippage) less
+ *      the fee, before the sales and the exit of (b) and (c); inside the bar (C3 e, the entry bar too)
+ *      a low at or below it, the stop price being above the liquidation price, closes it at
+ *      stop x (1 - exit slippage) less the fee. A stop price at or below the liquidation price is
+ *      never reached before the liquidation. What comes back goes to the free cash, nothing to a
+ *      harvest due at that open.
+ * C16. The leverage of an entry (params.atrLeverage: an experiment): campaignLeverage at the entry fill
+ *      price with the ATR over the entry channel's daily bars up to the signal bar, so that the
+ *      liquidation sits atrLeverage ATRs below the entry, params.leverage at most. The campaign keeps
+ *      that leverage as the cap of its adds (C6).
  *
  * What the replay knows at a close T: candles that closed at or before T and funding settlements
  * with time <= T. Linear contracts only; long only.
@@ -141,6 +157,8 @@ interface Series {
 /** An open campaign: the position (the CampaignPosition of the rule) and what the rule remembers about it. */
 interface Campaign {
   s: Series;
+  /** The rule with this campaign's leverage (C16) */
+  p: CampaignParams;
   signalTs: number;
   entryTime: number;
   entryPx: Decimal;
@@ -364,10 +382,24 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
     c.funding = c.funding.minus(paid);
   };
 
-  /** C3 e-g: the bar that just closed. Returns whether the campaign was liquidated. */
+  /** C5, C15: the campaign is closed at `trigger` less the exit slippage; the equity after the fee comes back. */
+  const close = (c: Campaign, bar: Bar, end: CampaignEnd, trigger: Decimal): void => {
+    const px = trigger.mul(D(1).minus(c.s.exitSlippage));
+    const cost = fee.mul(c.qty).mul(px);
+    c.fees = c.fees.plus(cost);
+    finish(c, bar, end, Decimal.max(ZERO, isolatedLongEquity(c, px).minus(cost)));
+  };
+
+  /** C3 e-g: the bar that just closed. Returns whether the campaign ended in it. */
   const closeBar = (c: Campaign, bar: Bar, now: number): boolean => {
     const { maintenance } = c.s;
-    if (bar.low.lte(isolatedLongLiquidationPrice(c, maintenance))) {
+    const liquidation = isolatedLongLiquidationPrice(c, maintenance);
+    const stop = campaignStopPrice(c.lastAddPx, params);
+    if (stop !== null && stop.gt(liquidation) && bar.low.lte(stop)) {
+      close(c, bar, 'stop', stop);
+      return true;
+    }
+    if (bar.low.lte(liquidation)) {
       finish(c, bar, 'liquidated', ZERO);
       return true;
     }
@@ -394,17 +426,19 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
       finish(c, bar, 'liquidated', ZERO);
       return;
     }
+    const stop = campaignStopPrice(c.lastAddPx, params);
+    if (stop !== null && bar.open.lte(stop)) {
+      close(c, bar, 'stop', bar.open);
+      return;
+    }
     for (const sale of c.sales.splice(0)) if (sell(c, bar, sale)) return;
     if (action === 'exit') {
-      const px = bar.open.mul(D(1).minus(s.exitSlippage));
-      const cost = fee.mul(c.qty).mul(px);
-      c.fees = c.fees.plus(cost);
-      finish(c, bar, 'exit', Decimal.max(ZERO, isolatedLongEquity(c, px).minus(cost)));
+      close(c, bar, 'exit', bar.open);
       return;
     }
     if (action === 'add') {
       const px = bar.open.mul(s.slippage.plus(1));
-      const qty = orderable(campaignAddQuantity(c, c.qty0, bar.open, px, params, config.exchangeCap ? s.inst.maxLever : undefined), s.inst);
+      const qty = orderable(campaignAddQuantity(c, c.qty0, bar.open, px, c.p, config.exchangeCap ? s.inst.maxLever : undefined), s.inst);
       if (qty.gt(0)) {
         const cost = fee.mul(qty).mul(px);
         c.avgPx = c.qty.mul(c.avgPx).plus(qty.mul(px)).div(c.qty.plus(qty));
@@ -417,21 +451,28 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
     }
   };
 
-  /** C1, C2: the entry at the open of `bar`. */
+  /** C16: the ATR over the entry channel's daily bars up to the signal bar that opened at `signalTs` (a signal has them all). */
+  const atrAt = (s: Series, signalTs: number): Decimal => {
+    const k = s.dayIndex.get(signalTs + DAY_MS) as number;
+    return atr(s.days.slice(k - params.entryChannel, k + 1), params.entryChannel);
+  };
+
+  /** C1, C2, C16: the entry at the open of `bar`. */
   const enter = (s: Series, bar: Bar, signalTs: number): void => {
     const event = { instId: s.inst.instId, signalTs };
     const px = bar.open.mul(s.slippage.plus(1));
+    const p = params.atrLeverage === undefined ? params : { ...params, leverage: campaignLeverage(px, atrAt(s, signalTs), s.maintenance, params).toFixed() };
     let qty: Decimal;
     let contracts: Decimal | null = null;
     if (catalogue) {
-      qty = campaignEntryQuantity(1, px, params);
+      qty = campaignEntryQuantity(1, px, p);
     } else {
       const planned = campaignStake(cash, pot);
       if (planned === null) {
         signals.push({ ...event, outcome: 'skipped', rule: 'cash' });
         return;
       }
-      contracts = campaignContracts(campaignEntryQuantity(planned, px, params), s.inst);
+      contracts = campaignContracts(campaignEntryQuantity(planned, px, p), s.inst);
       if (contracts.isZero()) {
         signals.push({ ...event, outcome: 'skipped', rule: 'min-size' });
         return;
@@ -439,12 +480,13 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
       qty = contractsToCoin(contracts, s.inst);
     }
     const notional = qty.mul(px);
-    const margin = notional.div(params.leverage);
+    const margin = notional.div(p.leverage);
     const cost = fee.mul(notional);
     const stake = catalogue ? D(1) : margin.plus(cost);
     if (!catalogue) cash = cash.minus(stake);
     open.set(s.inst.instId, {
       s,
+      p,
       signalTs,
       entryTime: bar.ts,
       entryPx: px,

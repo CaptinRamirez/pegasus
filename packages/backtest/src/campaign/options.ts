@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { CAMPAIGN_INSTRUMENTS, CAMPAIGN_MAINTENANCE, D, DEFAULT_CAMPAIGN_PARAMS, DEFAULT_POT_PARAMS, isDecimalString, type CampaignStructure } from '@pegasus/shared';
+import { CAMPAIGN_INSTRUMENTS, CAMPAIGN_MAINTENANCE, D, DEFAULT_CAMPAIGN_PARAMS, DEFAULT_POT_PARAMS, isDecimalString, type CampaignParams, type CampaignStructure } from '@pegasus/shared';
 import { oneOf, positiveInt, UsageError, utcDate } from '../options.js';
 import type { CampaignConfig, CampaignCosts } from './types.js';
 
@@ -54,6 +54,11 @@ come, one campaign per instrument. Fractions are fractions: 0.05 = 5%.
   --exit-channel n        daily bars of the exit channel (default ${DEFAULT_CAMPAIGN_PARAMS.exitChannel})
   --leverage n            leverage of the entry and cap of an add (default ${DEFAULT_CAMPAIGN_PARAMS.leverage})
   --add-step f            rise of a 12-hour close over the last add price that triggers an add (default ${DEFAULT_CAMPAIGN_PARAMS.addStep})
+  --stop f                experiment: a stop at (1 - f) x the last add price (the entry at first), filled at
+                          that price less the exit slippage, before the liquidation (default: none)
+  --atr-leverage k        experiment: the leverage of each entry set so that its liquidation sits k ATRs
+                          (over the entry channel's daily bars) below the entry, --leverage at most
+                          (default: none, --leverage for every entry)
   --no-funding            do not charge funding
   --offline               read the cache only and never download: for a frozen data set
   --refresh               download the history again instead of extending the cache
@@ -100,9 +105,9 @@ function positive(name: string, value: string): string {
 }
 
 /** Flags that say what is replayed: with --check the reference file says it. */
-const RULE_FLAGS = ['from', 'to', 'pot', 'min-stake', 'catalogue', 'entry-channel', 'exit-channel', 'leverage', 'add-step', 'no-funding', 'refresh'] as const;
+const RULE_FLAGS = ['from', 'to', 'pot', 'min-stake', 'catalogue', 'entry-channel', 'exit-channel', 'leverage', 'add-step', 'stop', 'atr-leverage', 'no-funding', 'refresh'] as const;
 /** Flags that do not go with --reconcile: the ledger's pot says what is replayed, and nothing is written. */
-const NOT_WITH_RECONCILE = ['from', 'to', 'structure', 'pot', 'min-stake', 'catalogue', 'exchange-limits', 'entry-channel', 'exit-channel', 'leverage', 'add-step', 'no-funding', 'check', 'out'] as const;
+const NOT_WITH_RECONCILE = ['from', 'to', 'structure', 'pot', 'min-stake', 'catalogue', 'exchange-limits', 'entry-channel', 'exit-channel', 'leverage', 'add-step', 'stop', 'atr-leverage', 'no-funding', 'check', 'out'] as const;
 
 export function parseCampaignCli(argv: readonly string[]): CampaignCliOptions {
   const string = { type: 'string' } as const;
@@ -126,6 +131,8 @@ export function parseCampaignCli(argv: readonly string[]): CampaignCliOptions {
         'exit-channel': string,
         leverage: string,
         'add-step': string,
+        stop: string,
+        'atr-leverage': string,
         'no-funding': boolean,
         offline: boolean,
         refresh: boolean,
@@ -160,16 +167,22 @@ export function parseCampaignCli(argv: readonly string[]): CampaignCliOptions {
   const mode = values.catalogue === true ? 'catalogue' : d.mode;
   // The exchange's limits belong to the pot; the catalogue is the reference run unless they are asked for.
   const limits = mode === 'pot' || values['exchange-limits'] === true;
+  const params: CampaignParams = {
+    ...d.params,
+    entryChannel: values['entry-channel'] !== undefined ? positiveInt('entry-channel', values['entry-channel']) : d.params.entryChannel,
+    exitChannel: values['exit-channel'] !== undefined ? positiveInt('exit-channel', values['exit-channel']) : d.params.exitChannel,
+    leverage,
+    structure: values.structure !== undefined ? oneOf<CampaignStructure>('structure', values.structure, ['pyramid', 'noadd']) : d.params.structure,
+    addStep: values['add-step'] !== undefined ? positive('add-step', values['add-step']) : d.params.addStep,
+  };
+  if (values.stop !== undefined) {
+    params.stop = positive('stop', values.stop);
+    if (D(params.stop).gte(1)) throw new UsageError('--stop must be below 1');
+  }
+  if (values['atr-leverage'] !== undefined) params.atrLeverage = positive('atr-leverage', values['atr-leverage']);
   const config: CampaignConfig = {
     mode,
-    params: {
-      ...d.params,
-      entryChannel: values['entry-channel'] !== undefined ? positiveInt('entry-channel', values['entry-channel']) : d.params.entryChannel,
-      exitChannel: values['exit-channel'] !== undefined ? positiveInt('exit-channel', values['exit-channel']) : d.params.exitChannel,
-      leverage,
-      structure: values.structure !== undefined ? oneOf<CampaignStructure>('structure', values.structure, ['pyramid', 'noadd']) : d.params.structure,
-      addStep: values['add-step'] !== undefined ? positive('add-step', values['add-step']) : d.params.addStep,
-    },
+    params,
     pot,
     from: values.from !== undefined ? utcDate('from', values.from) : null,
     to: values.to !== undefined ? utcDate('to', values.to) : null,

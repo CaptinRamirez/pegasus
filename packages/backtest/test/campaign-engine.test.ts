@@ -674,3 +674,51 @@ describe('what the replay leaves out', () => {
     expect(() => runCampaigns([data(SETUP, { inst: instrument('AAA-USD-SWAP', { ctType: 'inverse' }) })], config())).toThrow(/linear/);
   });
 });
+
+describe('C15: the stop (experiment)', () => {
+  // Entry open 100: a stop of 5% sits at 95, above the liquidation at 91.
+  const stopped = config({ params: { ...SHORT, stop: '0.05' } });
+
+  it('closes the campaign inside a bar whose low reaches the stop, at the stop less the exit slippage, the entry bar too', () => {
+    const c = only(runCampaigns([data([...SETUP, [100, 100.5, 94.9, 98], QUIET])], stopped));
+    const px = D(95).mul('0.9975');
+    const proceeds = M0.plus(Q0.mul(px.minus(FILL))).minus(Q0.mul(px).mul(FEE));
+    expect(c).toMatchObject({ end: 'stop', endTime: day(4), proceeds: money(proceeds), open: false });
+    expect(D(c.multiple).gt(0.4) && D(c.multiple).lt(0.5)).toBe(true);
+    expect(only(runCampaigns([data([...SETUP, [100, 100.5, 95.01, 98]])], stopped)).end).toBe('end-of-data');
+  });
+
+  it('closes at an open at or below the stop, before the exit decided at the last close', () => {
+    const c = only(runCampaigns([data([...SETUP, QUIET, QUIET, [94, 95, 93, 94.5]])], stopped));
+    const px = D(94).mul('0.9975');
+    expect(c).toMatchObject({ end: 'stop', endTime: day(5), proceeds: money(M0.plus(Q0.mul(px.minus(FILL))).minus(Q0.mul(px).mul(FEE))) });
+  });
+
+  it('follows the last add price', () => {
+    // The entry bar closes at 105.5: an add at the next open, 106, moves the stop to 100.7; the bar after it trades down to 100.6.
+    const c = only(runCampaigns([data([...SETUP, [100, 106, 99.5, 105.5], [106, 107, 100.9, 101], [101, 101.5, 100.6, 101]])], stopped));
+    expect(c).toMatchObject({ end: 'stop', endTime: day(5), adds: 1 });
+    expect(D(c.proceeds).gt(0) && D(c.multiple).lt(1)).toBe(true);
+  });
+
+  it('is never reached before the liquidation when it sits at or below the liquidation price', () => {
+    const c = only(runCampaigns([data([...SETUP, [100, 100.5, 90.99, 95]])], config({ params: { ...SHORT, stop: '0.2' } })));
+    expect(c).toMatchObject({ end: 'liquidated', proceeds: '0' });
+  });
+});
+
+describe('C16: the leverage from the ATR (experiment)', () => {
+  // ATR over the 3 days before the entry: true ranges 2, 2 and 4, so 8/3; at 5 ATRs the liquidation sits 13.33 below the fill of 100.1.
+  const atr5 = config({ params: { ...SHORT, atrLeverage: '5' } });
+
+  it('sets the leverage of the entry so that the liquidation sits k ATRs below the fill', () => {
+    const liq = FILL.minus(D(40).div(3));
+    expect(only(runCampaigns([data([...SETUP, [100, 100.5, 86.8, 95]])], atr5)).end).toBe('end-of-data');
+    expect(only(runCampaigns([data([...SETUP, [100, 100.5, 86.7, 95]])], atr5)).end).toBe('liquidated');
+    expect(liq.toFixed(2)).toBe('86.77');
+    // A quieter market would ask for more than 10x: the rule leverage caps it (liquidation at 91 as without the experiment).
+    const atr1 = config({ params: { ...SHORT, atrLeverage: '1' } });
+    expect(only(runCampaigns([data([...SETUP, [100, 100.5, 91.01, 95]])], atr1)).end).toBe('end-of-data');
+    expect(only(runCampaigns([data([...SETUP, [100, 100.5, 90.99, 95]])], atr1)).end).toBe('liquidated');
+  });
+});

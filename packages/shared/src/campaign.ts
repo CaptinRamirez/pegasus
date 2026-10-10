@@ -33,6 +33,16 @@ export interface CampaignParams {
   addStep: string;
   /** Taker fee the sizing leaves room for, fraction of the fill notional */
   feeRate: string;
+  /**
+   * Experiment of the backtest, not the approved rule: a stop at (1 - stop) x the last add price (the entry at
+   * first); the campaign is closed when the price reaches it, before the liquidation. Absent: no stop.
+   */
+  stop?: string;
+  /**
+   * Experiment of the backtest: the leverage of each entry is set so that its liquidation sits this many ATRs (over
+   * the entry channel's daily bars) below the entry, `leverage` at most. Absent: `leverage` for every entry.
+   */
+  atrLeverage?: string;
 }
 
 export const DEFAULT_CAMPAIGN_PARAMS: CampaignParams = {
@@ -174,6 +184,25 @@ export function isolatedLongLiquidationPrice(pos: CampaignPosition, maintenance:
   const qty = D(pos.qty);
   if (!qty.gt(0)) throw new SignalError('BAD_INPUT', 'the position must hold a positive quantity');
   return qty.mul(pos.avgPx).minus(pos.margin).div(qty.mul(D(1).minus(maintenance)));
+}
+
+/** Stop price of a campaign (the stop experiment): lastAddPx x (1 - stop); null when the rule has no stop. */
+export function campaignStopPrice(lastAddPx: DecimalInput, p: CampaignParams = DEFAULT_CAMPAIGN_PARAMS): Decimal | null {
+  return p.stop === undefined ? null : D(lastAddPx).mul(D(1).minus(p.stop));
+}
+
+/**
+ * Leverage of an entry at `px`: p.leverage, or with atrLeverage the leverage at which the liquidation price of the
+ * isolated long sits atrLeverage x atr below px, capped at p.leverage and at least 1. From
+ * isolatedLongLiquidationPrice with margin = qty x px / L: liq / px = (1 - 1/L) / (1 - maintenance).
+ */
+export function campaignLeverage(px: DecimalInput, atr: DecimalInput, maintenance: DecimalInput, p: CampaignParams = DEFAULT_CAMPAIGN_PARAMS): Decimal {
+  if (p.atrLeverage === undefined) return D(p.leverage);
+  const price = D(px);
+  if (price.lte(0) || D(atr).lte(0)) throw new SignalError('BAD_INPUT', 'price and ATR must be positive');
+  const distance = D(atr).mul(p.atrLeverage).div(price);
+  const inverse = D(1).minus(D(1).minus(distance).mul(D(1).minus(maintenance)));
+  return Decimal.min(p.leverage, Decimal.max(1, D(1).div(inverse)));
 }
 
 /**

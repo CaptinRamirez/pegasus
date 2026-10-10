@@ -64,6 +64,8 @@ describe('the summary of a pot run', () => {
       leverage: '10',
       addStep: '0.05',
       feeRate: '0.0005',
+      stop: null,
+      atrLeverage: null,
       funding: true,
       exchangeCap: false,
       maintenance: { 'AAA-USDT-SWAP': '0.01' },

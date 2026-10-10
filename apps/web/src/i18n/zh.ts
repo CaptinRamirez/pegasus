@@ -938,7 +938,7 @@ export const zh: Messages = {
 
     acceptance: '纸面阶段验收',
     ranToEnd: '由程序走完的战役',
-    ranToEndTitle: '由程序走完全程的战役：按离场信号平仓、被强平，或被取回整笔卖出。第 0 关要求 20 次，且执行错误为零。',
+    ranToEndTitle: '由程序走完全程的战役：按离场信号平仓、被强平，或被取回整笔卖出。第 0 关要求 20 次，且执行错误为零、错过收盘为零、账本与回放逐笔一致。',
     ofTarget: (n, target) => `${n} / ${target}`,
     notCounted: (open, external, unknown) => `未计入：${open} 个持仓中，${external} 个被手动平仓（外部），${unknown} 个原因不明地结束（未知）。`,
     errorCount: '执行错误',

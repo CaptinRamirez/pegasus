@@ -81,4 +81,14 @@ describe('campaign command line', () => {
     expect(() => parseCampaignCli(['--offline', '--refresh'])).toThrow(UsageError);
     expect(() => parseCampaignCli(['--unknown'])).toThrow(UsageError);
   });
+
+  it('reads the experiments, which the approved rule does not have', () => {
+    expect(parseCampaignCli([]).config.params).not.toHaveProperty('stop');
+    expect(parseCampaignCli([]).config.params).not.toHaveProperty('atrLeverage');
+    expect(parseCampaignCli(['--stop', '0.06', '--atr-leverage', '3']).config.params).toMatchObject({ stop: '0.06', atrLeverage: '3', leverage: '10' });
+    expect(() => parseCampaignCli(['--stop', '1'])).toThrow(/below 1/);
+    expect(() => parseCampaignCli(['--atr-leverage', '0'])).toThrow(UsageError);
+    expect(() => parseCampaignCli(['--check', 'ref.json', '--stop', '0.06'])).toThrow(UsageError);
+    expect(() => parseCampaignCli(['--reconcile', 'ledger.json', '--atr-leverage', '3'])).toThrow(UsageError);
+  });
 });

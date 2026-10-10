@@ -129,6 +129,12 @@ export function AcceptanceCard({ view }: { view: CampaignView }) {
         <span className="v num campaign-errcount" title={t.campaign.errorCountTitle}>
           <b className={view.errorCount > 0 ? 'neg' : 'pos'}>{view.errorCount}</b> <span className="dim">({t.campaign.errorTarget})</span>
         </span>
+        <span className="k" title={t.campaign.missedTitle}>
+          {t.campaign.missedCloses}
+        </span>
+        <span className="v num campaign-missed-acceptance" title={t.campaign.missedTitle}>
+          <b className={view.missedCloses > 0 ? 'neg' : 'pos'}>{view.missedCloses}</b> <span className="dim">({t.campaign.errorTarget})</span>
+        </span>
       </div>
       <div className="bar pos">
         <div style={{ width: `${progress}%` }} />

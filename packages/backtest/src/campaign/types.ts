@@ -76,8 +76,11 @@ export interface CampaignInstrument {
   next?: { ts: number; open: string };
 }
 
-/** 'harvest': the sale of a harvest closed the campaign, because less than the minimum order would have been left. */
-export type CampaignEnd = 'exit' | 'liquidated' | 'harvest' | 'end-of-data';
+/**
+ * 'harvest': the sale of a harvest closed the campaign, because less than the minimum order would have been left.
+ * 'stop': the stop of the experiment (C15) was reached.
+ */
+export type CampaignEnd = 'exit' | 'stop' | 'liquidated' | 'harvest' | 'end-of-data';
 
 /** One campaign from entry to end. Money as decimal strings in the quote currency. */
 export interface CampaignRecord {

@@ -68,6 +68,9 @@ export interface CampaignSummary {
     leverage: string;
     addStep: string;
     feeRate: string;
+    /** The experiments (C15, C16); null when not run */
+    stop: string | null;
+    atrLeverage: string | null;
     funding: boolean;
     /** Adds cut to what the exchange accepts: notional within maxLever x the position's margin */
     exchangeCap: boolean;
@@ -85,6 +88,8 @@ export interface CampaignSummary {
   campaigns: {
     count: number;
     exited: number;
+    /** Closed by the stop of the experiment */
+    stopped: number;
     liquidated: number;
     /** Closed by the sale of a harvest */
     harvested: number;
@@ -187,6 +192,8 @@ export function buildCampaignSummary(result: CampaignResult, config: CampaignCon
       leverage: config.params.leverage,
       addStep: config.params.addStep,
       feeRate: config.params.feeRate,
+      stop: config.params.stop ?? null,
+      atrLeverage: config.params.atrLeverage ?? null,
       funding: config.funding,
       exchangeCap: config.exchangeCap,
       maintenance: result.maintenance,
@@ -203,6 +210,7 @@ export function buildCampaignSummary(result: CampaignResult, config: CampaignCon
     campaigns: {
       count: campaigns.length,
       exited: campaigns.filter((c) => c.end === 'exit').length,
+      stopped: campaigns.filter((c) => c.end === 'stop').length,
       liquidated: campaigns.filter((c) => c.end === 'liquidated').length,
       harvested: campaigns.filter((c) => c.end === 'harvest').length,
       open: campaigns.filter((c) => c.open).length,
@@ -228,7 +236,9 @@ export function formatCampaignSummary(s: CampaignSummary): string {
   lines.push(`Campaign replay (${run.mode})  ${run.instruments.join(', ')}  ${run.from} to ${run.to}`);
   lines.push(
     `rule: close above the ${run.entryChannel}-day high, long at ${run.leverage}x isolated, ${run.structure === 'pyramid' ? `adds every ${pct(Number(run.addStep), 0)} (pyramid)` : 'no adds'}, ` +
-      `out below the ${run.exitChannel}-day low; fee ${pct(Number(run.feeRate), 2)}, funding ${run.funding ? 'charged' : 'not charged'}`,
+      `out below the ${run.exitChannel}-day low; fee ${pct(Number(run.feeRate), 2)}, funding ${run.funding ? 'charged' : 'not charged'}` +
+      (run.stop !== null ? `; stop ${pct(Number(run.stop), 1)} below the last add price` : '') +
+      (run.atrLeverage !== null ? `; leverage per entry: liquidation ${run.atrLeverage} ATRs below it` : ''),
   );
   const byRate = new Map<string, string[]>();
   for (const [instId, rate] of Object.entries(run.maintenance)) byRate.set(rate, [...(byRate.get(rate) ?? []), instId.split('-')[0] ?? instId]);
@@ -242,7 +252,9 @@ export function formatCampaignSummary(s: CampaignSummary): string {
       .join(', ') || 'none';
   lines.push('');
   lines.push(`signals: ${s.signals.entries} entries, ${s.signals.taken} taken; skipped: ${list(s.signals.skipped)}; no next bar: ${s.signals.noNextBar}`);
-  lines.push(`campaigns: ${c.count} (${c.liquidated} liquidated, ${c.exited} exited, ${c.harvested > 0 ? `${c.harvested} closed by a harvest, ` : ''}${c.open} open at the end, marked), ${c.adds} adds`);
+  lines.push(
+    `campaigns: ${c.count} (${c.liquidated} liquidated, ${c.exited} exited, ${c.stopped > 0 ? `${c.stopped} stopped, ` : ''}${c.harvested > 0 ? `${c.harvested} closed by a harvest, ` : ''}${c.open} open at the end, marked), ${c.adds} adds`,
+  );
   const m = c.multiples;
   lines.push(
     `multiples of the stake: lost ${pct(m.lost)}  below the stake ${pct(m.belowStake)}  median ${times(m.median)}  mean ${times(m.mean)}  without the top two ${times(m.meanWithoutTop2)}  ` +
