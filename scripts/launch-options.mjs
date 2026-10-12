@@ -5,8 +5,8 @@ const FLAGS = ['--mock', '--paper', '--campaign', '--dev', '--no-open'];
 /**
  * --mock: local mock exchange instead of OKX (made-up prices); --paper: paper trading (OKX's live prices, a
  * simulated account); --campaign: paper trading on the campaign pot's own paper account, with the campaign enabled
- * (it is paper trading, so `paper` is true with it); --dev: Vite dev server instead of the built page; --no-open: no
- * browser.
+ * (it is paper trading, so `paper` is true with it); --paper and --campaign together: both stacks from one window
+ * (`both`); --dev: Vite dev server instead of the built page; --no-open: no browser.
  */
 export function parseFlags(argv) {
   const unknown = argv.filter((arg) => !FLAGS.includes(arg));
@@ -16,7 +16,7 @@ export function parseFlags(argv) {
   if (argv.includes('--mock') && argv.includes('--paper')) throw new Error('--mock 和 --paper 不能同时使用：--mock 的行情是随机生成的，--paper 用的是 OKX 实盘行情');
   if (argv.includes('--mock') && argv.includes('--campaign')) throw new Error('--mock 和 --campaign 不能同时使用：滚仓只在纸面交易上运行（OKX 实盘行情，虚拟账户），--mock 的行情是随机生成的');
   const campaign = argv.includes('--campaign');
-  return { mock: argv.includes('--mock'), paper: campaign || argv.includes('--paper'), campaign, dev: argv.includes('--dev'), open: !argv.includes('--no-open') };
+  return { mock: argv.includes('--mock'), paper: campaign || argv.includes('--paper'), campaign, both: campaign && argv.includes('--paper'), dev: argv.includes('--dev'), open: !argv.includes('--no-open') };
 }
 
 /** The ports of a plain or --paper stack: the API's and the paper exchange's from .env, the page's the one vite.config.ts names. */

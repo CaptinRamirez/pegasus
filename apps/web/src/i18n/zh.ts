@@ -100,7 +100,7 @@ export const zh: Messages = {
     killSwitchOn: '紧急停止已开启',
     haltAll: '暂停全部交易',
     signOut: '退出登录',
-    badge: { paper: '纸面交易', demo: '模拟盘', live: '实盘' },
+    badge: { paper: '纸面交易', demo: '模拟盘', live: '实盘', campaign: '滚仓' },
     paperTitle: '纸面交易：订单、持仓和资金都由 Pegasus 按 OKX 实盘行情模拟，不会向任何 OKX 账户发送指令。',
     dots: { ws: '后端', public: '行情', private: '账户', business: 'K线' },
     dotTitle: (label, state) => `${label}：${state}`,

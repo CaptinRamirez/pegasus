@@ -1,4 +1,5 @@
 import { useMutation } from '@tanstack/react-query';
+import { useEffect } from 'react';
 import type { ConnState, KillSwitchRequest } from '@pegasus/shared';
 import { errorText, useLang, useT } from '../i18n';
 import { api } from '../lib/api';
@@ -23,6 +24,7 @@ export function Header() {
   const lang = useLang();
   const demo = useStore((s) => s.demo);
   const paper = useStore((s) => s.paper);
+  const campaignOn = useStore((s) => s.campaign !== null && s.campaign.status !== 'disabled');
   const connection = useStore((s) => s.connection);
   const wsStatus = useStore((s) => s.wsStatus);
   const balance = useStore((s) => s.balance);
@@ -34,6 +36,12 @@ export function Header() {
   const killSwitch = risk?.killSwitch ?? false;
   const equity = balance?.totalEq ?? risk?.currentEquity ?? null;
   const dailyPnl = risk?.dailyPnl ?? null;
+
+  const modeBadge = paper ? t.header.badge.paper : demo ? t.header.badge.demo : t.header.badge.live;
+  // The browser tab names the stack: the campaign's page and the paper page look the same otherwise.
+  useEffect(() => {
+    document.title = `Pegasus · ${campaignOn ? t.header.badge.campaign : modeBadge}`;
+  }, [campaignOn, modeBadge, t]);
 
   /** The second question of a release that the server refused with DAILY_LOSS_ACTIVE; `details` are that refusal's. */
   const rebaseQuestion = (details: Record<string, unknown> | undefined): string => {
@@ -73,8 +81,9 @@ export function Header() {
     <header className="header">
       <span className="brand">PEGASUS</span>
       <span className={`badge ${paper || demo ? 'badge-demo' : 'badge-live'}`} {...(paper ? { title: t.header.paperTitle } : {})}>
-        {paper ? t.header.badge.paper : demo ? t.header.badge.demo : t.header.badge.live}
+        {modeBadge}
       </span>
+      {campaignOn && <span className="badge badge-demo">{t.header.badge.campaign}</span>}
       <div className="dots">
         <Dot label={t.header.dots.ws} state={wsStatus} />
         <Dot label={t.header.dots.public} state={connection?.okxPublic} />

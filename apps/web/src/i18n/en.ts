@@ -225,7 +225,7 @@ export const en = {
     killSwitchOn: 'KILL SWITCH ON',
     haltAll: 'Halt all trading',
     signOut: 'Sign out',
-    badge: { paper: 'PAPER', demo: 'DEMO', live: 'LIVE' },
+    badge: { paper: 'PAPER', demo: 'DEMO', live: 'LIVE', campaign: 'CAMPAIGN' },
     paperTitle: 'Paper trading: orders, positions and balance are simulated by Pegasus on the live OKX prices. Nothing is sent to an OKX account.',
     dots: { ws: 'ws', public: 'public', private: 'private', business: 'business' },
     dotTitle: (label: string, state: string) => `${label}: ${state}`,

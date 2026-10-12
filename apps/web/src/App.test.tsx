@@ -677,6 +677,9 @@ describe('App', () => {
     });
     await settleAll();
     expect(activeTab()).toBe('Campaign');
+    // the header and the browser tab say which stack this page is
+    expect([...container.querySelectorAll('header .badge')].map((b) => b.textContent)).toEqual(['DEMO', 'CAMPAIGN']);
+    expect(document.title).toBe('Pegasus · CAMPAIGN');
     expect(container.querySelector('.panel-bottom-tall')).not.toBeNull();
     expect(container.querySelector('.campaign-status')?.textContent).toBe('running');
     // an API without the replay route: the replay parts say so, the rest of the scoreboard is there

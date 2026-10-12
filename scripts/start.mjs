@@ -8,6 +8,8 @@
 // --campaign has its own ports (API 8788, paper exchange 9201, page 5175), log directory, trade journal and built
 // page (apps/web/dist-campaign), so it runs beside `pnpm start` or `pnpm start --paper`. The page reaches its API
 // through the proxy of scripts/vite.stack.config.mjs, which points it at the API of its own stack.
+// --paper --campaign starts both stacks from this one window (start-all.bat): the paper stack first, then the
+// campaign's, with every line of a service's output tagged [纸面] or [滚仓].
 import { exec, execFileSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { connect } from 'node:net';
@@ -24,10 +26,11 @@ const STACK_CONFIG = '../../scripts/vite.stack.config.mjs';
 const children = new Map();
 let stopping = false;
 let exitCode = 0;
-let webUrl = null;
 
 const say = (msg) => console.log(`[pegasus] ${msg}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** A service's name with its stack's tag in front when both stacks run in this window. */
+const labelled = (tag, name) => (tag ? `${tag}·${name}` : name);
 
 /** The commit the stack is started from; null when git or the repository is not there. */
 function gitVersion() {
@@ -45,9 +48,24 @@ function localPort(url) {
   return ['127.0.0.1', 'localhost', '[::1]'].includes(hostname) ? Number(port || 80) : null;
 }
 
-/** Runs one service with this Node binary; the commands mirror the packages' own start/dev scripts. */
+/**
+ * Runs one service with this Node binary; the commands mirror the packages' own start/dev scripts. With `opts.tag`
+ * (both stacks in one window) its output passes through here with the tag in front of every line; `opts.onStdout`
+ * also sees what it prints.
+ */
 function start(name, dir, args, opts = {}) {
-  const child = spawn(process.execPath, args, { cwd: join(root, dir), env: { ...process.env, ...opts.env }, stdio: opts.stdio ?? ['ignore', 'inherit', 'inherit'] });
+  const tag = opts.tag ?? '';
+  const piped = tag !== '' || opts.onStdout !== undefined;
+  const child = spawn(process.execPath, args, { cwd: join(root, dir), env: { ...process.env, ...opts.env }, stdio: ['ignore', piped ? 'pipe' : 'inherit', tag ? 'pipe' : 'inherit'] });
+  // shortcut: a chunk is tagged line by line, so a line split across two chunks continues untagged; pino and vite write whole lines
+  const tagged = (text) => (tag ? text.replace(/^(?=.)/gm, `[${tag}] `) : text);
+  child.stdout?.setEncoding('utf8');
+  child.stdout?.on('data', (text) => {
+    process.stdout.write(tagged(text));
+    opts.onStdout?.(text);
+  });
+  child.stderr?.setEncoding('utf8');
+  child.stderr?.on('data', (text) => process.stderr.write(tagged(text)));
   children.set(name, child);
   child.on('error', (err) => {
     children.delete(name);
@@ -128,19 +146,22 @@ async function waitFor(what, ready, timeoutMs) {
 /**
  * Serves the built page with `vite preview`, or runs the dev server with --dev, on the stack's page port with /api and
  * /ws proxied to the stack's API (scripts/vite.stack.config.mjs). Either way Vite's output is piped so the URL it
- * settles on can be read; that also keeps it from clearing the other services' logs.
+ * settles on can be read (`onUrl`); that also keeps it from clearing the other services' logs.
  */
-function startWeb(dev, ports, outDir) {
+function startWeb(tag, dev, ports, outDir, onUrl) {
   const args = dev ? ['--config', STACK_CONFIG, '--port', String(ports.web), '--strictPort'] : ['preview', '--config', STACK_CONFIG, '--port', String(ports.web), '--strictPort', '--outDir', outDir];
-  const child = start('前端', 'apps/web', ['node_modules/vite/bin/vite.js', ...args], { stdio: ['ignore', 'pipe', 'inherit'], env: webEnv(ports) });
   let seen = '';
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', (text) => {
-    process.stdout.write(text);
-    if (webUrl !== null) return;
+  let found = false;
+  const onStdout = (text) => {
+    if (found) return;
     seen += text;
-    webUrl = /Local:\s+(\S+)/.exec(seen.replace(/\x1b\[[0-9;]*m/g, ''))?.[1] ?? null;
-  });
+    const url = /Local:\s+(\S+)/.exec(seen.replace(/\x1b\[[0-9;]*m/g, ''))?.[1];
+    if (url !== undefined) {
+      found = true;
+      onUrl(url);
+    }
+  };
+  start(labelled(tag, '前端'), 'apps/web', ['node_modules/vite/bin/vite.js', ...args], { tag, env: webEnv(ports), onStdout });
 }
 
 function openBrowser(url) {
@@ -157,6 +178,17 @@ async function main() {
 
   // Same precedence as node --env-file: a variable already set in the environment wins over the file.
   const base = { ...(existsSync(envFile) ? parseEnv(readFileSync(envFile, 'utf8')) : {}), ...process.env };
+  const version = gitVersion();
+  if (!flags.both) return runStack(flags, base, version, '');
+  say('两套栈在这一个窗口里依次启动：先纸面交易栈，再滚仓栈；每行前面的 [纸面] 或 [滚仓] 说明那一行属于哪套');
+  await runStack({ ...flags, campaign: false }, base, version, '纸面');
+  if (!stopping) await runStack(flags, base, version, '滚仓');
+}
+
+/** Builds and starts one stack (the exchange it trades on, the API, the page) and opens its page; `tag` names it when both run. */
+async function runStack(flags, base, version, tag) {
+  const log = tag ? (msg) => say(`${tag}：${msg}`) : say;
+  let webUrl = null;
   // Paper trading is chosen on the command line or, for double-clicking start.bat, by PAPER_TRADING=1 in .env.
   const paper = flags.paper || (!flags.mock && base.PAPER_TRADING === '1');
   // --campaign has ports of its own (CAMPAIGN_*_PORT move them); the others take API_PORT and PAPER_PORT from .env.
@@ -168,14 +200,13 @@ async function main() {
   const apiPort = ports.api;
   const mockPort = localPort(env.OKX_REST_URL);
   if (paper && mockPort !== null) throw new Error('纸面交易需要 OKX 的真实行情，但 .env 里的 OKX_REST_URL 指向了本机的模拟交易所；请删掉 .env 里的四个 OKX_*_URL 再启动');
-  const version = gitVersion();
   const mode = flags.campaign
     ? '，滚仓模式（纸面交易：OKX 实盘行情，资金池专用的虚拟账户 data/paper-campaign.json，账本 data/campaign-ledger.json，不会向 OKX 下单）'
     : paper
       ? '，纸面交易模式（OKX 实盘行情，虚拟账户，不会向 OKX 下单）'
       : '';
-  say(`版本：${version ?? '未知（不是 git 仓库或没有安装 git）'}${flags.mock ? '，模拟交易所模式（--mock）' : ''}${mode}${flags.dev ? '，开发模式（--dev）' : ''}`);
-  if (flags.campaign) say(`滚仓使用自己的端口（后端 ${ports.api}，纸面交易所 ${ports.paper}，页面 ${ports.web}）、日志目录 logs/campaign 和交易日志 data/journal.campaign.json，可以和 pnpm start --paper 同时运行`);
+  log(`版本：${version ?? '未知（不是 git 仓库或没有安装 git）'}${flags.mock ? '，模拟交易所模式（--mock）' : ''}${mode}${flags.dev ? '，开发模式（--dev）' : ''}`);
+  if (flags.campaign) log(`滚仓使用自己的端口（后端 ${ports.api}，纸面交易所 ${ports.paper}，页面 ${ports.web}）、日志目录 logs/campaign 和交易日志 data/journal.campaign.json，可以和 pnpm start --paper 同时运行`);
 
   const busy = [];
   if (mockPort !== null && (await portOpen(mockPort))) busy.push(mockPort);
@@ -185,39 +216,41 @@ async function main() {
 
   // Built before anything is started: a failed build leaves nothing running, and the page and the API come from the same files.
   if (!flags.dev) {
-    say('正在构建前端页面');
-    const code = await runToEnd('前端构建', 'apps/web', ['node_modules/vite/bin/vite.js', 'build', '--outDir', webOutDir(flags)]);
+    log('正在构建前端页面');
+    const code = await runToEnd(labelled(tag, '前端构建'), 'apps/web', ['node_modules/vite/bin/vite.js', 'build', '--outDir', webOutDir(flags)]);
     if (code !== 0) throw new Error(`前端页面构建失败（退出码 ${code}），Pegasus 没有启动。具体错误见上面的输出`);
     if (stopping) return;
   }
 
   if (mockPort !== null) {
-    say(`正在启动模拟交易所（端口 ${mockPort}）`);
-    start('模拟交易所', 'packages/mock-okx', ['--import', 'tsx', 'src/cli.ts'], { env: { MOCK_OKX_PORT: String(mockPort) } });
-    await waitFor('模拟交易所', () => portOpen(mockPort), 30_000);
+    log(`正在启动模拟交易所（端口 ${mockPort}）`);
+    start(labelled(tag, '模拟交易所'), 'packages/mock-okx', ['--import', 'tsx', 'src/cli.ts'], { tag, env: { MOCK_OKX_PORT: String(mockPort) } });
+    await waitFor(labelled(tag, '模拟交易所'), () => portOpen(mockPort), 30_000);
     if (stopping) return;
   }
 
   if (paperPort !== null) {
-    say(`正在启动纸面交易所（端口 ${paperPort}）；它先补算上次关闭以来的行情，隔得久会多等一会儿`);
+    log(`正在启动纸面交易所（端口 ${paperPort}）；它先补算上次关闭以来的行情，隔得久会多等一会儿`);
     // The same .env as the API: INSTRUMENTS, the campaign's settings and the PAPER_* settings come from it; --campaign
     // gives it the pot's own account (paperExchangeEnv).
-    start('纸面交易所', 'packages/paper', ['--env-file-if-exists=../../.env', '--import', 'tsx', 'src/cli.ts'], { env: paperExchangeEnv(flags, overrides, paperPort) });
-    await waitFor('纸面交易所', () => portOpen(paperPort), 300_000);
+    start(labelled(tag, '纸面交易所'), 'packages/paper', ['--env-file-if-exists=../../.env', '--import', 'tsx', 'src/cli.ts'], { tag, env: paperExchangeEnv(flags, overrides, paperPort) });
+    await waitFor(labelled(tag, '纸面交易所'), () => portOpen(paperPort), 300_000);
     if (stopping) return;
   }
 
-  say(`正在启动后端（端口 ${apiPort}）`);
-  start('后端', 'apps/api', ['--env-file-if-exists=../../.env', '--import', 'tsx', 'src/index.ts'], { env: version === null ? overrides : { ...overrides, PEGASUS_VERSION: version } });
-  await waitFor('后端', () => apiHealthy(apiPort), 60_000);
+  log(`正在启动后端（端口 ${apiPort}）`);
+  start(labelled(tag, '后端'), 'apps/api', ['--env-file-if-exists=../../.env', '--import', 'tsx', 'src/index.ts'], { tag, env: version === null ? overrides : { ...overrides, PEGASUS_VERSION: version } });
+  await waitFor(labelled(tag, '后端'), () => apiHealthy(apiPort), 60_000);
   if (stopping) return;
 
-  say('正在启动前端');
-  startWeb(flags.dev, ports, webOutDir(flags));
-  await waitFor('前端', () => webUrl !== null, 60_000);
+  log('正在启动前端');
+  startWeb(tag, flags.dev, ports, webOutDir(flags), (url) => {
+    webUrl = url;
+  });
+  await waitFor(labelled(tag, '前端'), () => webUrl !== null, 60_000);
   if (stopping) return;
 
-  say(`Pegasus 已启动：${webUrl}`);
+  log(`Pegasus 已启动：${webUrl}`);
   say('关闭这个窗口（或按 Ctrl+C）会停止全部服务');
   if (flags.open) openBrowser(webUrl);
 }

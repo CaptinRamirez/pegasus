@@ -65,6 +65,7 @@ pnpm start        # Windows 上也可以直接双击 start.bat
 | 参数 | 作用 |
 | --- | --- |
 | `--paper` | 纸面交易：OKX 实盘行情，虚拟账户，不向 OKX 下单，也不需要 API key（见下） |
+| `--campaign` | 滚仓：纸面交易，资金池专用的虚拟账户（见下）；和 `--paper` 一起写就是在同一个窗口里先后启动两套（Windows 上双击 start-all.bat） |
 | `--mock` | 不连 OKX，改用本地模拟交易所（见方式一） |
 | `--dev` | 开发模式：前端用 Vite 开发服务器（改代码即时刷新），不做构建 |
 | `--no-open` | 不自动打开浏览器 |
@@ -124,7 +125,7 @@ pnpm start --paper     # Windows 上也可以直接双击 start-paper.bat
 pnpm start --campaign     # Windows 上也可以直接双击 start-campaign.bat
 ```
 
-**滚仓模式用自己的一组端口**：页面 http://localhost:5175，后端 8788，纸面交易所 9201。所以它可以和 `pnpm start --paper`（页面 5174）同时运行，两个页面各开一个浏览器标签。第一次打开 5175 时要再输入一次 token。端口可以用 `CAMPAIGN_WEB_PORT`、`CAMPAIGN_API_PORT`、`CAMPAIGN_PAPER_PORT` 修改。
+**滚仓模式用自己的一组端口**：页面 http://localhost:5175，后端 8788，纸面交易所 9201。所以它可以和 `pnpm start --paper`（页面 5174）同时运行，两个页面各开一个浏览器标签（标签页标题和页面左上角的标识分别写着"滚仓"和"纸面交易"）。要在一个窗口里同时启动两套，用 `pnpm start --paper --campaign`，Windows 上双击 `start-all.bat`：先启动纸面交易栈，再启动滚仓栈，窗口里每行前面的 `[纸面]` 或 `[滚仓]` 说明那一行属于哪套。第一次打开 5175 时要再输入一次 token。端口可以用 `CAMPAIGN_WEB_PORT`、`CAMPAIGN_API_PORT`、`CAMPAIGN_PAPER_PORT` 修改。
 
 **资金池有自己的纸面账户和文件**，和 `--paper` 的账户（`data/paper-account.json`）互不影响：
 

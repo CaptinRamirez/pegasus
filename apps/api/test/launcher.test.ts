@@ -23,7 +23,7 @@ interface StackPorts {
   web: number;
 }
 interface LaunchOptions {
-  parseFlags(argv: string[]): { mock: boolean; paper: boolean; campaign: boolean; dev: boolean; open: boolean };
+  parseFlags(argv: string[]): { mock: boolean; paper: boolean; campaign: boolean; both: boolean; dev: boolean; open: boolean };
   mockEnv(port?: number): Record<string, string>;
   paperEnv(port?: number): Record<string, string>;
   campaignEnv(port?: number, potStart?: string, ports?: StackPorts): Record<string, string>;
@@ -41,13 +41,13 @@ const options = (await import(pathToFileURL(join(scripts, 'launch-options.mjs'))
 
 describe('launcher options', () => {
   it('understands --mock, --paper, --campaign, --dev and --no-open and refuses anything else', () => {
-    expect(options.parseFlags([])).toEqual({ mock: false, paper: false, campaign: false, dev: false, open: true });
-    expect(options.parseFlags(['--mock', '--no-open'])).toEqual({ mock: true, paper: false, campaign: false, dev: false, open: false });
-    expect(options.parseFlags(['--paper'])).toEqual({ mock: false, paper: true, campaign: false, dev: false, open: true });
-    expect(options.parseFlags(['--dev'])).toEqual({ mock: false, paper: false, campaign: false, dev: true, open: true });
-    // the campaign is paper trading
-    expect(options.parseFlags(['--campaign'])).toEqual({ mock: false, paper: true, campaign: true, dev: false, open: true });
-    expect(options.parseFlags(['--campaign', '--paper', '--dev'])).toEqual({ mock: false, paper: true, campaign: true, dev: true, open: true });
+    expect(options.parseFlags([])).toEqual({ mock: false, paper: false, campaign: false, both: false, dev: false, open: true });
+    expect(options.parseFlags(['--mock', '--no-open'])).toEqual({ mock: true, paper: false, campaign: false, both: false, dev: false, open: false });
+    expect(options.parseFlags(['--paper'])).toEqual({ mock: false, paper: true, campaign: false, both: false, dev: false, open: true });
+    expect(options.parseFlags(['--dev'])).toEqual({ mock: false, paper: false, campaign: false, both: false, dev: true, open: true });
+    // the campaign is paper trading; with --paper as well, both stacks start from one window
+    expect(options.parseFlags(['--campaign'])).toEqual({ mock: false, paper: true, campaign: true, both: false, dev: false, open: true });
+    expect(options.parseFlags(['--campaign', '--paper', '--dev'])).toEqual({ mock: false, paper: true, campaign: true, both: true, dev: true, open: true });
     expect(() => options.parseFlags(['--mcok'])).toThrow('--mcok');
     // made-up prices and real prices are two different things
     expect(() => options.parseFlags(['--mock', '--paper'])).toThrow('不能同时使用');
@@ -277,6 +277,23 @@ describe('launcher in a stub tree', () => {
       expect(plain.stdout).not.toContain('滚仓使用自己的端口');
     } finally {
       for (const key of ['CAMPAIGN_API_PORT', 'CAMPAIGN_PAPER_PORT', 'CAMPAIGN_WEB_PORT']) delete extraEnv[key];
+    }
+  });
+
+  it('--paper --campaign starts both stacks from one window, the paper stack first, its lines tagged', () => {
+    writeFileSync(join(root, 'apps/web/node_modules/vite/bin/vite.js'), "console.log('vite ' + process.argv.slice(2).join(' '));\nprocess.exit(3);\n");
+    extraEnv['PAPER_PORT'] = String(freePort); // a paper stack may be running on this machine
+    try {
+      const run = launch('--paper', '--campaign');
+      expect(run.status).toBe(1);
+      expect(run.stdout).toContain('两套栈在这一个窗口里依次启动');
+      expect(run.stdout).toContain('[pegasus] 纸面：版本：');
+      expect(run.stdout).toContain('[pegasus] 纸面：正在构建前端页面');
+      expect(run.stdout).toContain('vite build --outDir dist');
+      // the paper stack's build failed, so the campaign's never began
+      expect(run.stdout).not.toContain('滚仓：');
+    } finally {
+      delete extraEnv['PAPER_PORT'];
     }
   });
 
