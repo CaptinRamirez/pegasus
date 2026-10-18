@@ -122,6 +122,8 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
   private lastDecision: TraderLastDecision | null = null;
   /** The model asked for a close: the result of the position is dated by it */
   private closing = false;
+  /** A position the trader did not open was logged already */
+  private foreignWarned = false;
   private readonly model: TraderModel | null;
   private readonly sources: TraderDossierSources;
   private readonly now: () => number;
@@ -210,6 +212,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     const fifteen = inSession || this.state.position !== null || this.state.control.position !== null ? await this.confirmedBars(bar) : [];
     await this.reconcilePosition(bar, now, equity, fifteen);
     await this.expirePendingLimit(bar);
+    await this.guardStop(bar);
     this.settleControl(fifteen, bar);
     const done = (): void => {
       this.state.lastBarTs = bar;
@@ -218,6 +221,14 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     };
     // Outside the session a position is left to its stop; nothing is asked.
     if (!inSession || this.model === null) return done();
+    // A position the trader did not open: nothing is asked and nothing is opened until it is gone.
+    const foreign = this.foreignPosition();
+    if (foreign) {
+      if (!this.foreignWarned) this.log.warn({ instId: this.config.instId, pos: foreign.pos, avgPx: foreign.avgPx }, 'the exchange holds a position the trader did not open: it asks nothing and opens nothing until that position is closed');
+      this.foreignWarned = true;
+      return done();
+    }
+    this.foreignWarned = false;
     const position = this.state.position;
     const dossier = await buildTraderDossier({ instId: this.config.instId, now: bar, sources: this.sources, account: this.accountInfo(equity, position), guardrails: g, calendar: this.calendarFor(bar), triggers: [] });
     const triggers = detectTriggers(this.lastDossier, dossier, position);
@@ -294,6 +305,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     if (!inTraderSession(bar, g)) return 'outside the session';
     if (s.position) return `a ${s.position.side} is held`;
     if (s.pendingLimit) return 'a limit order is resting';
+    if (this.foreignPosition()) return 'the exchange holds a position the trader did not open';
     if (s.tradesToday >= g.maxTradesPerDay) return `the day's ${g.maxTradesPerDay} trades are done`;
     if (s.equityAtStart !== null && D(s.pnlToday).lte(D(s.equityAtStart).mul(g.dailyLossPct).neg())) return `the daily loss limit (${D(g.dailyLossPct).mul(100).toFixed()}% of ${s.equityAtStart}) is reached`;
     if (s.cooldownUntil !== null && s.cooldownUntil > bar) return `cooling down until ${iso(s.cooldownUntil)} after ${g.maxConsecutiveLosses} losses in a row`;
@@ -368,6 +380,50 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     return this.deps.account.positionList().find((p) => p.instId === this.config.instId && !D(p.pos || '0').isZero()) ?? null;
   }
 
+  /** A position on the instrument that the trader neither holds nor is waiting to fill: someone else's (a manual order, a lost answer). */
+  private foreignPosition(): Position | null {
+    if (this.state.position || this.state.pendingLimit) return null;
+    return this.livePosition();
+  }
+
+  /**
+   * The held position still has its stop on the exchange: when none is found (a partial fill, a stop the exchange did
+   * not create, one cancelled by hand) one is placed at the held stop price, and when the mark is already past it the
+   * position is closed. Not for a position opened in this step: the exchange creates its stop as it fills.
+   */
+  private async guardStop(bar: number): Promise<void> {
+    const held = this.state.position;
+    if (!held || held.openedAt >= bar) return;
+    const live = this.livePosition();
+    if (!live) return;
+    const { instId } = this.config;
+    const closing = held.side === 'long' ? 'sell' : 'buy';
+    let algos;
+    try {
+      algos = await this.deps.account.refreshAlgoOrders();
+    } catch (err) {
+      this.log.warn({ err: (err as Error).message }, 'the stops could not be read: the stop guard waits for the next close');
+      return;
+    }
+    if (algos.orders.some((o) => o.instId === instId && o.side === closing && o.slTriggerPx !== '')) return;
+    const posSide = this.deps.account.config?.posMode === 'long_short_mode' ? held.side : undefined;
+    const mark = this.deps.market.liveMarkPrice(instId);
+    const past = mark !== undefined && (held.side === 'long' ? D(mark).lte(held.stopPx) : D(mark).gte(held.stopPx));
+    try {
+      if (past) {
+        await this.deps.orders.closePosition({ instId, mgnMode: 'isolated', ...(posSide ? { posSide } : {}) });
+        this.log.error({ instId, stopPx: held.stopPx, mark }, 'the position had no stop and the mark is past it: closed at the market');
+      } else {
+        await this.deps.orders.placeStop({ instId, mgnMode: 'isolated', ...(posSide ? { posSide } : {}), slTriggerPx: held.stopPx });
+        this.log.error({ instId, stopPx: held.stopPx }, 'the position had no stop on the exchange: one was placed at the held stop price');
+      }
+      this.record({ ts: this.now(), kind: 'error', instId, error: past ? `no stop on the exchange and the mark ${mark ?? ''} past ${held.stopPx}: closed at the market` : `no stop on the exchange: one placed at ${held.stopPx}` });
+    } catch (err) {
+      this.log.error({ instId, err: (err as Error).message }, 'the missing stop could not be restored');
+      this.record({ ts: this.now(), kind: 'error', instId, error: `no stop on the exchange and it could not be restored: ${(err as Error).message}` });
+    }
+  }
+
   /** A position gone from the exchange is a result; a limit order that filled is a position. */
   private async reconcilePosition(bar: number, now: number, equity: string, fifteen: readonly Candle[]): Promise<void> {
     const live = this.livePosition();
@@ -385,6 +441,15 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     } else if (!held && live && this.state.pendingLimit) {
       const p = this.state.pendingLimit;
       this.state.pendingLimit = null;
+      // A partial fill: the rest is cancelled, so that the exchange creates the stop for what filled (it waits for the order to end).
+      if (this.deps.account.openOrderList().some((o) => o.clOrdId === p.clOrdId)) {
+        try {
+          await this.deps.orders.cancel({ instId: this.config.instId, clOrdId: p.clOrdId });
+          this.log.info({ clOrdId: p.clOrdId, filled: live.pos }, 'trader limit order partly filled: the rest is cancelled');
+        } catch (err) {
+          this.log.warn({ clOrdId: p.clOrdId, err: (err as Error).message }, 'the rest of a partly filled limit order could not be cancelled');
+        }
+      }
       const entryPx = live.avgPx !== '' ? live.avgPx : p.px;
       this.openPosition({ side: p.side, contracts: D(live.pos).abs().toFixed(), entryPx, stopPx: p.stopPx, targetPx: p.targetPx, openedAt: now, clOrdId: p.clOrdId, equityAtEntry: p.equityAtEntry }, entryPx, bar);
       this.record({ ts: now, kind: 'execution', instId: this.config.instId, order: { clOrdId: p.clOrdId, side: p.side === 'long' ? 'buy' : 'sell', entryType: 'limit', contracts: p.contracts, entryPx, stopPx: p.stopPx, targetPx: p.targetPx, leverage: p.leverage } });
@@ -440,6 +505,9 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
 
   private openControl(position: TraderPosition, mark: string, bar: number): void {
     const inst = this.deps.market.requireInstrument(this.config.instId);
+    // The control's last position is still open (it had no target, or the trader's ended first): it is closed at the mark and booked.
+    const previous = this.state.control.position;
+    if (previous) this.endControl(previous, mark, 'close', bar);
     const side = this.flip();
     const m = D(mark);
     const entry = side === 'long' ? m.mul(D(1).plus(CONTROL_SLIPPAGE)) : m.mul(D(1).minus(CONTROL_SLIPPAGE));
@@ -573,6 +641,8 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     if (this.stateError !== null) return { status: 'blocked', reason: { code: 'STATE_UNREADABLE', message: `${this.stateError}: the trader does not trade until the file is repaired or moved away` } };
     if (this.model === null) return { status: 'blocked', reason: { code: 'NO_MODEL_CREDENTIALS', message: 'no ANTHROPIC_API_KEY in the environment: put one in .env and restart the stack' } };
     if (!this.deps.account.ready || this.equity() === null) return { status: 'blocked', reason: { code: 'ACCOUNT_UNAVAILABLE', message: 'the paper account has not been read yet' } };
+    const foreign = this.foreignPosition();
+    if (foreign) return { status: 'blocked', reason: { code: 'FOREIGN_POSITION', message: `the paper account holds a ${this.config.instId} position of ${foreign.pos} contracts that the trader did not open: it asks nothing and opens nothing until that position is closed` } };
     if (this.state.position) return { status: 'holding', reason: null };
     return { status: inTraderSession(now, this.config.guardrails) ? 'in-session' : 'idle', reason: null };
   }

@@ -45,6 +45,14 @@ How to decide:
 - confidence is your probability, from 0 to 1, that the trade reaches its target before its stop; be calibrated, not enthusiastic.
 - Prices are decimal strings with the instrument's precision; limitPrice, stopPx and targetPx are strings or null.`;
 
+/**
+ * The answer's ceiling: the model's whole output (its thinking counts) may not exceed it. The board asked for a hundred
+ * times the first 4,000; the model's own maximum, 128,000, is the most the API accepts. Only what is generated is paid.
+ */
+export const TRADER_MAX_TOKENS = 128_000;
+/** A call longer than this is given up (and retried once by the SDK): the 15-minute bar is not waited past. */
+export const TRADER_TIMEOUT_MS = 180_000;
+
 export class ClaudeTraderModel implements TraderModel {
   readonly name: string;
   private readonly client: Anthropic;
@@ -53,19 +61,21 @@ export class ClaudeTraderModel implements TraderModel {
   constructor(opts: { model: string; effort: TraderEffort; timeoutMs?: number; client?: Anthropic }) {
     this.name = opts.model;
     this.effort = opts.effort;
-    this.client = opts.client ?? new Anthropic({ timeout: opts.timeoutMs ?? 60_000, maxRetries: 1 });
+    this.client = opts.client ?? new Anthropic({ timeout: opts.timeoutMs ?? TRADER_TIMEOUT_MS, maxRetries: 1 });
   }
 
   async decide(dossier: TraderDossier): Promise<TraderModelAnswer> {
     const started = Date.now();
-    const res = await this.client.messages.parse({
+    // Streamed: the SDK wants a stream for a ceiling this large; the final message carries the parsed decision.
+    const stream = this.client.messages.stream({
       model: this.name,
-      max_tokens: 4000,
+      max_tokens: TRADER_MAX_TOKENS,
       thinking: { type: 'adaptive' },
       output_config: { effort: this.effort, format: zodOutputFormat(traderDecisionSchema) },
       system: [{ type: 'text', text: TRADER_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: JSON.stringify(dossier) }],
     });
+    const res = await stream.finalMessage();
     const usage: TraderUsage = {
       inputTokens: res.usage.input_tokens,
       outputTokens: res.usage.output_tokens,

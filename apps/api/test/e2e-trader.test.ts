@@ -278,3 +278,74 @@ describe('the Claude auto trader on the paper exchange', () => {
     expect(s.service.view().status).toBe('idle');
   });
 });
+
+/** Moves the mid (and with it the mark) and waits until the API's market data has it. */
+async function moveTo(s: Stack, mid: string): Promise<void> {
+  s.mock.setPrice(BTC, mid);
+  await waitFor(() => s.deps.market.liveMarkPrice(BTC) === D(mid).toFixed(), 5000, `BTC at ${mid}`);
+}
+
+const stops = async (s: Stack) => (await s.deps.account.refreshAlgoOrders()).orders.filter((o) => o.instId === BTC && o.slTriggerPx !== '');
+
+describe('the trader keeps its position covered and its books straight', () => {
+  let s: Stack;
+  beforeAll(async () => {
+    s = await startStack('5', DAY + 13 * H + 45 * 60_000 + 5_000);
+  }, 30_000);
+  afterAll(async () => {
+    await stopStack(s);
+  });
+
+  it('puts the stop back when the exchange has none for the position', async () => {
+    s.model.queue.push(decide({ action: 'long', stopPx: '59700' }));
+    await closeAt(s, DAY + 14 * H);
+    await waitFor(() => position(s), 5000, 'the long');
+    const before = await stops(s);
+    expect(before.map((o) => o.slTriggerPx)).toEqual(['59700']);
+    await s.deps.orders.cancelStop({ instId: BTC, algoId: (before[0] as { algoId: string }).algoId });
+    expect(await stops(s)).toEqual([]);
+    await closeAt(s, DAY + 14 * H + M15);
+    expect((await stops(s)).map((o) => o.slTriggerPx)).toEqual(['59700']);
+    expect(records(s).some((r) => r.kind === 'error' && /no stop on the exchange: one placed at 59700/.test(r.error ?? ''))).toBe(true);
+  });
+
+  it('closes the control s open position at the mark before it opens the next one', async () => {
+    // the stop fires on the exchange; the control (settled on the flat test candles) is still open
+    await moveTo(s, '59600');
+    await waitFor(() => !position(s), 5000, 'the long stopped out');
+    await closeAt(s, DAY + 14 * H + 2 * M15);
+    expect(s.service.stateCopy().recent).toHaveLength(1);
+    expect(s.service.stateCopy().control.position).not.toBeNull();
+    await moveTo(s, String(PRICE));
+    s.model.queue.push(decide({ action: 'long', stopPx: '59700', targetPx: '60600' }));
+    await closeAt(s, DAY + 15 * H);
+    await waitFor(() => position(s), 5000, 'the second long');
+    const control = s.service.stateCopy().control;
+    expect(control.trades).toBe(2);
+    expect(control.wins + control.losses).toBe(1);
+    expect(control.position).not.toBeNull();
+  });
+
+  it('asks nothing and opens nothing while the account holds a position it did not open', async () => {
+    s.model.queue.push(decide({ action: 'close' }));
+    await closeAt(s, DAY + 16 * H);
+    await waitFor(() => !position(s), 5000, 'the second long closed');
+    await closeAt(s, DAY + 16 * H + M15);
+    expect(s.service.stateCopy().position).toBeNull();
+    // a manual order on the trader's account
+    await s.deps.orders.place({ instId: BTC, side: 'buy', ordType: 'market', tdMode: 'isolated', size: { unit: 'contracts', value: '1' } });
+    await waitFor(() => position(s), 5000, 'the manual long');
+    const calls = s.model.calls;
+    s.model.queue.push(decide({ action: 'long', stopPx: '59700' }));
+    await closeAt(s, DAY + 17 * H);
+    expect(s.model.calls).toBe(calls);
+    expect(s.service.view()).toMatchObject({ status: 'blocked', reason: { code: 'FOREIGN_POSITION' } });
+    expect(s.service.stateCopy().position).toBeNull();
+    // once it is gone the trader goes on
+    await s.deps.orders.closePosition({ instId: BTC, mgnMode: 'isolated' });
+    await waitFor(() => !position(s), 5000, 'the manual long closed');
+    await closeAt(s, DAY + 18 * H);
+    expect(s.model.calls).toBe(calls + 1);
+    expect(s.service.view().status).toBe('holding');
+  });
+});
