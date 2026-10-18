@@ -20,19 +20,20 @@ import type { OrdType, PosSide, Side, TdMode } from './types.js';
  * - external: an order not placed through Pegasus (OKX's app or website, another program), and a position the journal
  *   found open without having seen it open.
  */
-export type TradeSource = OrderSource | 'campaign' | 'external';
-export const TRADE_SOURCES: readonly TradeSource[] = ['manual', 'signal', 'campaign', 'external'] as const;
+export type TradeSource = OrderSource | 'campaign' | 'trader' | 'external';
+export const TRADE_SOURCES: readonly TradeSource[] = ['manual', 'signal', 'campaign', 'trader', 'external'] as const;
 
 /** Client order id prefixes that tell where an order comes from (see sourceOfClOrdId). */
-export const CL_ORD_PREFIXES = { campaign: 'pc', signal: 'ps', pegasus: 'pg' } as const;
+export const CL_ORD_PREFIXES = { campaign: 'pc', signal: 'ps', trader: 'pt', pegasus: 'pg' } as const;
 
 /**
- * Where an order comes from by its client order id alone: `pc` the campaign, `ps` a signal followed from the terminal,
+ * Where an order comes from by its client order id alone: `pc` the campaign, `pt` the Claude auto trader, `ps` a signal followed from the terminal,
  * `pg` anything else Pegasus placed (the ticket, a close button); anything else is external. The request of an order
  * Pegasus placed says more (its `source`) and wins over the prefix, except for the campaign's.
  */
 export function sourceOfClOrdId(clOrdId: string): TradeSource {
   if (clOrdId.startsWith(CL_ORD_PREFIXES.campaign)) return 'campaign';
+  if (clOrdId.startsWith(CL_ORD_PREFIXES.trader)) return 'trader';
   if (clOrdId.startsWith(CL_ORD_PREFIXES.signal)) return 'signal';
   if (clOrdId.startsWith(CL_ORD_PREFIXES.pegasus)) return 'manual';
   return 'external';

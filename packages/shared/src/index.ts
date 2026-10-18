@@ -12,3 +12,4 @@ export * from './campaign-api.js';
 export * from './campaign-signals.js';
 export * from './journal.js';
 export * from './exits.js';
+export * from './trader.js';

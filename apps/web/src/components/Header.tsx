@@ -2,6 +2,7 @@ import { useMutation } from '@tanstack/react-query';
 import { useEffect } from 'react';
 import type { ConnState, KillSwitchRequest } from '@pegasus/shared';
 import { errorText, useLang, useT } from '../i18n';
+import { useTrader } from '../hooks/useTrader';
 import { api } from '../lib/api';
 import { isApiError } from '../lib/http';
 import { fmtNum, fmtSigned, signOf } from '../lib/format';
@@ -25,6 +26,7 @@ export function Header() {
   const demo = useStore((s) => s.demo);
   const paper = useStore((s) => s.paper);
   const campaignOn = useStore((s) => s.campaign !== null && s.campaign.status !== 'disabled');
+  const traderOn = useTrader().data?.enabled === true;
   const connection = useStore((s) => s.connection);
   const wsStatus = useStore((s) => s.wsStatus);
   const balance = useStore((s) => s.balance);
@@ -38,10 +40,10 @@ export function Header() {
   const dailyPnl = risk?.dailyPnl ?? null;
 
   const modeBadge = paper ? t.header.badge.paper : demo ? t.header.badge.demo : t.header.badge.live;
-  // The browser tab names the stack: the campaign's page and the paper page look the same otherwise.
+  // The browser tab names the stack: the campaign's, the trader's and the paper page look the same otherwise.
   useEffect(() => {
-    document.title = `Pegasus · ${campaignOn ? t.header.badge.campaign : modeBadge}`;
-  }, [campaignOn, modeBadge, t]);
+    document.title = `Pegasus · ${campaignOn ? t.header.badge.campaign : traderOn ? t.header.badge.trader : modeBadge}`;
+  }, [campaignOn, traderOn, modeBadge, t]);
 
   /** The second question of a release that the server refused with DAILY_LOSS_ACTIVE; `details` are that refusal's. */
   const rebaseQuestion = (details: Record<string, unknown> | undefined): string => {
@@ -84,6 +86,7 @@ export function Header() {
         {modeBadge}
       </span>
       {campaignOn && <span className="badge badge-demo">{t.header.badge.campaign}</span>}
+      {traderOn && <span className="badge badge-demo">{t.header.badge.trader}</span>}
       <div className="dots">
         <Dot label={t.header.dots.ws} state={wsStatus} />
         <Dot label={t.header.dots.public} state={connection?.okxPublic} />

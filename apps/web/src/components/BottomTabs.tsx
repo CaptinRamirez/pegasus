@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { CampaignServiceStatus } from '@pegasus/shared';
+import { useTrader } from '../hooks/useTrader';
 import { useT } from '../i18n';
 import { readBottomHeight, writeBottomHeight } from '../lib/bottomHeight';
 import type { BottomSize } from '../lib/bottomHeight';
@@ -14,33 +15,38 @@ import { PositionsTable } from './PositionsTable';
 import { SignalsPanel } from './SignalsPanel';
 import { Splitter } from './Splitter';
 import { StopsTable } from './StopsTable';
+import { TraderPanel } from './TraderPanel';
 
 export type { Tab };
 
 /**
- * The tab the page opens on: the campaign's on the campaign stack (the campaign is not disabled), the signals
- * otherwise; null while the campaign's status is not known yet. The page does not remember a tab, so every load is a
+ * The tab the page opens on: the campaign's on the campaign stack (the campaign is not disabled), the trader's on
+ * the trader stack, the signals otherwise; null while the campaign's status (or, with the campaign disabled, whether
+ * the trader is enabled) is not known yet. The page does not remember a tab, so every load is a
  * first visit.
  */
-export function defaultTab(status: CampaignServiceStatus | null): Tab | null {
+export function defaultTab(status: CampaignServiceStatus | null, traderEnabled: boolean | null): Tab | null {
   if (status === null) return null;
-  return status === 'disabled' ? 'signals' : 'campaign';
+  if (status !== 'disabled') return 'campaign';
+  if (traderEnabled === null) return null;
+  return traderEnabled ? 'trader' : 'signals';
 }
 
 /** Tabs that are pages of their own: the bottom panel opens taller for them. */
-const TALL: readonly Tab[] = ['campaign', 'signals', 'journal'];
+const TALL: readonly Tab[] = ['campaign', 'trader', 'signals', 'journal'];
 
 export function BottomTabs() {
   const t = useT();
   const campaignStatus = useStore((s) => s.campaign?.status ?? null);
+  const traderEnabled = useTrader().data?.enabled ?? null;
   // A tab the trader picked (or a link opened) stays; until then the default is decided once, from the first status
   // the page hears, and a later change of the status does not move the page.
   const picked = useUi((s) => s.tab);
   const setTab = useUi((s) => s.setTab);
-  const [initial, setInitial] = useState<Tab | null>(() => defaultTab(campaignStatus));
+  const [initial, setInitial] = useState<Tab | null>(() => defaultTab(campaignStatus, traderEnabled));
   useEffect(() => {
-    if (initial === null) setInitial(defaultTab(campaignStatus));
-  }, [initial, campaignStatus]);
+    if (initial === null) setInitial(defaultTab(campaignStatus, traderEnabled));
+  }, [initial, campaignStatus, traderEnabled]);
   const tab: Tab = picked ?? initial ?? 'signals';
   const positions = useStore((s) => s.positions.length);
   const orders = useStore((s) => Object.keys(s.orders).length);
@@ -60,6 +66,7 @@ export function BottomTabs() {
 
   const tabs: { id: Tab; label: string; count?: number; title?: string }[] = [
     { id: 'campaign', label: t.tabs.campaign },
+    { id: 'trader', label: t.tabs.trader },
     { id: 'signals', label: t.tabs.signals, title: t.tabs.signalsTitle },
     { id: 'journal', label: t.tabs.journal, title: t.tabs.journalTitle, count: openTrades },
     { id: 'positions', label: t.tabs.positions, count: positions },
@@ -89,6 +96,7 @@ export function BottomTabs() {
         {...(height !== null ? { style: { flex: `0 0 ${height}px` } } : {})}
       >
         {tab === 'campaign' && <CampaignPanel />}
+        {tab === 'trader' && <TraderPanel />}
         {tab === 'signals' && <SignalsPanel />}
         {tab === 'journal' && <JournalPanel />}
         {tab === 'positions' && <PositionsTable />}

@@ -1,6 +1,6 @@
 // The launcher's command line and the environment it gives its children; kept apart from start.mjs so it can be tested.
 
-const FLAGS = ['--mock', '--paper', '--campaign', '--dev', '--no-open'];
+const FLAGS = ['--mock', '--paper', '--campaign', '--trader', '--dev', '--no-open'];
 
 /**
  * --mock: local mock exchange instead of OKX (made-up prices); --paper: paper trading (OKX's live prices, a
@@ -15,8 +15,12 @@ export function parseFlags(argv) {
   }
   if (argv.includes('--mock') && argv.includes('--paper')) throw new Error('--mock 和 --paper 不能同时使用：--mock 的行情是随机生成的，--paper 用的是 OKX 实盘行情');
   if (argv.includes('--mock') && argv.includes('--campaign')) throw new Error('--mock 和 --campaign 不能同时使用：滚仓只在纸面交易上运行（OKX 实盘行情，虚拟账户），--mock 的行情是随机生成的');
+  if (argv.includes('--mock') && argv.includes('--trader')) throw new Error('--mock 和 --trader 不能同时使用：交易员只在纸面交易上运行（OKX 实盘行情，虚拟账户），--mock 的行情是随机生成的');
   const campaign = argv.includes('--campaign');
-  return { mock: argv.includes('--mock'), paper: campaign || argv.includes('--paper'), campaign, both: campaign && argv.includes('--paper'), dev: argv.includes('--dev'), open: !argv.includes('--no-open') };
+  const trader = argv.includes('--trader');
+  const explicitPaper = argv.includes('--paper');
+  const stacks = (explicitPaper ? 1 : 0) + (campaign ? 1 : 0) + (trader ? 1 : 0);
+  return { mock: argv.includes('--mock'), paper: campaign || trader || explicitPaper, explicitPaper, campaign, trader, both: stacks > 1, dev: argv.includes('--dev'), open: !argv.includes('--no-open') };
 }
 
 /** The ports of a plain or --paper stack: the API's and the paper exchange's from .env, the page's the one vite.config.ts names. */
@@ -27,6 +31,9 @@ export const DEFAULT_PORTS = { api: 8787, paper: 9200, web: 5174 };
  * over API_PORT and PAPER_PORT in .env; CAMPAIGN_API_PORT, CAMPAIGN_PAPER_PORT and CAMPAIGN_WEB_PORT move them.
  */
 export const CAMPAIGN_PORTS = { api: 8788, paper: 9201, web: 5175 };
+
+/** The ports of the --trader stack (the Claude auto trader), beside both others; TRADER_API_PORT, TRADER_PAPER_PORT and TRADER_WEB_PORT move them. */
+export const TRADER_PORTS = { api: 8789, paper: 9202, web: 5176 };
 
 /** A TCP port from the environment, or the fallback when it is not one. */
 function portOf(value, fallback) {
@@ -39,12 +46,15 @@ export function stackPorts(flags, env) {
   if (flags.campaign) {
     return { api: portOf(env.CAMPAIGN_API_PORT, CAMPAIGN_PORTS.api), paper: portOf(env.CAMPAIGN_PAPER_PORT, CAMPAIGN_PORTS.paper), web: portOf(env.CAMPAIGN_WEB_PORT, CAMPAIGN_PORTS.web) };
   }
+  if (flags.trader) {
+    return { api: portOf(env.TRADER_API_PORT, TRADER_PORTS.api), paper: portOf(env.TRADER_PAPER_PORT, TRADER_PORTS.paper), web: portOf(env.TRADER_WEB_PORT, TRADER_PORTS.web) };
+  }
   return { api: portOf(env.API_PORT, DEFAULT_PORTS.api), paper: portOf(env.PAPER_PORT, DEFAULT_PORTS.paper), web: DEFAULT_PORTS.web };
 }
 
 /** Where the page is built for a stack: the campaign's apart, so that building it never changes the page another stack serves. */
 export function webOutDir(flags) {
-  return flags.campaign ? 'dist-campaign' : 'dist';
+  return flags.campaign ? 'dist-campaign' : flags.trader ? 'dist-trader' : 'dist';
 }
 
 /** The origins of the page served on `webPort`: what the API's WEB_ORIGINS must list. */
@@ -120,13 +130,48 @@ export function campaignEnv(port = CAMPAIGN_PORTS.paper, potStart = CAMPAIGN_POT
   };
 }
 
+/** What the trader's paper account starts with unless .env says otherwise (TRADER_BALANCE): the ticket. */
+export const TRADER_BALANCE = '56';
+
+/**
+ * What --trader adds to the environment of the API and of the paper exchange (docs/proposals/claude-auto-trader.md):
+ * paper trading on the trader's own paper account, data/paper-trader.json, opened with `balance` USDT, BTC only, the
+ * trader enabled and the campaign off, its own state, journal, log directory and ports, so that it runs beside the
+ * other stacks. It wins over .env; ANTHROPIC_API_KEY stays .env's.
+ */
+export function traderEnv(port = TRADER_PORTS.paper, balance = TRADER_BALANCE, ports = TRADER_PORTS, instId = 'BTC-USDT-SWAP') {
+  return {
+    ...paperEnv(port),
+    STATE_FILE: 'data/pegasus-state.trader.json',
+    JOURNAL_FILE: 'data/journal.trader.json',
+    LOG_DIR: 'logs/trader',
+    API_PORT: String(ports.api),
+    WEB_ORIGINS: webOrigins(ports.web),
+    INSTRUMENTS: instId,
+    CAMPAIGN_ENABLED: '0',
+    TRADER_ENABLED: '1',
+    TRADER_INSTRUMENT: instId,
+    TRADER_STATE_FILE: 'data/trader-state.json',
+    TRADER_LOG_FILE: 'data/trader-log.jsonl',
+    PAPER_STATE_FILE: 'data/paper-trader.json',
+    PAPER_INSTRUMENTS: instId,
+    PAPER_BALANCE: balance,
+  };
+}
+
+/** The trader's starting balance from .env when it is a positive decimal, TRADER_BALANCE otherwise. */
+export function traderBalanceOf(env) {
+  const value = env.TRADER_BALANCE;
+  return typeof value === 'string' && /^\d+(\.\d+)?$/.test(value) && Number(value) > 0 ? value : TRADER_BALANCE;
+}
+
 /**
  * What the paper exchange is given on top of the environment and of .env (which it reads itself, and which this wins
- * over): its port and, with --campaign, the pot's own account and the campaign enabled, so that it trades the
- * campaign's instruments. Plain --paper leaves its account to .env (data/paper-account.json by default).
+ * over): its port and, with --campaign or --trader, that stack's own account and settings, so that it trades that
+ * stack's instruments. Plain --paper leaves its account to .env (data/paper-account.json by default).
  */
 export function paperExchangeEnv(flags, overrides, port = 9200) {
-  return { ...(flags.campaign ? overrides : {}), PAPER_PORT: String(port) };
+  return { ...(flags.campaign || flags.trader ? overrides : {}), PAPER_PORT: String(port) };
 }
 
 /** The pot's start from .env when it is a positive decimal (the API refuses anything else), CAMPAIGN_POT_START otherwise. */

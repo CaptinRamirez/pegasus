@@ -23,16 +23,19 @@ interface StackPorts {
   web: number;
 }
 interface LaunchOptions {
-  parseFlags(argv: string[]): { mock: boolean; paper: boolean; campaign: boolean; both: boolean; dev: boolean; open: boolean };
+  parseFlags(argv: string[]): { mock: boolean; paper: boolean; explicitPaper: boolean; campaign: boolean; trader: boolean; both: boolean; dev: boolean; open: boolean };
   mockEnv(port?: number): Record<string, string>;
   paperEnv(port?: number): Record<string, string>;
   campaignEnv(port?: number, potStart?: string, ports?: StackPorts): Record<string, string>;
-  paperExchangeEnv(flags: { campaign: boolean }, overrides: Record<string, string>, port?: number): Record<string, string>;
+  traderEnv(port?: number, balance?: string, ports?: StackPorts, instId?: string): Record<string, string>;
+  paperExchangeEnv(flags: { campaign?: boolean; trader?: boolean }, overrides: Record<string, string>, port?: number): Record<string, string>;
   potStartOf(env: Record<string, string | undefined>): string;
+  traderBalanceOf(env: Record<string, string | undefined>): string;
   DEFAULT_PORTS: StackPorts;
   CAMPAIGN_PORTS: StackPorts;
-  stackPorts(flags: { campaign: boolean }, env: Record<string, string | undefined>): StackPorts;
-  webOutDir(flags: { campaign: boolean }): string;
+  TRADER_PORTS: StackPorts;
+  stackPorts(flags: { campaign?: boolean; trader?: boolean }, env: Record<string, string | undefined>): StackPorts;
+  webOutDir(flags: { campaign?: boolean; trader?: boolean }): string;
   webOrigins(webPort: number): string;
   webServerOptions(webPort: number, apiPort: number): { port: number; strictPort: boolean; proxy: Record<string, { target: string; ws?: boolean; changeOrigin?: boolean }> };
   webEnv(ports: StackPorts): Record<string, string>;
@@ -41,17 +44,28 @@ const options = (await import(pathToFileURL(join(scripts, 'launch-options.mjs'))
 
 describe('launcher options', () => {
   it('understands --mock, --paper, --campaign, --dev and --no-open and refuses anything else', () => {
-    expect(options.parseFlags([])).toEqual({ mock: false, paper: false, campaign: false, both: false, dev: false, open: true });
-    expect(options.parseFlags(['--mock', '--no-open'])).toEqual({ mock: true, paper: false, campaign: false, both: false, dev: false, open: false });
-    expect(options.parseFlags(['--paper'])).toEqual({ mock: false, paper: true, campaign: false, both: false, dev: false, open: true });
-    expect(options.parseFlags(['--dev'])).toEqual({ mock: false, paper: false, campaign: false, both: false, dev: true, open: true });
-    // the campaign is paper trading; with --paper as well, both stacks start from one window
-    expect(options.parseFlags(['--campaign'])).toEqual({ mock: false, paper: true, campaign: true, both: false, dev: false, open: true });
-    expect(options.parseFlags(['--campaign', '--paper', '--dev'])).toEqual({ mock: false, paper: true, campaign: true, both: true, dev: true, open: true });
+    const none = { mock: false, paper: false, explicitPaper: false, campaign: false, trader: false, both: false, dev: false, open: true };
+    expect(options.parseFlags([])).toEqual(none);
+    expect(options.parseFlags(['--mock', '--no-open'])).toEqual({ ...none, mock: true, open: false });
+    expect(options.parseFlags(['--paper'])).toEqual({ ...none, paper: true, explicitPaper: true });
+    expect(options.parseFlags(['--dev'])).toEqual({ ...none, dev: true });
+    // the campaign and the trader are paper trading; with --paper as well (or both of them), several stacks start from one window
+    expect(options.parseFlags(['--campaign'])).toEqual({ ...none, paper: true, campaign: true });
+    expect(options.parseFlags(['--campaign', '--paper', '--dev'])).toEqual({ ...none, paper: true, explicitPaper: true, campaign: true, both: true, dev: true });
+    expect(options.parseFlags(['--trader'])).toEqual({ ...none, paper: true, trader: true });
+    expect(options.parseFlags(['--paper', '--campaign', '--trader'])).toEqual({ ...none, paper: true, explicitPaper: true, campaign: true, trader: true, both: true });
+    expect(options.parseFlags(['--campaign', '--trader'])).toEqual({ ...none, paper: true, campaign: true, trader: true, both: true });
     expect(() => options.parseFlags(['--mcok'])).toThrow('--mcok');
     // made-up prices and real prices are two different things
     expect(() => options.parseFlags(['--mock', '--paper'])).toThrow('不能同时使用');
     expect(() => options.parseFlags(['--campaign', '--mock'])).toThrow('--mock 和 --campaign 不能同时使用');
+    expect(() => options.parseFlags(['--trader', '--mock'])).toThrow('--mock 和 --trader 不能同时使用');
+    // the trader's stack: its own ports, account, files and instrument; the campaign off
+    expect(options.stackPorts({ trader: true }, {})).toEqual({ api: 8789, paper: 9202, web: 5176 });
+    expect(options.webOutDir({ trader: true })).toBe('dist-trader');
+    expect(options.traderEnv()).toMatchObject({ PAPER_EXCHANGE_URL: 'http://127.0.0.1:9202', TRADER_ENABLED: '1', CAMPAIGN_ENABLED: '0', INSTRUMENTS: 'BTC-USDT-SWAP', PAPER_INSTRUMENTS: 'BTC-USDT-SWAP', PAPER_STATE_FILE: 'data/paper-trader.json', PAPER_BALANCE: '56', API_PORT: '8789', STATE_FILE: 'data/pegasus-state.trader.json', JOURNAL_FILE: 'data/journal.trader.json' });
+    expect(options.traderBalanceOf({ TRADER_BALANCE: '100' })).toBe('100');
+    expect(options.traderBalanceOf({})).toBe('56');
   });
 
   it('--paper keeps the market data on OKX live, sends the account side to the paper exchange and never uses the key in .env', () => {

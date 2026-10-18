@@ -635,6 +635,18 @@ at 10x on a hard-capped pot. Settings (`.env`):
 | `CAMPAIGN_MIN_STAKE` | `5.6` | the smallest stake; one above `CAMPAIGN_POT_START` is refused |
 | `CAMPAIGN_STRUCTURE` | `pyramid` | `pyramid` (a campaign that works adds to itself) or `noadd` |
 | `CAMPAIGN_CUT_HOUR` | `0` | UTC hour the campaign's daily bars close at: `0` (OKX's own `1Dutc` / `12Hutc` bars) or `4`, `8`, `12`, `16`, `20` (bars built from its `4H` candles; the 12-hour closes are at it and 12 hours later). Followed by the campaign, `GET /api/campaign/signals`, channel trailing and the replay beside the pot; a pot keeps the cut it was started with (another setting blocks it with `LEDGER_UNREADABLE`). `20` adopted on 2026-10-18 |
+| `TRADER_ENABLED` | `0` | `1` runs the Claude auto trader (`docs/proposals/claude-auto-trader.md`); paper only, refused with `CAMPAIGN_ENABLED=1` on the same stack (`pnpm start --trader` sets everything) |
+| `TRADER_INSTRUMENT` | `BTC-USDT-SWAP` | the one USDT swap it trades; tracked while the trader is enabled |
+| `TRADER_SESSION` | `13-21` | UTC hours in which it opens positions (the US cash session is 13:30 to 20:00 UTC); a position is left to its stop after the end |
+| `TRADER_RISK_PCT` | `0.02` | loss accepted per trade, fraction of the equity |
+| `TRADER_MAX_TRADES_PER_DAY` | `3` | |
+| `TRADER_DAILY_LOSS_PCT` | `0.06` | loss of the day, fraction of the day's starting equity, at which it stops for the day |
+| `TRADER_MAX_CONSECUTIVE_LOSSES` | `3` | after this many losses in a row it pauses 24 hours |
+| `TRADER_MODEL` / `TRADER_EFFORT` | `claude-opus-5-5` / `high` | the model (the SDK reads `ANTHROPIC_API_KEY` from the environment; without it the trader is `blocked`) and its effort |
+| `TRADER_CADENCE` | `hourly` | `hourly`: the hourly closes and the 15-minute closes that trigger an event; `15m`: every 15-minute close |
+| `TRADER_CONTROL` | `1` | the coin-flip control beside the trader |
+| `TRADER_CALENDAR` | | scheduled events the model is told about, `YYYY-MM-DD name;...` |
+| `TRADER_STATE_FILE` / `TRADER_LOG_FILE` | `data/trader-state.json` / `data/trader-log.jsonl` | its state and its decision log |
 | `CAMPAIGN_STATE_FILE` | `data/campaign-ledger.json` | the campaign's ledger (below), under the repository root unless the path is absolute; kept in this file whichever store the API uses. It belongs to the paper account the pot runs on: a new paper account wants a new ledger |
 
 The campaign's leverage (10) and the fee rate it sizes with are the rule's (`DEFAULT_CAMPAIGN_PARAMS`), not settings.
@@ -1053,6 +1065,39 @@ Error codes returned by the API:
 | `NOT_FOUND` | unknown route (404) |
 | `TRADE_NOT_FOUND` | `GET /api/journal/:id`: the journal has no trade with that id (404, `details.id`) |
 | `INTERNAL` | anything else (500) |
+
+## Trader (`GET /api/trader`, `GET /api/trader/log`)
+
+The Claude auto trader of `docs/proposals/claude-auto-trader.md` (`services/trader.ts`): paper only, on a stack of its own
+(`pnpm start --trader`, `TRADER_ENABLED=1`, never with the campaign on the same account). Both routes answer on every
+stack; where the trader is disabled the view has `enabled: false` and status `disabled`.
+
+```ts
+GET /api/trader -> TraderView (packages/shared/src/trader.ts)
+{
+  enabled: boolean;
+  status: 'disabled' | 'blocked' | 'idle' | 'in-session' | 'holding';
+  reason: { code: string; message: string } | null;   // blocked: STATE_UNREADABLE, NO_MODEL_CREDENTIALS, ACCOUNT_UNAVAILABLE
+  instId: string;
+  session: { startHour: number; endHour: number; inSession: boolean };   // UTC
+  guardrails: TraderGuardrails;                        // riskPct, maxTradesPerDay, dailyLossPct, maxConsecutiveLosses, cooldownMs, session hours, stop distance limits, maxLeverage
+  model: string;
+  nextCallAt: number | null;                           // the next hourly close in session (every 15 minutes with TRADER_CADENCE=15m)
+  last: { ts; decision: TraderDecision | null; verdict: string; executed: boolean; usage; triggers: string[]; error: string | null } | null;
+  position: TraderPosition & { unrealizedPnl: string | null } | null;
+  today: { date; trades; pnl; consecutiveLosses; cooldownUntil; equityAtStart };
+  usageToday: { calls; inputTokens; outputTokens; estimatedUsd };
+  control: { position; trades; pnlTotal; wins; losses } | null;   // the coin-flip control (TRADER_CONTROL=1)
+  recent: TraderTradeResult[];                         // newest first, at most 50
+  serverTime: number;
+}
+
+GET /api/trader/log?limit=30 -> { records: TraderLogRecord[] }   // newest first, 1 to 200, each record without its dossier
+```
+
+The decision log itself is `TRADER_LOG_FILE` (`data/trader-log.jsonl`): one JSON line per decision (with the whole dossier the
+model saw), execution, result, control move or error. The trader's orders carry client order ids starting with `pt`; the
+journal shows them with source `trader`.
 
 ## WebSocket `/ws?token=<API_TOKEN>`
 

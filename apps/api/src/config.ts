@@ -2,7 +2,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { defaultEndpoints, type OkxCredentials, type OkxEndpoints } from '@pegasus/okx';
-import { CAMPAIGN_INSTRUMENTS, D, DEFAULT_CAMPAIGN_PARAMS, DEFAULT_POT_PARAMS, SIGNAL_PHASE_HOURS, type CampaignStructure, type RiskConfig, type SignalPhase, type TdMode } from '@pegasus/shared';
+import { CAMPAIGN_INSTRUMENTS, D, DEFAULT_CAMPAIGN_PARAMS, DEFAULT_POT_PARAMS, DEFAULT_TRADER_GUARDRAILS, SIGNAL_PHASE_HOURS, type CampaignStructure, type RiskConfig, type SignalPhase, type TdMode, type TraderGuardrails } from '@pegasus/shared';
+import type { TraderEffort } from './services/trader-model.js';
 
 /** The repository root, from where this module lives: the launcher, `pnpm dev:api` and tests run with different working directories. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -88,6 +89,31 @@ const envSchema = z.object({
    * without the first `.json`), so that the paper, the campaign and the mock accounts each keep their own.
    */
   TRAILING_STATE_FILE: z.string().default(''),
+
+  /** '1' runs the Claude auto trader (docs/proposals/claude-auto-trader.md): paper trading only, on a stack of its own (never with CAMPAIGN_ENABLED=1). */
+  TRADER_ENABLED: z.enum(['0', '1']).default('0'),
+  /** The one USDT swap it trades; tracked like INSTRUMENTS while the trader is enabled. */
+  TRADER_INSTRUMENT: z.string().default('BTC-USDT-SWAP'),
+  /** The window in which it opens positions, UTC hours start-end (the US cash session is 13:30 to 20:00 UTC). */
+  TRADER_SESSION: z.string().regex(/^\d{1,2}-\d{1,2}$/, 'must be two UTC hours, start-end').default('13-21'),
+  /** Loss accepted per trade, fraction of the equity. */
+  TRADER_RISK_PCT: fraction.default(DEFAULT_TRADER_GUARDRAILS.riskPct),
+  TRADER_MAX_TRADES_PER_DAY: z.coerce.number().int().min(1).default(DEFAULT_TRADER_GUARDRAILS.maxTradesPerDay),
+  /** Loss of the day, fraction of the day's starting equity, at which it stops for the day. */
+  TRADER_DAILY_LOSS_PCT: fraction.default(DEFAULT_TRADER_GUARDRAILS.dailyLossPct),
+  TRADER_MAX_CONSECUTIVE_LOSSES: z.coerce.number().int().min(1).default(DEFAULT_TRADER_GUARDRAILS.maxConsecutiveLosses),
+  /** The model asked (the SDK reads ANTHROPIC_API_KEY from the environment) and its effort. */
+  TRADER_MODEL: z.string().min(1).default('claude-opus-5-5'),
+  TRADER_EFFORT: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('high'),
+  /** hourly: at every hourly close and at 15-minute closes that trigger an event; 15m: at every 15-minute close. */
+  TRADER_CADENCE: z.enum(['hourly', '15m']).default('hourly'),
+  /** '1' keeps the coin-flip control beside the trader. */
+  TRADER_CONTROL: z.enum(['0', '1']).default('1'),
+  /** Scheduled events the model is told about, 'YYYY-MM-DD name' separated by semicolons. */
+  TRADER_CALENDAR: z.string().default(''),
+  /** The trader's state (the day's counters, its position, the control) and its decision log; relative paths are under the repository root. */
+  TRADER_STATE_FILE: z.string().min(1).default('data/trader-state.json'),
+  TRADER_LOG_FILE: z.string().min(1).default('data/trader-log.jsonl'),
 });
 
 /** The exit orders of this stage, take-profits, the cost-price stop and trailing stops: paper trading and the local mock only. */
@@ -131,6 +157,22 @@ export interface CampaignConfig {
   stateFile: string;
   /** Where the replay beside the pot keeps the bars and the funding it reads from OKX: data/campaign-replay under the repository root (git-ignored) */
   replayCacheDir: string;
+}
+
+/** The Claude auto trader (services/trader.ts). */
+export interface TraderConfig {
+  enabled: boolean;
+  instId: string;
+  guardrails: TraderGuardrails;
+  model: string;
+  effort: TraderEffort;
+  cadence: 'hourly' | '15m';
+  control: boolean;
+  /** Scheduled events, by UTC date */
+  calendar: Array<{ date: string; name: string }>;
+  /** Absolute paths */
+  stateFile: string;
+  logFile: string;
 }
 
 export interface AppConfig {
@@ -178,6 +220,8 @@ export interface AppConfig {
   campaign: CampaignConfig;
   /** Take-profits, the cost-price stop and trailing stops; `enabled` only in paper trading and against a local mock. */
   exits: ExitsConfig;
+  /** The Claude auto trader; `enabled` only in paper trading, never with the campaign on the same stack. */
+  trader: TraderConfig;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -233,10 +277,42 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       throw new Error(`invalid configuration: CAMPAIGN_MIN_STAKE ${e.CAMPAIGN_MIN_STAKE} is more than CAMPAIGN_POT_START ${e.CAMPAIGN_POT_START}: the pot could never open a campaign`);
     }
   }
+  const traderEnabled = e.TRADER_ENABLED === '1';
+  const traderInst = e.TRADER_INSTRUMENT.trim().toUpperCase();
+  const [sessionStart = NaN, sessionEnd = NaN] = e.TRADER_SESSION.split('-').map(Number);
+  if (traderEnabled) {
+    if (!paper) throw new Error('invalid configuration: TRADER_ENABLED=1 is refused: the trader is paper only, it runs on the paper exchange and never on an OKX account. Start Pegasus with pnpm start --trader, or set TRADER_ENABLED=0');
+    if (campaignEnabled) throw new Error('invalid configuration: TRADER_ENABLED=1 and CAMPAIGN_ENABLED=1 on one stack: the trader needs a paper account of its own (the pot must stay dedicated); start it with pnpm start --trader');
+    if (!/^[A-Z0-9]+-USDT-SWAP$/.test(traderInst)) throw new Error(`invalid configuration: TRADER_INSTRUMENT must be a USDT swap (<coin>-USDT-SWAP), the trader sizes linear contracts only; got '${e.TRADER_INSTRUMENT}'`);
+  }
+  if (!(Number.isInteger(sessionStart) && Number.isInteger(sessionEnd) && sessionStart >= 0 && sessionEnd <= 24 && sessionStart < sessionEnd)) {
+    throw new Error(`invalid configuration: TRADER_SESSION must be two UTC hours start-end with start before end, got '${e.TRADER_SESSION}'`);
+  }
+  const calendar = e.TRADER_CALENDAR.split(';')
+    .map((s) => s.trim())
+    .filter((s) => s !== '')
+    .map((s) => {
+      const [date = '', ...name] = s.split(' ');
+      return { date, name: name.join(' ') };
+    });
+  const trader: TraderConfig = {
+    enabled: traderEnabled,
+    instId: traderInst,
+    guardrails: { ...DEFAULT_TRADER_GUARDRAILS, riskPct: e.TRADER_RISK_PCT, maxTradesPerDay: e.TRADER_MAX_TRADES_PER_DAY, dailyLossPct: e.TRADER_DAILY_LOSS_PCT, maxConsecutiveLosses: e.TRADER_MAX_CONSECUTIVE_LOSSES, sessionStartHour: sessionStart, sessionEndHour: sessionEnd },
+    model: e.TRADER_MODEL,
+    effort: e.TRADER_EFFORT,
+    cadence: e.TRADER_CADENCE,
+    control: e.TRADER_CONTROL === '1',
+    calendar,
+    stateFile: resolve(REPO_ROOT, e.TRADER_STATE_FILE),
+    logFile: resolve(REPO_ROOT, e.TRADER_LOG_FILE),
+  };
   // The campaign's instruments are tracked like the terminal's own (market data, the instrument list, positions)
   // whenever the market data is OKX's (live, demo, paper): the signals page shows the campaign rule on them, and
-  // following a signal needs them tracked. A local mock (endpoints overridden) lists only its own instruments.
-  const instruments = campaignEnabled || !overridden ? [...new Set([...ownInstruments, ...campaignInstruments])] : ownInstruments;
+  // following a signal needs them tracked. A local mock (endpoints overridden) lists only its own instruments. The
+  // trader's instrument is tracked wherever the trader runs.
+  const tracked = traderEnabled ? [traderInst] : [];
+  const instruments = campaignEnabled || !overridden ? [...new Set([...ownInstruments, ...campaignInstruments, ...tracked])] : [...new Set([...ownInstruments, ...tracked])];
   const phaseNames = e.SIGNAL_PHASES.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
   const unknownPhases = phaseNames.filter((s) => !SIGNAL_PHASE_HOURS.some((h) => String(h) === s));
   if (phaseNames.length === 0 || unknownPhases.length > 0) {
@@ -296,5 +372,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       replayCacheDir: resolve(REPO_ROOT, 'data', 'campaign-replay'),
     },
     exits: { enabled: exitsEnabled, stateFile: trailingFile },
+    trader,
   };
 }

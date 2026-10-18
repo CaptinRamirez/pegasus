@@ -48,6 +48,8 @@ import type {
   TradeSource,
   TradeStatus,
   TrailingView,
+  TraderLogRecord,
+  TraderView,
 } from '@pegasus/shared';
 import { ApiError, http } from './http';
 
@@ -169,6 +171,10 @@ export const api = {
   signals: (query: SignalsQuery = {}) => http<SignalsResponse>('/api/signals', { query }),
   /** The campaign's state; also pushed as the `campaign` message while the campaign is enabled. */
   campaign: () => http<CampaignView>('/api/campaign'),
+  /** The Claude trader's state. */
+  trader: () => http<TraderView>('/api/trader'),
+  /** The trader's decision log, newest first, without the dossiers. */
+  traderLog: (limit: number) => http<{ records: TraderLogRecord[] }>('/api/trader/log', { query: { limit } }),
   campaignLog: (query: CampaignLogQuery = {}) => http<CampaignLogPage>('/api/campaign/log', { query }),
   /** The replay beside the pot; an API without the route answers NOT_FOUND (404). */
   campaignReplay: () => http<CampaignReplayView>('/api/campaign/replay'),

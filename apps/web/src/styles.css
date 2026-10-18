@@ -780,3 +780,11 @@ a:hover { text-decoration: underline; }
 .campaign-disabled .campaign-card { max-width: 640px; gap: 10px; padding: 14px 16px; }
 .campaign-link { align-self: flex-start; padding: 7px 14px; font-weight: 700; }
 .campaign-link:hover { text-decoration: none; filter: brightness(1.1); }
+
+/* TRADER tab: reuses the campaign cards; only the badge colours and two lines are its own */
+.trader-status-in-session, .trader-status-holding, .trader-action-long { background: var(--up-bg); color: var(--up); }
+.trader-status-blocked, .trader-action-short { background: var(--down-bg); color: var(--down); }
+.trader-status-idle, .trader-action-flat, .trader-action-close, .trader-action-tighten_stop { background: var(--warn-bg); color: var(--warn); }
+.trader-status-disabled { color: var(--fg-muted); }
+.trader-oneliner { font-size: 12.5px; font-weight: 600; }
+.trader-prices { display: flex; flex-wrap: wrap; gap: 4px 16px; }

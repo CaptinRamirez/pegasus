@@ -263,7 +263,7 @@ export class JournalBook {
   /** An order Pegasus placed (OrderService.onPlaced): its plan waits for the trade it opens; one on the leg of an open trade joins its timeline. */
   placed(req: PlaceOrderRequest, order: Order): void {
     const now = this.opts.now();
-    const source: TradeSource = order.clOrdId.startsWith(CL_ORD_PREFIXES.campaign) ? 'campaign' : (req.source ?? 'manual');
+    const source: TradeSource = order.clOrdId.startsWith(CL_ORD_PREFIXES.campaign) ? 'campaign' : order.clOrdId.startsWith(CL_ORD_PREFIXES.trader) ? 'trader' : (req.source ?? 'manual');
     const pending: PendingOrder = {
       clOrdId: order.clOrdId,
       ordId: order.ordId,

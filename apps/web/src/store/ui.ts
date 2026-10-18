@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 
 /** The tabs under the chart. */
-export type Tab = 'campaign' | 'signals' | 'journal' | 'positions' | 'orders' | 'stops' | 'history' | 'fills';
+export type Tab = 'campaign' | 'trader' | 'signals' | 'journal' | 'positions' | 'orders' | 'stops' | 'history' | 'fills';
 
 /** A request to show the trade journal: one trade's drawer, or the trades of one coin. */
 export interface JournalFocus {

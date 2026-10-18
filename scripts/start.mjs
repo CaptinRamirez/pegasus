@@ -16,7 +16,7 @@ import { connect } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
-import { campaignEnv, mockEnv, paperEnv, paperExchangeEnv, parseFlags, potStartOf, stackPorts, webEnv, webOutDir } from './launch-options.mjs';
+import { campaignEnv, mockEnv, paperEnv, paperExchangeEnv, parseFlags, potStartOf, stackPorts, traderBalanceOf, traderEnv, webEnv, webOutDir } from './launch-options.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const envFile = join(root, '.env');
@@ -180,9 +180,11 @@ async function main() {
   const base = { ...(existsSync(envFile) ? parseEnv(readFileSync(envFile, 'utf8')) : {}), ...process.env };
   const version = gitVersion();
   if (!flags.both) return runStack(flags, base, version, '');
-  say('两套栈在这一个窗口里依次启动：先纸面交易栈，再滚仓栈；每行前面的 [纸面] 或 [滚仓] 说明那一行属于哪套');
-  await runStack({ ...flags, campaign: false }, base, version, '纸面');
-  if (!stopping) await runStack(flags, base, version, '滚仓');
+  const names = [flags.explicitPaper ? '纸面' : null, flags.campaign ? '滚仓' : null, flags.trader ? '交易员' : null].filter((n) => n !== null);
+  say(names.length === 2 ? `两套栈在这一个窗口里依次启动：先${names[0]}栈，再${names[1]}栈；每行前面的 [${names[0]}] 或 [${names[1]}] 说明那一行属于哪套` : `三套栈在这一个窗口里依次启动：${names.join('、')}；每行前面的 [${names.join('] / [')}] 说明那一行属于哪套`);
+  if (flags.explicitPaper) await runStack({ ...flags, campaign: false, trader: false }, base, version, '纸面');
+  if (!stopping && flags.campaign) await runStack({ ...flags, trader: false }, base, version, '滚仓');
+  if (!stopping && flags.trader) await runStack({ ...flags, campaign: false }, base, version, '交易员');
 }
 
 /** Builds and starts one stack (the exchange it trades on, the API, the page) and opens its page; `tag` names it when both run. */
@@ -195,18 +197,21 @@ async function runStack(flags, base, version, tag) {
   const ports = stackPorts(flags, base);
   const paperPort = paper ? ports.paper : null;
   // --mock, --paper and --campaign only change what the children see; .env is read here, never written.
-  const overrides = flags.mock ? mockEnv(Number(process.env.MOCK_OKX_PORT ?? 9100)) : flags.campaign ? campaignEnv(ports.paper, potStartOf(base), ports) : paper ? paperEnv(paperPort) : {};
+  const overrides = flags.mock ? mockEnv(Number(process.env.MOCK_OKX_PORT ?? 9100)) : flags.campaign ? campaignEnv(ports.paper, potStartOf(base), ports) : flags.trader ? traderEnv(ports.paper, traderBalanceOf(base), ports) : paper ? paperEnv(paperPort) : {};
   const env = { ...base, ...overrides };
   const apiPort = ports.api;
   const mockPort = localPort(env.OKX_REST_URL);
   if (paper && mockPort !== null) throw new Error('纸面交易需要 OKX 的真实行情，但 .env 里的 OKX_REST_URL 指向了本机的模拟交易所；请删掉 .env 里的四个 OKX_*_URL 再启动');
   const mode = flags.campaign
     ? '，滚仓模式（纸面交易：OKX 实盘行情，资金池专用的虚拟账户 data/paper-campaign.json，账本 data/campaign-ledger.json，不会向 OKX 下单）'
-    : paper
-      ? '，纸面交易模式（OKX 实盘行情，虚拟账户，不会向 OKX 下单）'
-      : '';
+    : flags.trader
+      ? '，交易员模式（纸面交易：OKX 实盘行情，交易员专用的虚拟账户 data/paper-trader.json，决定日志 data/trader-log.jsonl，不会向 OKX 下单；模型密钥 ANTHROPIC_API_KEY 来自 .env）'
+      : paper
+        ? '，纸面交易模式（OKX 实盘行情，虚拟账户，不会向 OKX 下单）'
+        : '';
   log(`版本：${version ?? '未知（不是 git 仓库或没有安装 git）'}${flags.mock ? '，模拟交易所模式（--mock）' : ''}${mode}${flags.dev ? '，开发模式（--dev）' : ''}`);
   if (flags.campaign) log(`滚仓使用自己的端口（后端 ${ports.api}，纸面交易所 ${ports.paper}，页面 ${ports.web}）、日志目录 logs/campaign 和交易日志 data/journal.campaign.json，可以和 pnpm start --paper 同时运行`);
+  if (flags.trader) log(`交易员使用自己的端口（后端 ${ports.api}，纸面交易所 ${ports.paper}，页面 ${ports.web}）、日志目录 logs/trader 和交易日志 data/journal.trader.json，可以和另外两套栈同时运行`);
 
   const busy = [];
   if (mockPort !== null && (await portOpen(mockPort))) busy.push(mockPort);

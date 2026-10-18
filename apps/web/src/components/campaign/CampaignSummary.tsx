@@ -15,7 +15,7 @@ export function reasonText(reason: CampaignStatusReason, t: Messages): { text: s
 }
 
 /** The time left until `to`, ticking every second on its own: the rest of the page does not re-render with it. */
-function Countdown({ to }: { to: number }) {
+export function Countdown({ to }: { to: number }) {
   const t = useT();
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {

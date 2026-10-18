@@ -8,6 +8,7 @@ import { createOkxClients, OkxUnreachableAtStartError, reachOkxAtStart, schedule
 import { buildServer } from './server.js';
 import { AccountService } from './services/account.js';
 import { CampaignService, disabledCampaignView } from './services/campaign.js';
+import { TraderService } from './services/trader.js';
 import { CampaignOrders } from './services/campaign-orders.js';
 import { CampaignSignalsService } from './services/campaign-signals.js';
 import { campaignOwns, ChannelTrailingService } from './services/channel-trailing.js';
@@ -94,6 +95,13 @@ async function main(): Promise<void> {
   deps.exitFollowUp = exitFollowUp;
   // The campaign rule read per coin with a plan to follow each signal by hand (GET /api/campaign/signals).
   deps.campaignSignals = new CampaignSignalsService({ config, clients, market, account, risk, journal, campaign: campaign ?? undefined, disabledView: () => disabledCampaignView(config.campaign), log });
+  // The Claude auto trader on its own paper stack (docs/proposals/claude-auto-trader.md); loadConfig refuses it outside paper trading or beside the campaign.
+  const trader = config.trader.enabled ? new TraderService(config.trader, { clients, market, account, risk, orders, log }) : null;
+  if (trader) {
+    deps.trader = trader;
+    const g = config.trader.guardrails;
+    log.info({ instId: config.trader.instId, model: config.trader.model, effort: config.trader.effort, session: `${g.sessionStartHour}-${g.sessionEndHour} UTC`, cadence: config.trader.cadence, control: config.trader.control, state: config.trader.stateFile }, 'TRADER ENABLED on the paper exchange');
+  }
 
   // Risk wiring: equity feeds the daily PnL / loss limit; exposure feeds the state shown in the UI.
   account.on('balance', (b) => risk.updateEquity(b.totalEq));
@@ -116,11 +124,13 @@ async function main(): Promise<void> {
   log.info({ url: `http://${config.server.host}:${config.server.port}` }, 'pegasus api listening');
   // The ledger, the pot's start or the closes missed while the API was down; it waits for the account by itself.
   if (campaign) void campaign.start().catch((err: unknown) => log.error({ err }, 'the campaign service could not start'));
+  if (trader) void trader.start().catch((err: unknown) => log.error({ err }, 'the trader could not start'));
 
   const shutdown = async (signal: string) => {
     log.info({ signal }, 'shutting down');
     try {
       await campaign?.stop();
+      trader?.stop();
       await journal.stop();
       exitFollowUp.stop();
       await trailing.stop();

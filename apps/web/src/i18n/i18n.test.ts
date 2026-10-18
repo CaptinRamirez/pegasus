@@ -105,10 +105,10 @@ describe('the signals, the confirmation sheet, the exits and the journal in both
       expect(Object.keys(t.journal.eventCode).sort()).toEqual(['POSITION_ADOPTED', 'POSITION_CLOSED', 'POSITION_GONE', 'SIZE_CORRECTED']);
       expect(Object.keys(t.journal.statusReason).sort()).toEqual(['JOURNAL_DISABLED', 'JOURNAL_STARTING', 'JOURNAL_UNREADABLE']);
       expect(Object.keys(t.journal.exitReason).sort()).toEqual(['adl', 'campaign', 'external', 'liquidation', 'manual', 'stop', 'take_profit', 'trailing', 'unknown']);
-      expect(Object.keys(t.journal.source).sort()).toEqual(['campaign', 'external', 'manual', 'signal']);
+      expect(Object.keys(t.journal.source).sort()).toEqual(['campaign', 'external', 'manual', 'signal', 'trader']);
       for (const code of ['TP_WRONG_SIDE', 'CALLBACK_RATIO', 'ACTIVE_PX_WRONG_SIDE']) expect(t.riskReject[code]).toBeDefined();
     }
-    expect(zh.journal.source).toEqual({ manual: '手动', signal: '按信号', campaign: '滚仓', external: '外部' });
+    expect(zh.journal.source).toEqual({ manual: '手动', signal: '按信号', campaign: '滚仓', trader: '交易员', external: '外部' });
     expect(zh.tabs.journal).toBe('开仓记录');
     expect(zh.tabs.signals).toBe('信号');
   });

@@ -446,7 +446,7 @@ describe('App', () => {
       button('中文')?.click();
     });
     expect(localStorage.getItem(LANG_KEY)).toBe('zh');
-    expect([...container.querySelectorAll('button.tab')].map((b) => b.textContent)).toEqual(['滚仓', '信号', '开仓记录', '持仓', '当前委托', '止损单', '历史委托', '成交记录']);
+    expect([...container.querySelectorAll('button.tab')].map((b) => b.textContent)).toEqual(['滚仓', '交易员', '信号', '开仓记录', '持仓', '当前委托', '止损单', '历史委托', '成交记录']);
     const banner = container.querySelector('.banner')?.textContent ?? '';
     expect(banner).toContain('账户数据未更新：API key 无效（OKX: [50111] Invalid OK-ACCESS-KEY）');
     expect(banner).not.toContain('Account data is not updating');
