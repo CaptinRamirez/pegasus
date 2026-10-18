@@ -122,6 +122,12 @@ describe('loadConfig paper trading', () => {
 });
 
 describe('loadConfig campaign', () => {
+  it('CAMPAIGN_CUT_HOUR names the daily cut, a 4-hour boundary', () => {
+    expect(loadConfig(PAPER).campaign.cutHour).toBe(0);
+    expect(loadConfig({ ...PAPER, CAMPAIGN_CUT_HOUR: '20' }).campaign.cutHour).toBe(20);
+    expect(() => loadConfig({ ...PAPER, CAMPAIGN_CUT_HOUR: '3' })).toThrow();
+  });
+
   const PAPER = { PAPER_EXCHANGE_URL: 'http://127.0.0.1:9200' };
   const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -139,6 +145,7 @@ describe('loadConfig campaign', () => {
       potStart: '56',
       minStake: '5.6',
       structure: 'pyramid',
+      cutHour: 0,
       leverage: '10',
       feeRate: '0.0005',
       stateFile: join(root, 'data', 'campaign-ledger.json'),

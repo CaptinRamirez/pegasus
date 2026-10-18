@@ -285,7 +285,7 @@ describe('the campaign signals service', () => {
       ['DOT-USDT-SWAP', 'unavailable', false],
     ]);
     expect(res).toMatchObject({ riskPct: '0.01', equity: '2000', equitySource: 'account', campaign: { enabled: false, status: 'disabled', ownAccount: false } });
-    expect(res.params).toEqual({ entryChannel: 20, exitChannel: 10, addStep: '0.05', structure: 'pyramid', leverage: '10', feeRate: '0.0005' });
+    expect(res.params).toEqual({ entryChannel: 20, exitChannel: 10, addStep: '0.05', structure: 'pyramid', leverage: '10', feeRate: '0.0005', cutHour: 0 });
     expect(res.thresholds).toEqual({ nearPct: '0.03', stopWidePct: '0.2', stopNarrowPct: '0.02', farAbovePct: '0.05', liqBufferPct: '0.01' });
     const btc = res.rows[0];
     expect(btc?.markPx).toBe('105.2');

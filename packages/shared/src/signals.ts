@@ -733,15 +733,28 @@ export function phaseDayStart(ts: number, phase: SignalPhase): number {
 /**
  * Candles of `periodMs` built from the consecutive candles of `barMs` they are made of, each period opening `anchorMs`
  * past a multiple of `periodMs` (UTC: an anchor of 20 hours gives days that open and close at 20:00 UTC). A period is
- * emitted only when every bar of it is present and is confirmed only when all are. Oldest first.
+ * emitted only when every bar of it is present and is confirmed only when all are; with `forming` the running period
+ * (the one the newest candle belongs to) is emitted too, from its bars so far, unconfirmed. Oldest first.
  */
-export function aggregateCandles(candles: readonly Candle[], barMs: number, periodMs: number, anchorMs = 0): Candle[] {
+export function aggregateCandles(candles: readonly Candle[], barMs: number, periodMs: number, anchorMs = 0, forming = false): Candle[] {
   const n = periodMs / barMs;
   if (!Number.isInteger(n) || n < 1) throw new SignalError('BAD_INPUT', 'periodMs must be a multiple of barMs');
   const byTs = new Map<number, Candle>();
   for (const c of candles) byTs.set(c.ts, c);
+  const sorted = [...byTs.values()].sort((a, b) => a.ts - b.ts);
+  const newest = sorted[sorted.length - 1];
+  const join = (parts: readonly Candle[], confirm: boolean): Candle => ({
+    ts: (parts[0] as Candle).ts,
+    open: (parts[0] as Candle).open,
+    high: Decimal.max(...parts.map((c) => c.high)).toFixed(),
+    low: Decimal.min(...parts.map((c) => c.low)).toFixed(),
+    close: (parts[parts.length - 1] as Candle).close,
+    vol: parts.reduce((sum, c) => sum.plus(c.vol), ZERO).toFixed(),
+    volCcy: parts.reduce((sum, c) => sum.plus(c.volCcy), ZERO).toFixed(),
+    confirm,
+  });
   const out: Candle[] = [];
-  for (const first of [...byTs.values()].sort((a, b) => a.ts - b.ts)) {
+  for (const first of sorted) {
     if ((((first.ts - anchorMs) % periodMs) + periodMs) % periodMs !== 0) continue;
     const parts: Candle[] = [first];
     for (let k = 1; k < n; k++) {
@@ -749,17 +762,9 @@ export function aggregateCandles(candles: readonly Candle[], barMs: number, peri
       if (!part) break;
       parts.push(part);
     }
-    if (parts.length < n) continue;
-    out.push({
-      ts: first.ts,
-      open: first.open,
-      high: Decimal.max(...parts.map((c) => c.high)).toFixed(),
-      low: Decimal.min(...parts.map((c) => c.low)).toFixed(),
-      close: (parts[n - 1] as Candle).close,
-      vol: parts.reduce((sum, c) => sum.plus(c.vol), ZERO).toFixed(),
-      volCcy: parts.reduce((sum, c) => sum.plus(c.volCcy), ZERO).toFixed(),
-      confirm: parts.every((c) => c.confirm),
-    });
+    if (parts.length === n) out.push(join(parts, parts.every((c) => c.confirm)));
+    // The running period: every bar from its start to the newest candle is there, and the period is not over.
+    else if (forming && newest !== undefined && parts.length === Math.floor((newest.ts - first.ts) / barMs) + 1) out.push(join(parts, false));
   }
   return out;
 }

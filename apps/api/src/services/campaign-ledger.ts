@@ -61,6 +61,7 @@ function problemOf(v: unknown): string | null {
     if (!isObject(pot)) return 'pot is not an object';
     for (const key of ['startValue', 'btcMarkAtStart', 'structure', 'start', 'minStake', 'banked']) if (!isString(pot[key])) return `pot.${key} is not a string`;
     if (!isNumber(pot['startedAt']) || !isNumber(pot['rungs'])) return 'pot.startedAt or pot.rungs is not a number';
+    if (pot['cutHour'] !== undefined && !isNumber(pot['cutHour'])) return 'pot.cutHour is not a number';
   }
   for (const c of v['campaigns'] as unknown[]) {
     if (!isObject(c) || !isString(c['id']) || !isString(c['instId']) || !isObject(c['entry']) || !Array.isArray(c['adds']) || !Array.isArray(c['sales'])) return 'a campaign is not complete';

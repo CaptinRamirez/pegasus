@@ -268,7 +268,7 @@ export const signalRows: CampaignSignalRow[] = [
 
 export const signalsResponse: CampaignSignalsResponse = {
   generatedAt: NOW,
-  params: { entryChannel: 20, exitChannel: 10, addStep: '0.05', structure: 'pyramid', leverage: '10', feeRate: '0.0005' },
+  params: { entryChannel: 20, exitChannel: 10, addStep: '0.05', structure: 'pyramid', leverage: '10', feeRate: '0.0005', cutHour: 0 },
   thresholds: { nearPct: '0.03', stopWidePct: '0.2', stopNarrowPct: '0.02', farAbovePct: '0.05', liqBufferPct: '0.01' },
   riskPct: '0.01',
   equity: '25000',
@@ -376,7 +376,7 @@ export const trailingOn: TrailingView = {
     },
   ],
   pending: [],
-  nextCloseAt: DAILY_TS + 2 * DAY,
+  cutHour: 0, nextCloseAt: DAILY_TS + 2 * DAY,
   ts: NOW,
 };
 

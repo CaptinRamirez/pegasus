@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import type { PotReplayInput } from '@pegasus/backtest/campaign';
 import { OkxApiError, OkxTransportError } from '@pegasus/okx';
 import {
+  campaignBarsFromFourHours,
   contractsToCoin,
   D,
   Decimal,
@@ -73,7 +74,8 @@ import type { RiskEngine } from './risk-engine.js';
  *
  * The live counterparts of the replay's timing rules (packages/backtest/src/campaign/engine.ts, C1-C13):
  *
- * C1.  Entry. Read at a 00:00 UTC close from the exchange's daily bar that closed then (OKX 1Dutc, confirmed) and the
+ * C1.  Entry. Read at the daily close (00:00 UTC, or the cut of CAMPAIGN_CUT_HOUR) from the daily bar that closed then
+ *      (the exchange's 1Dutc at cut 0, else built from its 4-hour candles; confirmed) and the
  *      ones before it, and carried out right after the close by a market buy (openLong), not at the next bar's open.
  *      One campaign per instrument: an instrument whose campaign the exchange has liquidated before the step is free.
  * C2.  Size. campaignStake of the free cash left at that moment; the quantity at the open of the 12-hour bar running
@@ -132,7 +134,7 @@ import type { RiskEngine } from './risk-engine.js';
  *
  * Beside the pot the service keeps its replay (campaign-replay.ts): the backtest's replay of the pot from its start on
  * OKX's bars, with the other structure, the start value held in BTC and the ledger reconciled with it. It is computed
- * in the background after every step of a 00:00 UTC close, once at start when a pot exists and when the pot starts;
+ * in the background after every step of a daily close, once at start when a pot exists and when the pot starts;
  * the view carries its summary (`replay`) and GET /api/campaign/replay the result.
  */
 
@@ -143,12 +145,20 @@ export interface CampaignCandleSource {
   daily(instId: string): Promise<Candle[]>;
 }
 
-/** The exchange's bars through the market data service, which maps 12H and 1D to OKX's UTC-aligned ones. */
-export function exchangeCandleSource(market: MarketDataService): CampaignCandleSource {
-  return {
-    halfDay: (instId) => market.fetchCandles(instId, '12H', 300),
-    daily: (instId) => market.fetchCandles(instId, '1D', 300),
-  };
+/**
+ * The exchange's bars through the market data service, which maps 12H and 1D to OKX's UTC-aligned ones. At another
+ * cut (CAMPAIGN_CUT_HOUR) both are built from its 4-hour candles, the running bar included.
+ * shortcut: 300 4-hour candles are 50 days of bars, enough for the channels; page history-candles if more is ever needed.
+ */
+export function exchangeCandleSource(market: MarketDataService, cutHour = 0): CampaignCandleSource {
+  if (cutHour === 0) {
+    return {
+      halfDay: (instId) => market.fetchCandles(instId, '12H', 300),
+      daily: (instId) => market.fetchCandles(instId, '1D', 300),
+    };
+  }
+  const bars = async (instId: string): Promise<{ daily: Candle[]; halfDay: Candle[] }> => campaignBarsFromFourHours(await market.fetchCandles(instId, '4H', 300), cutHour, true);
+  return { halfDay: async (instId) => (await bars(instId)).halfDay, daily: async (instId) => (await bars(instId)).daily };
 }
 
 export interface CampaignServiceDeps {
@@ -291,7 +301,7 @@ function settingsPot(config: CampaignConfig): PotParams {
   return { ...DEFAULT_POT_PARAMS, start: config.potStart, minStake: config.minStake };
 }
 
-function paramsView(instruments: string[], params: CampaignParams, pot: PotParams): CampaignParamsView {
+function paramsView(instruments: string[], params: CampaignParams, pot: PotParams, cutHour: number): CampaignParamsView {
   return {
     instruments,
     potStart: pot.start,
@@ -302,6 +312,7 @@ function paramsView(instruments: string[], params: CampaignParams, pot: PotParam
     addStep: params.addStep,
     entryChannel: params.entryChannel,
     exitChannel: params.exitChannel,
+    cutHour,
     stakeFraction: pot.stakeFraction,
     rungFactor: pot.rungFactor,
     bankFraction: pot.bankFraction,
@@ -313,7 +324,7 @@ export function disabledCampaignView(config: CampaignConfig, now = Date.now()): 
   return {
     status: 'disabled',
     reason: { code: 'CAMPAIGN_DISABLED', message: 'the campaign is not enabled (CAMPAIGN_ENABLED=1, paper trading only)' },
-    params: paramsView(config.instruments, settingsParams(config), settingsPot(config)),
+    params: paramsView(config.instruments, settingsParams(config), settingsPot(config), config.cutHour),
     pot: null,
     campaigns: [],
     bankings: [],
@@ -370,7 +381,7 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
     this.basePot = opts.pot ?? settingsPot(config);
     this.now = opts.now ?? Date.now;
     this.sleep = opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms).unref()));
-    this.candles = opts.candles ?? exchangeCandleSource(deps.market);
+    this.candles = opts.candles ?? exchangeCandleSource(deps.market, this.config.cutHour);
     this.checkEveryMs = opts.checkEveryMs ?? 15_000;
     this.pollMs = opts.pollMs ?? 5_000;
     this.closeWindowMs = opts.closeWindowMs ?? 10 * 60_000;
@@ -392,6 +403,14 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
     if (!loaded.ok) {
       this.ledgerError = loaded.error;
       this.log.error({ file: this.opts.ledgerFile, err: loaded.error }, 'campaign ledger unreadable: the campaign does not trade; repair or move the file away (a copy is kept as .corrupt)');
+      this.emitChange();
+      return;
+    }
+    const potCut = loaded.ledger.pot?.cutHour ?? 0;
+    if (loaded.ledger.pot && potCut !== this.config.cutHour) {
+      // A pot keeps the cut it was started with: its closes would not be this setting's.
+      this.ledgerError = `the pot was started at the ${String(potCut).padStart(2, '0')}:00 UTC daily cut and CAMPAIGN_CUT_HOUR is ${this.config.cutHour}; a pot keeps its cut: move the ledger (and the pot's paper account) away to start a new pot at the new cut, or set the cut back`;
+      this.log.error({ file: this.opts.ledgerFile, potCut, setting: this.config.cutHour }, 'campaign ledger refused: the pot runs another daily cut');
       this.emitChange();
       return;
     }
@@ -457,7 +476,7 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
     const pot = this.ledger.pot;
     if (pot.finishedAt !== null) return;
     const now = this.now();
-    const due = closesAfter(this.ledger.lastClose ?? closeAtOrBefore(pot.startedAt), now);
+    const due = closesAfter(this.ledger.lastClose ?? closeAtOrBefore(pot.startedAt, this.config.cutHour), now, this.config.cutHour);
     const last = due[due.length - 1];
     if (last === undefined) return;
     // A close is processed as it comes while its window is open; past it, it is a missed close.
@@ -494,6 +513,7 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
       startValue: money(snap.totalEq),
       btcMarkAtStart: await this.btcMark(),
       structure: this.baseParams.structure,
+      cutHour: this.config.cutHour,
       start: this.basePot.start,
       minStake: this.basePot.minStake,
       banked: '0',
@@ -501,7 +521,7 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
       peak: null,
       finishedAt: null,
     };
-    this.ledger.lastClose = closeAtOrBefore(now);
+    this.ledger.lastClose = closeAtOrBefore(now, this.config.cutHour);
     this.log.info({ value: this.ledger.pot.startValue, btcMark: this.ledger.pot.btcMarkAtStart, structure: this.ledger.pot.structure, instruments: this.tradedInstruments().map((i) => i.instId) }, 'campaign pot started');
     this.changed();
     this.replay.refresh();
@@ -615,7 +635,7 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
       if (p) campaigns.push({ id: c.id, instId: c.instId, addRef: c.addRef, addUnit: c.addUnit, pendingExit: c.pendingExit !== null, position: this.stepPosition(p) });
       else unresolved.add(c.instId);
     }
-    const instruments = this.instrumentsWith(open).map((inst) => ({ inst, bars: bars.get(inst.instId) ?? barsAt(inst.instId, [], [], closeTs, this.rule()) }));
+    const instruments = this.instrumentsWith(open).map((inst) => ({ inst, bars: bars.get(inst.instId) ?? barsAt(inst.instId, [], [], closeTs, this.rule(), this.config.cutHour) }));
     const foreign = new Set(this.foreignPositions(snap).map((p) => p.instId));
     // Less available than banked (a position the ledger does not know holds margin): the pot has no free cash.
     const freeCash = snap.available.minus(pot.banked);
@@ -1161,7 +1181,7 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
 
   /** C8: the bars of the close, polled until the one that closed is confirmed (and, at 00:00 UTC, the daily one), or the window is over. */
   private async awaitBars(closeTs: number, deadline: number): Promise<Map<string, CloseBars>> {
-    const daily = isDailyClose(closeTs);
+    const daily = isDailyClose(closeTs, this.config.cutHour);
     const out = new Map<string, CloseBars>();
     await Promise.all(
       this.instrumentsWith(this.openCampaigns()).map(async (inst) => {
@@ -1177,7 +1197,7 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
               failure = (err as Error).message;
             }
           }
-          const bars = barsAt(inst.instId, halfDay, days, closeTs, this.rule());
+          const bars = barsAt(inst.instId, halfDay, days, closeTs, this.rule(), this.config.cutHour);
           const complete = bars.close !== null && (!daily || bars.daily !== null);
           if (complete || this.now() >= deadline || this.stopped || !this.config.instruments.includes(inst.instId)) {
             if (!complete) bars.input.note = `${bars.input.note ?? ''}${failure ? ` (${failure})` : ''}; not complete ${Math.round((this.now() - closeTs) / 1000)} s after the close: no signal`;
@@ -1259,7 +1279,7 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
     this.log.info({ seq: step.seq, kind: step.kind, close: iso(step.closeTs), actions: step.actions.length, errors: step.errors }, 'campaign step done');
     this.changed();
     // After the step of a 00:00 UTC close (entries and exits are decided there), in the background.
-    if (step.closes.some(isDailyClose)) this.replay.refresh();
+    if (step.closes.some((c) => isDailyClose(c, this.config.cutHour))) this.replay.refresh();
   }
 
   private act(step: CampaignStepLog, a: Pick<CampaignStepAction, 'kind' | 'closeTs' | 'instId' | 'campaignId' | 'plan'> & Partial<Pick<CampaignStepAction, 'outcome' | 'reason' | 'result'>>): CampaignStepAction {
@@ -1326,11 +1346,11 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
     const status = this.status();
     const live = this.liveFigures();
     const lastStep = this.ledger.steps[this.ledger.steps.length - 1];
-    const next = status.status === 'running' && pot ? (this.ledger.lastClose ?? closeAtOrBefore(pot.startedAt)) + HALF_DAY_MS : null;
+    const next = status.status === 'running' && pot ? (this.ledger.lastClose ?? closeAtOrBefore(pot.startedAt, this.config.cutHour)) + HALF_DAY_MS : null;
     return {
       status: status.status,
       reason: status.reason,
-      params: paramsView(this.config.instruments, this.rule(), this.potParams()),
+      params: paramsView(this.config.instruments, this.rule(), this.potParams(), this.config.cutHour),
       pot: pot
         ? {
             ...pot,
@@ -1348,7 +1368,7 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
       missedCloses: this.ledger.missedCloses,
       foreign: [...this.ledger.foreign],
       lastStep: lastStep ? { seq: lastStep.seq, kind: lastStep.kind, closeTs: lastStep.closeTs, startedAt: lastStep.startedAt, endedAt: lastStep.endedAt, errors: lastStep.errors } : null,
-      nextStep: next === null ? null : { closeTs: next, daily: isDailyClose(next) },
+      nextStep: next === null ? null : { closeTs: next, daily: isDailyClose(next, this.config.cutHour) },
       replay: this.replay.summary(),
       serverTime: this.now(),
     };
@@ -1378,7 +1398,7 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
   /** The pot, its campaigns and its rule now, copied: a step goes on while the replay runs. */
   private replayInput(): PotReplayInput {
     const pot = this.requirePot();
-    return { pot: structuredClone(pot), campaigns: structuredClone(this.ledger.campaigns), instruments: [...this.config.instruments], params: this.rule(), potParams: this.potParams(), now: this.now() };
+    return { pot: structuredClone(pot), campaigns: structuredClone(this.ledger.campaigns), instruments: [...this.config.instruments], params: this.rule(), potParams: this.potParams(), now: this.now(), cutHour: this.config.cutHour };
   }
 
   /** GET /api/campaign/log: the steps before `before` (a seq), newest first. */

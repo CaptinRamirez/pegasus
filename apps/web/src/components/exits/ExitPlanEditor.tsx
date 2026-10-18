@@ -1,3 +1,4 @@
+import { useTrailing } from '../../hooks/useTrailing';
 import { useId } from 'react';
 import { useT } from '../../i18n';
 import {
@@ -74,6 +75,8 @@ export function Segmented<T extends string>({ value, options, onChange, label }:
  * its own row; the trailing stop says where it stands now.
  */
 export function ExitPlanEditor({ form, update, ctx, takeProfit = true, trailing = true, channel = true, breakeven = true, noneOption = true, channelLevel = null, priceNow, entryNote = null }: Props) {
+  // The hour of the daily closes the channel stops move after: the API's trailing view says it
+  const cutHour = useTrailing().view?.cutHour ?? 0;
   const t = useT();
   const id = useId();
   const set = (p: Partial<ExitForm>) => update((f) => ({ ...f, ...p }));
@@ -272,7 +275,7 @@ export function ExitPlanEditor({ form, update, ctx, takeProfit = true, trailing 
               </div>
               {generalError('CHANNEL_BARS') === undefined ? (
                 <>
-                  <div className="exit-hint exit-now">{channelLevel === null ? t.exits.channelLater(bars, short) : t.exits.channelNow(fmtPx(channelLevel, ctx.inst), bars, short)}</div>
+                  <div className="exit-hint exit-now">{channelLevel === null ? t.exits.channelLater(bars, short, cutHour) : t.exits.channelNow(fmtPx(channelLevel, ctx.inst), bars, short, cutHour)}</div>
                   {channelWrong && channelLevel !== null && <div className="exit-hint warn exit-channel-wrong">{t.exits.channelWrongSide(fmtPx(channelLevel, ctx.inst), short)}</div>}
                 </>
               ) : (

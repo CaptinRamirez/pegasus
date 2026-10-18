@@ -62,6 +62,7 @@ export const params: CampaignParamsView = {
   addStep: '0.05',
   entryChannel: 20,
   exitChannel: 10,
+  cutHour: 0,
   stakeFraction: '0.5',
   rungFactor: '10',
   bankFraction: '0.5',

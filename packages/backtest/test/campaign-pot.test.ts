@@ -5,7 +5,7 @@ import type { Fetchers, HistoryBar } from '../src/data/load.js';
 import { DEFAULT_RECONCILE_TOLERANCES, heldInBtc, parseLedger, reconcileCampaigns, replayPot, type PotReplay, type PotReplayInput } from '../src/campaign/pot.js';
 import type { CampaignRecord } from '../src/campaign/types.js';
 import { day, FLAT_DAY, halves, QUIET, RISE_AND_EXIT, SETUP, SHORT, SIGNAL_DAY, type Row } from './campaign-helpers.js';
-import { DAY, HALF_DAY, HOUR, instrument } from './helpers.js';
+import { T0, DAY, HALF_DAY, HOUR, instrument } from './helpers.js';
 
 const BTC = 'BTC-USDT-SWAP';
 const ETH = 'ETH-USDT-SWAP';
@@ -35,6 +35,26 @@ function exchange(rows: Record<string, readonly Row[]>, running: Record<string, 
     },
   };
   return fetchers;
+}
+
+/** The same exchange serving 4-hour candles only, its 12-hour bars anchored at 20:00 UTC and split in three (the middle candles close at the open). */
+function exchange4h(rows: Record<string, readonly Row[]>, running: Record<string, string> = {}): Fetchers {
+  const halfDay = new Map(Object.entries(rows).map(([instId, r]) => [instId, halves(r, T0 + 20 * HOUR)]));
+  const split = (bars: readonly Candle[]): Candle[] => bars.flatMap((b) => [0, 1, 2].map((k) => ({ ...b, ts: b.ts + k * 4 * HOUR, close: k === 2 ? b.close : b.open })));
+  return {
+    instrument: async (instId: string) => instrument(instId),
+    candles: async (instId: string, bar: HistoryBar, after: number | undefined): Promise<Candle[]> =>
+      bar === '4H' ? split(halfDay.get(instId) ?? []).filter((c) => after === undefined || c.ts < after).slice(-100).reverse() : [],
+    openInterest: async () => [],
+    funding: async () => [],
+    fundingPageSize: Number.POSITIVE_INFINITY,
+    latest: async (instId: string): Promise<Candle[]> => {
+      const last = (halfDay.get(instId) ?? []).at(-1);
+      const open = running[instId];
+      const parts = last ? split([last]) : [];
+      return last && open !== undefined ? [...parts, { ...last, ts: last.ts + HALF_DAY, open, high: open, low: open, close: open, confirm: false }] : parts;
+    },
+  };
 }
 
 /** The pot started three hours after the close of day 3: it looks at closes from day 3, 12:00 on. */
@@ -99,6 +119,19 @@ const replay = async (campaigns: LedgerCampaign[] = [], over: Partial<PotReplayI
   replayPot(input(campaigns, over), { fetchers: exchange(WORLD, running), cache: new MemoryCache() });
 
 describe('the replay beside the pot', () => {
+  it('at another daily cut builds the bars from 4-hour candles: the pot at 20:00 UTC replays as the pot at 00:00, shifted', async () => {
+    const shift = 20 * HOUR;
+    // BTC and XRP only: their entries are at different closes, so the order of same-close entries (seeded by the close) plays no part
+    const base = await replayPot(input([], { instruments: [BTC, XRP] }), { fetchers: exchange(WORLD, { [XRP]: '100' }), cache: new MemoryCache() });
+    const shifted = await replayPot(input([], { instruments: [BTC, XRP], pot: { ...POT, startedAt: POT.startedAt + shift, cutHour: 20 }, now: END + HOUR + shift, cutHour: 20 }), { fetchers: exchange4h(WORLD, { [XRP]: '100' }), cache: new MemoryCache() });
+    expect(shifted.from).toBe(base.from + shift);
+    expect(shifted.through).toBe(base.through + shift);
+    expect(shifted.same.value).toBe(base.same.value);
+    expect(shifted.same.campaigns.map((c) => ({ ...c, signalTs: c.signalTs - shift, entryTs: c.entryTs - shift, endTs: c.endTs === null ? null : c.endTs - shift }))).toEqual(base.same.campaigns);
+    expect(shifted.same.samples.map((s) => ({ ...s, ts: s.ts - shift }))).toEqual(base.same.samples);
+    expect(shifted.heldBtc.map((s) => ({ ...s, ts: s.ts - shift }))).toEqual(base.heldBtc);
+  });
+
   it('replays from the first close after the start to the last close, with its own structure and the other one beside it', async () => {
     const r = await replay();
     expect(r).toMatchObject({ from: day(3) + HALF_DAY, through: END });

@@ -16,6 +16,7 @@ export const signalContext = (row: CampaignSignalRow, res: CampaignSignalsRespon
   entryChannel: res.params.entryChannel,
   exitChannel: res.params.exitChannel,
   addStep: fmtPct(res.params.addStep, 0),
+  cutHour: res.params.cutHour,
 });
 
 /** The coin's state in plain words: one sentence per reason, then the rule (or what to do on an exit). */

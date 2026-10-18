@@ -21,6 +21,7 @@ import {
   type Instrument,
 } from '@pegasus/shared';
 import {
+  isDailyClose,
   afterSale,
   barsAt,
   closeAtOrBefore,
@@ -97,6 +98,17 @@ describe('closes', () => {
     expect(closeAtOrBefore(day(3) + 13 * 3_600_000)).toBe(day(3) + HALF_DAY_MS);
     expect(closesAfter(day(1), day(2) + 1)).toEqual([day(1) + HALF_DAY_MS, day(2)]);
     expect(closesAfter(day(1), day(1) + HALF_DAY_MS - 1)).toEqual([]);
+  });
+
+  it('follow the cut: at 20 the 12-hour closes are 08:00 and 20:00 UTC and the daily one is 20:00', () => {
+    const h = 3_600_000;
+    expect(closeAtOrBefore(day(3) + 5 * h, 20)).toBe(day(2) + 20 * h);
+    expect(closeAtOrBefore(day(3) + 9 * h, 20)).toBe(day(3) + 8 * h);
+    expect(closesAfter(day(3) + 8 * h, day(4) + 8 * h, 20)).toEqual([day(3) + 20 * h, day(4) + 8 * h]);
+    expect(isDailyClose(day(3) + 20 * h, 20)).toBe(true);
+    expect(isDailyClose(day(3) + 8 * h, 20)).toBe(false);
+    expect(isDailyClose(day(3), 20)).toBe(false);
+    expect(isDailyClose(day(3))).toBe(true);
   });
 });
 

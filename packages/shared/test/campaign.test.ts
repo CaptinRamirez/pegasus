@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  campaignBarsFromFourHours,
+  campaignCloseAtOrBefore,
+  campaignDayCloseAtOrBefore,
+  isCampaignDailyClose,
   CAMPAIGN_MAINTENANCE,
   campaignAction,
   campaignAddQuantity,
@@ -387,5 +391,42 @@ describe('the experiments: a stop and a leverage from the ATR', () => {
     expect(campaignLeverage(100, 0.1, '0.0105', p).toFixed()).toBe('10');
     expect(campaignLeverage(100, 40, '0.0105', p).toFixed()).toBe('1');
     expect(() => campaignLeverage(100, 0, '0.0105', p)).toThrow(/ATR/);
+  });
+});
+
+describe('the daily cut', () => {
+  const H = 3_600_000;
+  const day = Date.UTC(2024, 0, 10);
+
+  it('places the 12-hour closes at the cut and 12 hours later, the daily one at the cut', () => {
+    expect(campaignCloseAtOrBefore(day + 5 * H)).toBe(day);
+    expect(campaignCloseAtOrBefore(day + 5 * H, 20)).toBe(day - 4 * H);
+    expect(campaignCloseAtOrBefore(day + 9 * H, 20)).toBe(day + 8 * H);
+    expect(campaignCloseAtOrBefore(day + 20 * H, 20)).toBe(day + 20 * H);
+    expect(campaignDayCloseAtOrBefore(day + 21 * H, 20)).toBe(day + 20 * H);
+    expect(campaignDayCloseAtOrBefore(day + 19 * H, 20)).toBe(day - 4 * H);
+    expect(isCampaignDailyClose(day, 0)).toBe(true);
+    expect(isCampaignDailyClose(day + 12 * H, 0)).toBe(false);
+    expect(isCampaignDailyClose(day + 20 * H, 20)).toBe(true);
+    expect(isCampaignDailyClose(day + 8 * H, 20)).toBe(false);
+  });
+
+  it('builds the bars of the cut from 4-hour candles, the running ones unconfirmed when asked for', () => {
+    const four = (i: number, confirm = true) => ({ ts: day + i * 4 * H, open: String(100 + i), high: String(101 + i), low: String(99 + i), close: String(100.5 + i), vol: '1', volCcy: '1', confirm });
+    const bars = Array.from({ length: 13 }, (_, i) => four(i, i < 12));
+    const { daily, halfDay } = campaignBarsFromFourHours(bars, 20);
+    expect(daily.map((c) => (c.ts - day) / H)).toEqual([20]);
+    expect(halfDay.map((c) => (c.ts - day) / H)).toEqual([8, 20, 32]);
+    const forming = campaignBarsFromFourHours(bars, 20, true);
+    expect(forming.daily.map((c) => [(c.ts - day) / H, c.confirm])).toEqual([
+      [20, true],
+      [44, false],
+    ]);
+    expect(forming.halfDay.map((c) => [(c.ts - day) / H, c.confirm])).toEqual([
+      [8, true],
+      [20, true],
+      [32, true],
+      [44, false],
+    ]);
   });
 });

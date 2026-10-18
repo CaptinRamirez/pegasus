@@ -20,6 +20,7 @@ Single-user OKX perpetual-swap manual trading terminal. pnpm monorepo, TypeScrip
 - Only send `posSide` in long/short position mode; only send `reduceOnly` in net mode.
 - Keep strict TS clean: `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax` (use `import type`). Build optional fields conditionally instead of assigning `undefined`.
 - Bars of 6H and longer are UTC-aligned: OKX's plain `6H`/`12H`/`1D`/`1W` bars open on UTC+8 boundaries, so they are mapped to its `…utc` bars at the wire boundary. Signals are computed on confirmed daily bars only, at the cuts listed in `SIGNAL_PHASES` (default both: 00:00 UTC from OKX `1Dutc` bars and 12:00 UTC built from `12Hutc` bars), each sized at 1/n of a unit.
+- The campaign's daily cut is `CAMPAIGN_CUT_HOUR` (default 0; 20 adopted on 2026-10-18 and set in `.env`): at 0 the exchange's `1Dutc` / `12Hutc` bars, otherwise daily and 12-hour bars built from its `4H` candles (`campaignBarsFromFourHours` in `@pegasus/shared`). The campaign service, `GET /api/campaign/signals`, channel trailing and the replay beside the pot all follow it; a pot keeps the cut it was started with.
 - The API denies by default: `server.ts` decides authentication on the matched route (only `/api/health` and `/ws` are exempt from the bearer token) and refuses any request whose Host is not local or whose Origin is not listed in `WEB_ORIGINS`.
 
 ## Commands

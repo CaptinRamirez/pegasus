@@ -74,6 +74,12 @@ const envSchema = z.object({
   CAMPAIGN_MIN_STAKE: positive.default(DEFAULT_POT_PARAMS.minStake),
   /** pyramid: a campaign that works adds to itself out of its open profit; noadd: it holds its entry quantity to the end. */
   CAMPAIGN_STRUCTURE: z.enum(['pyramid', 'noadd']).default(DEFAULT_CAMPAIGN_PARAMS.structure),
+  /**
+   * UTC hour the campaign's daily bars close at: 0 (the exchange's own daily and 12-hour bars) or 4, 8, 12, 16, 20
+   * (bars built from its 4-hour candles; the 12-hour closes are at it and 12 hours later). The SIGNALS tab, channel
+   * trailing and the replay beside the pot follow it. A pot keeps the cut it was started with.
+   */
+  CAMPAIGN_CUT_HOUR: z.enum(['0', '4', '8', '12', '16', '20']).default('0'),
   /** The campaign's ledger (the pot, its campaigns, the decision log); relative paths are under the repository root. */
   CAMPAIGN_STATE_FILE: z.string().min(1).default('data/campaign-ledger.json'),
   /**
@@ -115,6 +121,8 @@ export interface CampaignConfig {
   /** Smallest stake */
   minStake: string;
   structure: CampaignStructure;
+  /** UTC hour the daily bars close at (CAMPAIGN_CUT_HOUR); 0: the exchange's own daily and 12-hour bars */
+  cutHour: number;
   /** Leverage of a campaign: the most its isolated position's notional may be of its equity (DEFAULT_CAMPAIGN_PARAMS, not a setting) */
   leverage: string;
   /** Taker fee rate the campaign's sizing and margin moves leave room for (DEFAULT_CAMPAIGN_PARAMS, not a setting) */
@@ -281,6 +289,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       potStart: e.CAMPAIGN_POT_START,
       minStake: e.CAMPAIGN_MIN_STAKE,
       structure: e.CAMPAIGN_STRUCTURE,
+      cutHour: Number(e.CAMPAIGN_CUT_HOUR),
       leverage: DEFAULT_CAMPAIGN_PARAMS.leverage,
       feeRate: DEFAULT_CAMPAIGN_PARAMS.feeRate,
       stateFile: resolve(REPO_ROOT, e.CAMPAIGN_STATE_FILE),

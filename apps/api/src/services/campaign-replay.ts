@@ -9,7 +9,7 @@ import type { Logger } from '../logger.js';
  * value held in BTC, and the ledger reconciled with the replay campaign by campaign.
  *
  * Computed in the background, never in a step's way: the campaign service asks for it after every step that
- * processed a 00:00 UTC close, once at start when a pot exists, and when the pot starts; POST /api/campaign/replay
+ * processed a daily close, once at start when a pot exists, and when the pot starts; POST /api/campaign/replay
  * asks for it too. One computation at a time (one asked for while another runs follows it, once), each given up
  * after timeoutMs; a computation given up on is waited for before the next one starts. A failure is reported with
  * its reason and the last result is kept. The data is read from OKX's public endpoints and kept in the cache

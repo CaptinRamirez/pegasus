@@ -50,6 +50,7 @@ Request bodies are validated with the zod schemas in `packages/shared/src/schema
 | POST | `/api/positions/channel-trailing` | `SetChannelTrailingRequest` (`{ instId, mgnMode, posSide?, bars }`) | `ChannelTrailingEntry`: channel trailing set for an open position, its stop placed or moved at once (see "Exit orders") |
 | POST | `/api/positions/channel-trailing/clear` | `ClearChannelTrailingRequest` (`{ instId, mgnMode, posSide? }`) | `{ instId, mgnMode, posSide, cleared }`; the stop stays where it is |
 | GET | `/api/trailing` | – | `TrailingView`: `{ enabled, entries: ChannelTrailingEntry[], pending: PendingTrailingExit[], nextCloseAt, ts }` |
+  cutHour: number;                 // UTC hour of those daily closes (CAMPAIGN_CUT_HOUR)
 | GET | `/api/candles` | `CandlesQuery` | `Candle[]` ascending by `ts`; `6H`, `12H`, `1D` and `1W` are UTC-aligned (OKX `6Hutc` … `1Wutc`), also on the `candle` WS message |
 | GET | `/api/book` | `?instId` | `OrderBook` (top 50 each side) |
 | GET | `/api/ticker` | `?instId` | `Ticker` |
@@ -633,6 +634,7 @@ at 10x on a hard-capped pot. Settings (`.env`):
 | `CAMPAIGN_POT_START` | `56` | what the pot starts with, USDT |
 | `CAMPAIGN_MIN_STAKE` | `5.6` | the smallest stake; one above `CAMPAIGN_POT_START` is refused |
 | `CAMPAIGN_STRUCTURE` | `pyramid` | `pyramid` (a campaign that works adds to itself) or `noadd` |
+| `CAMPAIGN_CUT_HOUR` | `0` | UTC hour the campaign's daily bars close at: `0` (OKX's own `1Dutc` / `12Hutc` bars) or `4`, `8`, `12`, `16`, `20` (bars built from its `4H` candles; the 12-hour closes are at it and 12 hours later). Followed by the campaign, `GET /api/campaign/signals`, channel trailing and the replay beside the pot; a pot keeps the cut it was started with (another setting blocks it with `LEDGER_UNREADABLE`). `20` adopted on 2026-10-18 |
 | `CAMPAIGN_STATE_FILE` | `data/campaign-ledger.json` | the campaign's ledger (below), under the repository root unless the path is absolute; kept in this file whichever store the API uses. It belongs to the paper account the pot runs on: a new paper account wants a new ledger |
 
 The campaign's leverage (10) and the fee rate it sizes with are the rule's (`DEFAULT_CAMPAIGN_PARAMS`), not settings.
@@ -704,7 +706,7 @@ processed. Its types and the ones of the routes are in `packages/shared/src/camp
 interface CampaignView {
   status: 'disabled' | 'blocked' | 'running' | 'finished';
   reason: { code: string; message: string } | null; // CAMPAIGN_DISABLED, LEDGER_UNREADABLE, ACCOUNT_NOT_DEDICATED, ACCOUNT_UNAVAILABLE, POT_FINISHED; null while running
-  params: CampaignParamsView;      // instruments, potStart, minStake, structure, leverage, feeRate, addStep, entryChannel, exitChannel, stakeFraction, rungFactor, bankFraction
+  params: CampaignParamsView;      // instruments, potStart, minStake, structure, leverage, feeRate, addStep, entryChannel, exitChannel, cutHour (UTC hour of the daily close), stakeFraction, rungFactor, bankFraction
   pot: CampaignPotView | null;     // null until it started: startedAt, startValue, btcMarkAtStart, structure, start, minStake, banked, rungs,
                                    // peak { ts, value }, finishedAt; from the account now: freeCash, openEquity, value (null while unknown); nextRung
   campaigns: CampaignRecordView[]; // newest first: the ledger's record, its position now (position, null once ended) and valueMultiple

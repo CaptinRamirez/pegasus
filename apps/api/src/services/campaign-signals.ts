@@ -1,8 +1,10 @@
 import {
+  campaignBarsFromFourHours,
+  campaignCloseAtOrBefore,
+  campaignDayCloseAtOrBefore,
   D,
   positionDirection,
   sumDecimals,
-  utcDayStart,
   type CampaignParams,
   type CampaignParamsView,
   type CampaignReplayView,
@@ -32,8 +34,9 @@ import type { RiskEngine } from './risk-engine.js';
  * with a plan to follow it by hand. The states and the plan are campaign-signals-plan.ts's (its header gives the
  * rules). The rule's parameters are the campaign's: the pot's own while a pot runs, the settings otherwise.
  *
- * Inputs: the exchange's confirmed UTC bars (OKX 1Dutc and 12Hutc: through the market data service for a tracked
- * instrument, the public REST candles for the others), cached BAR_CACHE_MS and never across a 00:00 or 12:00 UTC close
+ * Inputs: the confirmed bars of the campaign's daily cut (CAMPAIGN_CUT_HOUR: OKX 1Dutc and 12Hutc at cut 0, bars built
+ * from its 4-hour candles otherwise; through the market data service for a tracked instrument, the public REST candles
+ * for the others), cached BAR_CACHE_MS and never across a 12-hour close of the cut
  * (INCOMPLETE_CACHE_MS while the bar that closed there is not confirmed yet); the mark price (the live stream of a
  * tracked instrument, else the public REST mark price, cached MARK_CACHE_MS); the account's positions (a long held,
  * and the notionals the risk limits count); the trade journal (the add reference: the last opening order of the
@@ -184,7 +187,7 @@ export class CampaignSignalsService {
     const status: CampaignServiceStatus = view.status;
     return {
       generatedAt: now,
-      params: { entryChannel: params.entryChannel, exitChannel: params.exitChannel, addStep: params.addStep, structure: params.structure, leverage: params.leverage, feeRate: params.feeRate },
+      params: { entryChannel: params.entryChannel, exitChannel: params.exitChannel, addStep: params.addStep, structure: params.structure, leverage: params.leverage, feeRate: params.feeRate, cutHour: view.params.cutHour },
       thresholds: { nearPct: NEAR_PCT, stopWidePct: STOP_WIDE_PCT, stopNarrowPct: STOP_NARROW_PCT, farAbovePct: FAR_ABOVE_PCT, liqBufferPct: LIQ_BUFFER_PCT },
       riskPct,
       equity,
@@ -214,7 +217,7 @@ export class CampaignSignalsService {
     };
   }
 
-  /** Bars cached BAR_CACHE_MS, never across a 00:00 or 12:00 UTC close, and only INCOMPLETE_CACHE_MS while the bar that closed last is not confirmed. */
+  /** Bars cached BAR_CACHE_MS, never across a 12-hour close of the cut, and only INCOMPLETE_CACHE_MS while the bar that closed last is not confirmed. */
   private async cachedBars(instId: string, bar: '1D' | '12H', limit: number, now: number): Promise<Candle[]> {
     const key = `${instId}:${bar}`;
     const cached = this.cache.get(key);
@@ -225,10 +228,11 @@ export class CampaignSignalsService {
   }
 
   private fresh(entry: BarCacheEntry, bar: '1D' | '12H', now: number): boolean {
-    const period = Math.floor(now / HALF_DAY_MS);
-    if (Math.floor(entry.at / HALF_DAY_MS) !== period) return false;
+    const cut = this.deps.config.campaign.cutHour;
+    const lastHalf = campaignCloseAtOrBefore(now, cut);
+    if (campaignCloseAtOrBefore(entry.at, cut) !== lastHalf) return false;
     const length = bar === '1D' ? DAY_MS : HALF_DAY_MS;
-    const lastClose = bar === '1D' ? utcDayStart(now) : period * HALF_DAY_MS;
+    const lastClose = bar === '1D' ? campaignDayCloseAtOrBefore(now, cut) : lastHalf;
     const newest = entry.candles.filter((c) => c.confirm).reduce((max, c) => Math.max(max, c.ts), Number.NEGATIVE_INFINITY);
     const complete = newest + length >= lastClose;
     return now - entry.at < (complete ? BAR_CACHE_MS : INCOMPLETE_CACHE_MS);
@@ -268,6 +272,13 @@ export class CampaignSignalsService {
       const rows = await this.deps.clients.rest.getCandles(instId, toOkxBar(bar), { limit: Math.min(limit, 300) });
       return rows.map(mapCandle).sort((a, b) => a.ts - b.ts);
     };
+    const cut = this.deps.config.campaign.cutHour;
+    if (cut !== 0) {
+      // The bars of the cut from the exchange's 4-hour candles, the running bar included.
+      // shortcut: the exchange serves 300 candles at most, 50 daily bars of the cut; page history-candles if a longer chart is wanted.
+      const bars = async (instId: string, fourHours: number): Promise<{ daily: Candle[]; halfDay: Candle[] }> => campaignBarsFromFourHours(await read(instId, '4H', Math.min(fourHours, 300)), cut, true);
+      return { daily: async (instId, limit) => (await bars(instId, limit * 6)).daily, halfDay: async (instId, limit) => (await bars(instId, limit * 3)).halfDay };
+    }
     return { daily: (instId, limit) => read(instId, '1D', limit), halfDay: (instId, limit) => read(instId, '12H', limit) };
   }
 

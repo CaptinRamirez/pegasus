@@ -1,6 +1,7 @@
 import type { CancelSweepState } from '@pegasus/shared';
 import { pad2, splitDuration } from '../lib/campaign';
 import { fmtNum, safeDecimal } from '../lib/format';
+import { hh } from './en';
 import type { Messages, RiskDetails } from './en';
 
 const SIDE = { buy: '买入', sell: '卖出' };
@@ -417,7 +418,7 @@ export const zh: Messages = {
     reason: {
       CLOSE_ABOVE_ENTRY: (p, c) => `${c.coin} 日线收在 ${c.entryChannel} 日高点 ${p.level} 之上（收盘 ${p.close}）。`,
       NEAR_ENTRY: (p, c) => `${c.coin} 现价 ${p.markPx}，距 ${c.entryChannel} 日高点 ${p.level} 还差 ${p.distancePct}：日线收在其上即为开仓信号。`,
-      MARK_ABOVE_ENTRY: (p, c) => `${c.coin} 现价 ${p.markPx} 已在 ${c.entryChannel} 日高点 ${p.level} 之上；需日线收盘在其上（UTC 00:00）才是开仓信号。`,
+      MARK_ABOVE_ENTRY: (p, c) => `${c.coin} 现价 ${p.markPx} 已在 ${c.entryChannel} 日高点 ${p.level} 之上；需日线收盘在其上（UTC ${hh(c.cutHour)}）才是开仓信号。`,
       BELOW_ENTRY: (p, c) => `${c.coin} 现价 ${p.markPx}，低于 ${c.entryChannel} 日高点 ${p.level}，相差 ${p.distancePct}。`,
       HOLDING: (p, c) => `持有多仓 ${p.contracts} 张。离场线（${c.exitChannel} 日低点）${p.trailingLine}${p.addTrigger === '' ? '' : `；12 小时收盘达到 ${p.addTrigger} 及以上时加仓`}。`,
       CLOSE_BELOW_EXIT: (p, c) => `${c.coin} 日线收在 ${c.exitChannel} 日低点 ${p.level} 之下（收盘 ${p.close}）：规则平多离场。`,
@@ -697,8 +698,8 @@ export const zh: Messages = {
     trailing: '移动止损',
     trailingMode: { none: '不设', channel: '通道', callback: '回调' },
     channelBars: '天数',
-    channelNow: (level, bars, short) => `止损现在在 ${level}（最近 ${bars} 日${short ? '最高价' : '最低价'}），每天 UTC 00:00 收盘后只往${short ? '下' : '上'}移。`,
-    channelLater: (bars, short) => `下单时按最近 ${bars} 日${short ? '最高价' : '最低价'}给出止损，之后每天 UTC 00:00 收盘后只往${short ? '下' : '上'}移。`,
+    channelNow: (level, bars, short, cutHour) => `止损现在在 ${level}（最近 ${bars} 日${short ? '最高价' : '最低价'}），每天 UTC ${hh(cutHour)} 收盘后只往${short ? '下' : '上'}移。`,
+    channelLater: (bars, short, cutHour) => `下单时按最近 ${bars} 日${short ? '最高价' : '最低价'}给出止损，之后每天 UTC ${hh(cutHour)} 收盘后只往${short ? '下' : '上'}移。`,
     channelWrongSide: (level, short) => `该价位 ${level} 不${short ? '高于' : '低于'}开仓价：止损挂在那里会立即触发。请增加天数，或不设通道移动止损。`,
     callbackPct: '回调 %',
     activePx: '激活价',

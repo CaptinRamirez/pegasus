@@ -52,7 +52,12 @@ export interface SignalContext {
   exitChannel: number;
   /** The add step as a percentage, "50.00%" */
   addStep: string;
+  /** UTC hour the daily bars close at (CAMPAIGN_CUT_HOUR) */
+  cutHour: number;
 }
+
+/** An hour of the day as "20:00" */
+export const hh = (hour: number): string => `${String(hour).padStart(2, '0')}:00`;
 
 /** What the regime shadow decided for a coin at the last daily close, or why not; 'no-channel': no signal because the entry channel is not full yet. */
 export type ShadowCase = RegimeEntry | RegimeSkip | 'open' | 'cash' | 'min-size' | 'no-channel';
@@ -586,7 +591,7 @@ export const en = {
       NEAR_ENTRY: (p: CodeText, c: SignalContext) =>
         `${c.coin} at ${p.markPx} is ${p.distancePct} below its ${c.entryChannel}-day high ${p.level}: a daily close above it is an entry.`,
       MARK_ABOVE_ENTRY: (p: CodeText, c: SignalContext) =>
-        `${c.coin} at ${p.markPx} is above its ${c.entryChannel}-day high ${p.level}; the entry needs a daily close above it (00:00 UTC).`,
+        `${c.coin} at ${p.markPx} is above its ${c.entryChannel}-day high ${p.level}; the entry needs a daily close above it (${hh(c.cutHour)} UTC).`,
       BELOW_ENTRY: (p: CodeText, c: SignalContext) => `${c.coin} at ${p.markPx} is ${p.distancePct} below its ${c.entryChannel}-day high ${p.level}.`,
       HOLDING: (p: CodeText, c: SignalContext) =>
         `A long of ${p.contracts} contracts is held. Exit line (${c.exitChannel}-day low): ${p.trailingLine}${p.addTrigger === '' ? '' : `; next add at a 12-hour close of ${p.addTrigger} or more`}.`,
@@ -938,11 +943,11 @@ export const en = {
     trailingMode: { none: 'None', channel: 'Channel', callback: 'Callback' } satisfies Record<TrailingMode, string>,
     channelBars: 'Days',
     /** Channel trailing with its level known now */
-    channelNow: (level: string, bars: string, short: boolean) =>
-      `The stop is now at ${level} (the ${short ? 'highest high' : 'lowest low'} of the last ${bars} daily bars) and moves ${short ? 'down' : 'up'} only, after every 00:00 UTC close.`,
+    channelNow: (level: string, bars: string, short: boolean, cutHour: number) =>
+      `The stop is now at ${level} (the ${short ? 'highest high' : 'lowest low'} of the last ${bars} daily bars) and moves ${short ? 'down' : 'up'} only, after every ${hh(cutHour)} UTC close.`,
     /** Channel trailing whose level is computed when the order is placed */
-    channelLater: (bars: string, short: boolean) =>
-      `The stop will be the ${short ? 'highest high' : 'lowest low'} of the last ${bars} daily bars when the order is placed, and moves ${short ? 'down' : 'up'} only, after every 00:00 UTC close.`,
+    channelLater: (bars: string, short: boolean, cutHour: number) =>
+      `The stop will be the ${short ? 'highest high' : 'lowest low'} of the last ${bars} daily bars when the order is placed, and moves ${short ? 'down' : 'up'} only, after every ${hh(cutHour)} UTC close.`,
     /** The channel level now is not on the losing side of the entry: a stop there fires at once */
     channelWrongSide: (level: string, short: boolean) => `The level ${level} is not ${short ? 'above' : 'below'} the entry: a stop there would fire at once. Choose more days, or no channel trailing.`,
     callbackPct: 'Callback %',

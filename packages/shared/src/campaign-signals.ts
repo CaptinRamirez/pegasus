@@ -228,7 +228,7 @@ export interface CampaignShadowSignal {
 export interface CampaignSignalsResponse {
   generatedAt: number;
   /** The rule the signals are read with: the campaign's (the pot's own while one runs) */
-  params: { entryChannel: number; exitChannel: number; addStep: string; structure: CampaignStructure; leverage: string; feeRate: string };
+  params: { entryChannel: number; exitChannel: number; addStep: string; structure: CampaignStructure; leverage: string; feeRate: string; /** UTC hour the daily bars close at (CAMPAIGN_CUT_HOUR) */ cutHour: number };
   /** The fixed thresholds of the states and the warnings */
   thresholds: { nearPct: string; stopWidePct: string; stopNarrowPct: string; farAbovePct: string; liqBufferPct: string };
   /** Risk of one plan, fraction of the equity */

@@ -1,4 +1,7 @@
 import {
+  campaignBarsFromFourHours,
+  campaignCloseAtOrBefore,
+  campaignDayCloseAtOrBefore,
   D,
   Decimal,
   DEFAULT_CAMPAIGN_PARAMS,
@@ -59,7 +62,6 @@ const HALF_DAY_MS = DAY_MS / 2;
 /** The instrument the pot's start value is held in, for the comparison */
 export const HELD_INSTRUMENT = 'BTC-USDT-SWAP';
 
-const closeAtOrBefore = (t: number): number => Math.floor(t / HALF_DAY_MS) * HALF_DAY_MS;
 const isPositive = (v: unknown): v is string => isDecimalString(v) && D(v).gt(0);
 const money = (v: Decimal): string => v.toDecimalPlaces(8).toFixed();
 const iso = (t: number): string => new Date(t).toISOString().replace(':00.000Z', 'Z');
@@ -77,6 +79,8 @@ export interface PotReplayInput {
   potParams?: PotParams;
   /** The replay ends at the last 12-hour close at or before this time */
   now: number;
+  /** The daily cut the pot runs at (CAMPAIGN_CUT_HOUR): the exchange's own bars at 0 (the default), bars built from its 4-hour candles otherwise */
+  cutHour?: number;
   /** DEFAULT_RECONCILE_TOLERANCES by default */
   tolerances?: ReconcileTolerances;
 }
@@ -158,17 +162,27 @@ export async function replayPot(input: PotReplayInput, sources: PotReplaySources
   const params: CampaignParams = { ...(input.params ?? DEFAULT_CAMPAIGN_PARAMS), structure: pot.structure };
   const potParams: PotParams = { ...(input.potParams ?? DEFAULT_POT_PARAMS), start: pot.start, minStake: pot.minStake };
   const startCash = isPositive(pot.startValue) ? pot.startValue : pot.start;
-  const from = closeAtOrBefore(pot.startedAt) + HALF_DAY_MS;
+  const cut = input.cutHour ?? 0;
+  const from = campaignCloseAtOrBefore(pot.startedAt, cut) + HALF_DAY_MS;
   // The bars of the channels of the first daily close the pot looks at, and two days to spare.
-  const since = Math.floor(from / DAY_MS) * DAY_MS - (Math.max(params.entryChannel, params.exitChannel) + 2) * DAY_MS;
+  const since = campaignDayCloseAtOrBefore(from, cut) - (Math.max(params.entryChannel, params.exitChannel) + 2) * DAY_MS;
   const instIds = [...new Set(input.instruments)];
 
   const loaded = new Map<string, Loaded>();
   for (const instId of instIds.includes(HELD_INSTRUMENT) ? instIds : [...instIds, HELD_INSTRUMENT]) {
     const replayed = instIds.includes(instId);
     const inst = await loadInstrument(instId, fetchers, cache, refresh);
-    const daily = replayed ? await loadCandles(instId, '1Dutc', fetchers, cache, refresh, since) : [];
-    const halfDay = await loadCandles(instId, '12Hutc', fetchers, cache, refresh, since);
+    let daily: Candle[] = [];
+    let halfDay: Candle[];
+    if (cut !== 0) {
+      // The bars of the cut, built from the exchange's 4-hour candles
+      const bars = campaignBarsFromFourHours(await loadCandles(instId, '4H', fetchers, cache, refresh, since), cut);
+      if (replayed) daily = bars.daily;
+      halfDay = bars.halfDay;
+    } else {
+      if (replayed) daily = await loadCandles(instId, '1Dutc', fetchers, cache, refresh, since);
+      halfDay = await loadCandles(instId, '12Hutc', fetchers, cache, refresh, since);
+    }
     let funding: FundingRecord[] | null = null;
     if (replayed) {
       try {
@@ -183,7 +197,7 @@ export async function replayPot(input: PotReplayInput, sources: PotReplaySources
     }
     let latest: Candle[] = [];
     try {
-      latest = (await fetchers.latest?.(instId, '12Hutc')) ?? [];
+      latest = cut !== 0 ? campaignBarsFromFourHours((await fetchers.latest?.(instId, '4H')) ?? [], cut, true).halfDay : ((await fetchers.latest?.(instId, '12Hutc')) ?? []);
     } catch (err) {
       notes.push(`${instId}: the running bar could not be read (${(err as Error).message}): what its last close decided is not filled`);
     }
@@ -192,7 +206,7 @@ export async function replayPot(input: PotReplayInput, sources: PotReplaySources
   }
 
   // The last close every instrument has; one that lags by more than a day does not hold the others back.
-  const cap = closeAtOrBefore(input.now);
+  const cap = campaignCloseAtOrBefore(input.now, cut);
   let through = cap;
   for (const instId of instIds) {
     const bars = (loaded.get(instId) as Loaded).halfDay.filter((c) => c.confirm && c.ts + HALF_DAY_MS <= cap);
@@ -211,7 +225,7 @@ export async function replayPot(input: PotReplayInput, sources: PotReplaySources
     return d;
   });
   const run = (over: Partial<CampaignParams>): CampaignResult =>
-    runCampaigns(data, { ...DEFAULT_CAMPAIGN_CONFIG, params: { ...params, ...over }, pot: potParams, from, to: through, startCash, sampleEveryClose: true });
+    runCampaigns(data, { ...DEFAULT_CAMPAIGN_CONFIG, params: { ...params, ...over }, pot: potParams, from, to: through, startCash, sampleEveryClose: true, ...(cut !== 0 ? { cutHour: cut } : {}) });
   // The engine runs in one go: the event loop is given a turn between the runs.
   const turn = (): Promise<void> => new Promise<void>((resolve) => setImmediate(resolve));
   const otherStructure: CampaignStructure = pot.structure === 'pyramid' ? 'noadd' : 'pyramid';
@@ -235,7 +249,7 @@ export async function replayPot(input: PotReplayInput, sources: PotReplaySources
     regime: regime === null ? null : replayRun(regime, pot.structure, startCash),
     decisions: regime?.regime ?? null,
     heldBtc: heldInBtc((loaded.get(HELD_INSTRUMENT) as Loaded).halfDay, pot, startCash, from, through),
-    reconciliation: reconcileCampaigns(input.campaigns, same.campaigns, through, input.tolerances),
+    reconciliation: reconcileCampaigns(input.campaigns, same.campaigns, through, input.tolerances, cut),
     results: { same, other, atr3, regime },
     notes,
   };
@@ -306,17 +320,17 @@ export function heldInBtc(halfDay: readonly Candle[], pot: Pick<CampaignPotRecor
 // ---- the reconciliation ----
 
 /** The ledger's end of a campaign as of `through`, with the close it belongs to; null while it is open then. */
-function liveEnd(c: LedgerCampaign, through: number): { kind: string; close: number } | null {
+function liveEnd(c: LedgerCampaign, through: number, cutHour = 0): { kind: string; close: number } | null {
   const end = c.end;
   if (!end) return null;
   if (end.kind === 'exit' || end.kind === 'harvest') {
     // Decided at a close and carried out right after it, as the replay fills it at the open of that close (C14).
-    const close = end.kind === 'exit' ? (end.closeTs ?? closeAtOrBefore(end.ts)) : (c.sales.at(-1)?.closeTs ?? closeAtOrBefore(end.ts));
+    const close = end.kind === 'exit' ? (end.closeTs ?? campaignCloseAtOrBefore(end.ts, cutHour)) : (c.sales.at(-1)?.closeTs ?? campaignCloseAtOrBefore(end.ts, cutHour));
     return close <= through ? { kind: end.kind, close } : null;
   }
   // A liquidation (or a close by another order) inside a 12-hour bar: the bar's open, as the replay dates it. Inside
   // the bar running after `through` the replay has not seen it.
-  const close = closeAtOrBefore(end.ts);
+  const close = campaignCloseAtOrBefore(end.ts, cutHour);
   return close < through ? { kind: end.kind, close } : null;
 }
 
@@ -326,7 +340,7 @@ const within = (live: string, replay: string, tolerance: string, floor: string |
   return D(live).minus(replay).abs().lte(scale.mul(tolerance));
 };
 
-function differences(live: LedgerCampaign, replay: CampaignRecord, through: number, tolerances: ReconcileTolerances): CampaignReconcileRow['differences'] {
+function differences(live: LedgerCampaign, replay: CampaignRecord, through: number, tolerances: ReconcileTolerances, cutHour = 0): CampaignReconcileRow['differences'] {
   const out: CampaignReconcileRow['differences'] = [];
   const differ = (field: string, l: string | null, r: string | null): void => {
     out.push({ field, live: l, replay: r });
@@ -337,7 +351,7 @@ function differences(live: LedgerCampaign, replay: CampaignRecord, through: numb
   if (adds !== replay.adds) differ('adds', String(adds), String(replay.adds));
   const sales = live.sales.filter((s) => s.closeTs <= through).length;
   if (sales !== replay.sales) differ('sales', String(sales), String(replay.sales));
-  const end = liveEnd(live, through);
+  const end = liveEnd(live, through, cutHour);
   const replayEnd = replay.open ? 'open' : replay.end;
   if ((end?.kind ?? 'open') !== replayEnd) differ('end', end?.kind ?? 'open', replayEnd);
   if (end && !replay.open) {
@@ -359,6 +373,8 @@ export function reconcileCampaigns(
   replayed: readonly CampaignRecord[],
   through: number,
   tolerances: ReconcileTolerances = DEFAULT_RECONCILE_TOLERANCES,
+  /** The daily cut the closes are on (CAMPAIGN_CUT_HOUR) */
+  cutHour = 0,
 ): CampaignReconciliation {
   const key = (instId: string, signalTs: number): string => `${instId} ${signalTs}`;
   const replay = new Map(replayed.map((c) => [key(c.instId, c.signalTs), c]));
@@ -373,7 +389,7 @@ export function reconcileCampaigns(
       rows.push({ instId: live.instId, signalTs: live.signalTs, campaignId: live.id, verdict: 'live-only', differences: [] });
       continue;
     }
-    const found = differences(live, r, through, tolerances);
+    const found = differences(live, r, through, tolerances, cutHour);
     rows.push({ instId: live.instId, signalTs: live.signalTs, campaignId: live.id, verdict: found.length === 0 ? 'match' : 'differs', differences: found });
   }
   for (const [k, r] of replay) {

@@ -120,7 +120,8 @@ export function createFetchers(opts: SourceOptions = {}): Fetchers {
   const fundingQueue = throttled(FUNDING_GAP_MS);
   const okxFundingQueue = throttled(OKX_FUNDING_GAP_MS);
   const latest = async (instId: string, bar: HistoryBar): Promise<Candle[]> => {
-    const rows = await candleQueue(() => withRetry(() => rest.getCandles(instId, bar, { limit: 3 })));
+    // Three 12-hour bars, or the 4-hour candles of the last 12-hour bar and the running one
+    const rows = await candleQueue(() => withRetry(() => rest.getCandles(instId, bar, { limit: bar === '4H' ? 9 : 3 })));
     return rows.map(toCandle).sort((a, b) => a.ts - b.ts);
   };
   if (opts.funding === 'okx') {

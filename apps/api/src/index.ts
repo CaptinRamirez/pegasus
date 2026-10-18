@@ -88,7 +88,7 @@ async function main(): Promise<void> {
   }
   // Exits of this stage (paper trading and the local mock): channel trailing and the trailing exits that follow an opening order, kept in TRAILING_STATE_FILE.
   const exitState = new ExitStateFile(config.exits.stateFile);
-  const trailing = new ChannelTrailingService({ clients, account, orders, market, store, log }, { enabled: config.exits.enabled, state: exitState, isCampaignPosition: (p) => campaignOwns(deps.campaign, p) });
+  const trailing = new ChannelTrailingService({ clients, account, orders, market, store, log }, { enabled: config.exits.enabled, cutHour: config.campaign.cutHour, state: exitState, isCampaignPosition: (p) => campaignOwns(deps.campaign, p) });
   const exitFollowUp = new ExitFollowUp({ clients, account, orders, channel: trailing, store, log }, { enabled: config.exits.enabled, state: exitState });
   deps.trailing = trailing;
   deps.exitFollowUp = exitFollowUp;

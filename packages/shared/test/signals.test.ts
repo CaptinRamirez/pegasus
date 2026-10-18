@@ -391,6 +391,16 @@ describe('second daily cut', () => {
       [24, true],
     ]);
     expect(() => aggregateCandles(bars, 4 * H, 10 * H)).toThrow(/multiple/);
+    // the running period, when asked for: its bars so far, unconfirmed
+    expect(aggregateCandles(bars, 4 * H, 24 * H, 0, true).map((c) => [(c.ts - day) / H, c.confirm])).toEqual([
+      [0, true],
+      [24, true],
+      [48, false],
+    ]);
+    expect(aggregateCandles(bars, 4 * H, 24 * H, 20 * H, true).map((c) => [(c.ts - day) / H, c.confirm])).toEqual([
+      [20, true],
+      [44, false],
+    ]);
   });
 });
 

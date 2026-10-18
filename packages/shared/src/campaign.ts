@@ -1,6 +1,6 @@
 import type { RegimeParams } from './campaign-regime.js';
 import { D, Decimal, ZERO, floorToStep, type DecimalInput } from './decimal.js';
-import { previousChannel, SignalError } from './signals.js';
+import { aggregateCandles, previousChannel, SignalError } from './signals.js';
 import { coinToContracts } from './sizing.js';
 import type { Candle, Instrument } from './types.js';
 
@@ -402,4 +402,44 @@ export function sameCloseOrder(instIds: readonly string[], closeTs: number): str
     order[j] = held;
   }
   return order;
+}
+
+// ---- the daily cut ----
+
+/**
+ * UTC hours the campaign's daily bars may close at (CAMPAIGN_CUT_HOUR): 0 is the exchange's own daily and 12-hour bars
+ * (OKX 1Dutc, 12Hutc); the others are built from its 4-hour candles (campaignBarsFromFourHours). The 12-hour closes
+ * are at the cut and 12 hours later. 20 (the US cash close, 22:00 in Paris) was adopted on 2026-10-18 after the replay
+ * of docs/proposals/cut-hour.md; 0 is where the evidence of the rule was computed.
+ */
+export const CAMPAIGN_CUT_HOURS: readonly number[] = [0, 4, 8, 12, 16, 20];
+
+const CUT_HOUR_MS = 3_600_000;
+const CUT_HALF_DAY_MS = 12 * CUT_HOUR_MS;
+const CUT_DAY_MS = 24 * CUT_HOUR_MS;
+
+/** The last 12-hour close at or before `t`: at the cut's hour and 12 hours later. */
+export function campaignCloseAtOrBefore(t: number, cutHour = 0): number {
+  const offset = (cutHour % 12) * CUT_HOUR_MS;
+  return Math.floor((t - offset) / CUT_HALF_DAY_MS) * CUT_HALF_DAY_MS + offset;
+}
+
+/** The last daily close at or before `t`: at the cut's hour. */
+export function campaignDayCloseAtOrBefore(t: number, cutHour = 0): number {
+  const offset = cutHour * CUT_HOUR_MS;
+  return Math.floor((t - offset) / CUT_DAY_MS) * CUT_DAY_MS + offset;
+}
+
+/** Whether a 12-hour close is the daily one: the daily bar closes there, and with it the entry and exit signals. */
+export const isCampaignDailyClose = (closeTs: number, cutHour = 0): boolean => (((closeTs % CUT_DAY_MS) + CUT_DAY_MS) % CUT_DAY_MS) === cutHour * CUT_HOUR_MS;
+
+/**
+ * The daily and 12-hour bars of a cut from the exchange's 4-hour candles: the daily bars open and close at the cut's
+ * hour, the 12-hour bars at it and 12 hours later. With `forming` the running bars are included, unconfirmed.
+ */
+export function campaignBarsFromFourHours(fourHour: readonly Candle[], cutHour: number, forming = false): { daily: Candle[]; halfDay: Candle[] } {
+  return {
+    daily: aggregateCandles(fourHour, 4 * CUT_HOUR_MS, CUT_DAY_MS, cutHour * CUT_HOUR_MS, forming),
+    halfDay: aggregateCandles(fourHour, 4 * CUT_HOUR_MS, CUT_HALF_DAY_MS, (cutHour % 12) * CUT_HOUR_MS, forming),
+  };
 }

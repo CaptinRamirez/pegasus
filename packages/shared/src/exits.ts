@@ -60,8 +60,8 @@ export function channelStopLevel(candles: readonly Candle[], bars: number, direc
   return direction === 'long' ? channel.low : channel.high;
 }
 
-/** The 00:00 UTC daily close at or before `t`. */
-export const dailyCloseAtOrBefore = (t: number): number => Math.floor(t / DAY_MS) * DAY_MS;
+/** The daily close at or before `t`: 00:00 UTC, or the hour of the campaign's cut (CAMPAIGN_CUT_HOUR). */
+export const dailyCloseAtOrBefore = (t: number, cutHour = 0): number => Math.floor((t - cutHour * 3_600_000) / DAY_MS) * DAY_MS + cutHour * 3_600_000;
 
 // ---- requests of the position routes ----
 
@@ -180,7 +180,9 @@ export interface TrailingView {
   enabled: boolean;
   entries: ChannelTrailingEntry[];
   pending: PendingTrailingExit[];
-  /** The next 00:00 UTC daily close the channels are moved at */
+  /** The next daily close the channels are moved at: 00:00 UTC, or the hour of the campaign's cut */
   nextCloseAt: number;
+  /** UTC hour of those daily closes (CAMPAIGN_CUT_HOUR) */
+  cutHour: number;
   ts: number;
 }

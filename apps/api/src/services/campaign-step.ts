@@ -1,4 +1,6 @@
 import {
+  campaignCloseAtOrBefore,
+  isCampaignDailyClose,
   campaignAction,
   campaignAddQuantity,
   campaignContracts,
@@ -33,8 +35,10 @@ import { spareMargin } from './campaign-orders.js';
  * the harvest sales, the exits, the adds, and the entries in sameCloseOrder. The liquidations of the close come
  * first and are the caller's: it removes the campaigns the exchange has liquidated before it asks.
  *
- * Entries and exits are read at 00:00 UTC only, from the daily bar (OKX 1Dutc) that closed then; adds and the ladder
- * at every 12-hour close (OKX 12Hutc). Only confirmed bars count, and a close without its bar gives no signal (C8).
+ * Entries and exits are read at the daily close only (00:00 UTC, or the hour of the cut, CAMPAIGN_CUT_HOUR), from the
+ * daily bar that closed then; adds and the ladder at every 12-hour close (at the cut and 12 hours later). The bars are
+ * the exchange's own (OKX 1Dutc, 12Hutc) at cut 0, built from its 4-hour candles otherwise. Only confirmed bars count,
+ * and a close without its bar gives no signal (C8).
  * The quantities of entries and adds are not fixed here but at execution time (sizeEntry, sizeAdd), with the free
  * cash and the position as they are then and the open of the 12-hour bar that runs after the close: the price the
  * replay fills at.
@@ -43,16 +47,16 @@ import { spareMargin } from './campaign-orders.js';
 export const HALF_DAY_MS = 43_200_000;
 export const DAY_MS = 86_400_000;
 
-/** A 00:00 UTC close: the daily bars close there, and with them the entry and exit signals. */
-export const isDailyClose = (closeTs: number): boolean => closeTs % DAY_MS === 0;
+/** The daily close of the cut (00:00 UTC at cut 0): the daily bars close there, and with them the entry and exit signals. */
+export const isDailyClose = (closeTs: number, cutHour = 0): boolean => isCampaignDailyClose(closeTs, cutHour);
 
-/** The latest 12-hour close at or before `t`. */
-export const closeAtOrBefore = (t: number): number => Math.floor(t / HALF_DAY_MS) * HALF_DAY_MS;
+/** The latest 12-hour close at or before `t`: at the cut's hour and 12 hours later. */
+export const closeAtOrBefore = (t: number, cutHour = 0): number => campaignCloseAtOrBefore(t, cutHour);
 
 /** The 12-hour closes after `last` up to `t`, oldest first. */
-export function closesAfter(last: number, t: number): number[] {
+export function closesAfter(last: number, t: number, cutHour = 0): number[] {
   const out: number[] = [];
-  for (let c = closeAtOrBefore(last) + HALF_DAY_MS; c <= t; c += HALF_DAY_MS) out.push(c);
+  for (let c = closeAtOrBefore(last, cutHour) + HALF_DAY_MS; c <= t; c += HALF_DAY_MS) out.push(c);
   return out;
 }
 
@@ -74,7 +78,7 @@ export interface CloseBars {
  * The bars of an instrument at a close. `halfDay` and `daily` are its 12-hour and daily UTC bars, oldest first, the
  * forming one included or not: only confirmed bars are read, except the open of the bar that runs after the close.
  */
-export function barsAt(instId: string, halfDay: readonly Candle[], daily: readonly Candle[], closeTs: number, params: CampaignParams): CloseBars {
+export function barsAt(instId: string, halfDay: readonly Candle[], daily: readonly Candle[], closeTs: number, params: CampaignParams, cutHour = 0): CloseBars {
   const input: CampaignStepInput = { instId, closeTs, halfDay: null, price: null, daily: null };
   const closed = halfDay.find((c) => c.confirm && c.ts === closeTs - HALF_DAY_MS);
   if (!closed) {
@@ -88,7 +92,7 @@ export function barsAt(instId: string, halfDay: readonly Candle[], daily: readon
   const notes: string[] = [];
   if (!next) notes.push('the bar after the close is not known yet: the close stands for its open');
   let signals: CampaignSignals | null = null;
-  if (isDailyClose(closeTs)) {
+  if (isDailyClose(closeTs, cutHour)) {
     // C8: a daily close without its daily bar gives no signal. The bars before it fill the channels.
     const days = daily.filter((c) => c.confirm && c.ts + DAY_MS <= closeTs);
     const last = days[days.length - 1];

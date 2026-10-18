@@ -1,4 +1,5 @@
 import {
+  campaignBarsFromFourHours,
   ceilToStep,
   channelStopLevel,
   D,
@@ -31,14 +32,14 @@ import { ExitsUnavailableError, generateClOrdId, type OrderService } from './ord
 /**
  * Channel trailing: Pegasus keeps the stop-loss of a flagged position at the channel of the last `bars` confirmed
  * daily bars (the lowest low for a long, the highest high for a short: channelStopLevel, the exit line of the campaign
- * rule with 10 bars) and moves it after each 00:00 UTC daily close, never against the position. The stop rests at the
+ * rule with 10 bars) and moves it after each daily close (00:00 UTC, or the cut of CAMPAIGN_CUT_HOUR), never against the position. The stop rests at the
  * exchange (an OKX `conditional` stop-loss, mark-triggered, executed at market); moving it needs this service running.
  *
  * - Which positions: the ones flagged with channel trailing, by an opening order's `trailing` once it has filled
  *   (exit-orders.ts) or through POST /api/positions/channel-trailing. The flags are kept in TRAILING_STATE_FILE
  *   (exit-state.ts) and survive a restart. A flag ends when its position is closed or turns to the other side, and
  *   through POST /api/positions/channel-trailing/clear (the stop then stays where it is).
- * - When: after each 00:00 UTC close, once the exchange's daily bar (OKX 1Dutc) that closed then is confirmed; the
+ * - When: after each daily close of the cut, once the daily bar that closed then (OKX 1Dutc, or built from its 4-hour candles) is confirmed; the
  *   clock is looked at every minute. Closes missed while the API was not running are caught up with at the first look
  *   after the start: the level of every close missed is computed from the bars and the best of them is applied, which
  *   is where a service that had been running would have left the stop.
@@ -76,8 +77,10 @@ export interface ChannelTrailingOptions {
   enabled: boolean;
   state: ExitStateFile;
   now?: () => number;
-  /** Daily UTC bars (OKX 1Dutc), oldest first; the forming one may be included. The exchange's by default */
+  /** Daily bars of the cut, oldest first; the forming one may be included. The exchange's by default */
   candles?: (instId: string) => Promise<Candle[]>;
+  /** UTC hour of the daily closes the stops move after (CAMPAIGN_CUT_HOUR); 0, 00:00 UTC, by default */
+  cutHour?: number;
   /** How often the clock is looked at; 0: never by itself (tick() is called). Default 60 s */
   checkEveryMs?: number;
   /** True for a position of the campaign service, which is never touched */
@@ -106,6 +109,7 @@ export class ChannelTrailingService {
   private stopped = false;
   private readonly now: () => number;
   private readonly candles: (instId: string) => Promise<Candle[]>;
+  private readonly cutHour: number;
   private readonly log: Logger;
 
   constructor(
@@ -114,9 +118,11 @@ export class ChannelTrailingService {
   ) {
     this.now = opts.now ?? Date.now;
     this.log = deps.log.child({ component: 'channel-trailing' });
-    this.candles =
-      opts.candles ??
-      (async (instId) => (await deps.clients.rest.getCandles(instId, '1Dutc', { limit: CANDLE_LIMIT })).map(mapCandle).sort((a, b) => a.ts - b.ts));
+    const cut = opts.cutHour ?? 0;
+    this.cutHour = cut;
+    const rest = async (instId: string, bar: string): Promise<Candle[]> => (await deps.clients.rest.getCandles(instId, bar, { limit: CANDLE_LIMIT })).map(mapCandle).sort((a, b) => a.ts - b.ts);
+    // shortcut: at another cut 300 4-hour candles are 50 daily bars, enough for the channel and weeks of missed closes; page history-candles for more.
+    this.candles = opts.candles ?? (cut === 0 ? (instId) => rest(instId, '1Dutc') : async (instId) => campaignBarsFromFourHours(await rest(instId, '4H'), cut, true).daily);
   }
 
   get enabled(): boolean {
@@ -166,7 +172,7 @@ export class ChannelTrailingService {
     return this.exclusive(async () => {
       if (!this.opts.enabled || this.stopped || this.opts.state.error || !this.accountReady()) return;
       this.prune();
-      const close = dailyCloseAtOrBefore(this.now());
+      const close = dailyCloseAtOrBefore(this.now(), this.cutHour);
       for (const entry of [...this.entries]) {
         if (entry.levelClose !== null && entry.levelClose >= close) continue;
         await this.process(entry, close).catch((err: unknown) => this.fail(entry, err));
@@ -212,7 +218,7 @@ export class ChannelTrailingService {
       } else this.entries.push(entry);
       this.log.info({ position: keyOf(entry), bars: entry.bars, source: source.kind, clOrdId: source.clOrdId ?? '' }, 'channel trailing set');
       this.opts.state.save();
-      await this.process(entry, dailyCloseAtOrBefore(this.now())).catch((err: unknown) => this.fail(entry, err));
+      await this.process(entry, dailyCloseAtOrBefore(this.now(), this.cutHour)).catch((err: unknown) => this.fail(entry, err));
       return structuredClone(entry);
     });
   }
@@ -237,7 +243,8 @@ export class ChannelTrailingService {
       enabled: this.opts.enabled,
       entries: structuredClone(this.entries),
       pending: structuredClone(this.opts.state.state.pending),
-      nextCloseAt: dailyCloseAtOrBefore(now) + DAY_MS,
+      nextCloseAt: dailyCloseAtOrBefore(now, this.cutHour) + DAY_MS,
+      cutHour: this.cutHour,
       ts: now,
     };
   }

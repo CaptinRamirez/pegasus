@@ -189,6 +189,8 @@ export interface CampaignPotRecord {
   btcMarkAtStart: string;
   /** The rule the pot runs, as it was started (a later change of the settings does not apply to it) */
   structure: CampaignStructure;
+  /** The daily cut the pot was started at (CAMPAIGN_CUT_HOUR); 0 when absent (ledgers from before the cut was a setting) */
+  cutHour?: number;
   /** CAMPAIGN_POT_START when it was started: the ladder's rungs are multiples of it */
   start: string;
   /** CAMPAIGN_MIN_STAKE when it was started */
@@ -312,6 +314,8 @@ export interface CampaignParamsView {
   addStep: string;
   entryChannel: number;
   exitChannel: number;
+  /** UTC hour the daily bars close at (CAMPAIGN_CUT_HOUR); 0: the exchange's own daily and 12-hour bars */
+  cutHour: number;
   stakeFraction: string;
   rungFactor: string;
   bankFraction: string;
