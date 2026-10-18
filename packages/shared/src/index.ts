@@ -7,6 +7,7 @@ export * from './sizing.js';
 export * from './time.js';
 export * from './signals.js';
 export * from './campaign.js';
+export * from './campaign-regime.js';
 export * from './campaign-api.js';
 export * from './campaign-signals.js';
 export * from './journal.js';

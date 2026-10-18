@@ -8,6 +8,9 @@ import type {
   Order,
   PlaceOrderRequest,
   PosSide,
+  RegimeEntry,
+  RegimeSkip,
+  RegimeState,
   Side,
   TradeExitReason,
   TradeFillRole,
@@ -49,6 +52,40 @@ export interface SignalContext {
   exitChannel: number;
   /** The add step as a percentage, "50.00%" */
   addStep: string;
+}
+
+/** What the regime shadow decided for a coin at the last daily close, or why not; 'no-channel': no signal because the entry channel is not full yet. */
+export type ShadowCase = RegimeEntry | RegimeSkip | 'open' | 'cash' | 'min-size' | 'no-channel';
+
+/** The regime shadow's figures for one coin, formatted for its sentence; '' where the shadow does not know them. */
+export interface ShadowText {
+  /** The light in the page's language (signals.shadow.light) */
+  light: string;
+  close: string;
+  /** The entry channel's high */
+  line: string;
+  /** How far the close is over the line, "1.2%" */
+  margin: string;
+  /** The close an entry needs: the line plus the thin margin */
+  need: string;
+  /** The thin margin, "1.0%" */
+  thin: string;
+  /** A thin breakout's level kept for the acceptance or the retest, and the closes it is still kept for */
+  level: string;
+  barsLeft: string;
+  /** The pending level plus the thin margin: a low at or under it is a retest */
+  retestTo: string;
+  /** This coin's funding mean per 8 hours and ATR over the close, "0.005%" / "2.5%" */
+  funding: string;
+  atr: string;
+  /** The thresholds at or above which the light is red and a coin is vetoed */
+  vetoFunding: string;
+  vetoWild: string;
+  /** BTC's readings behind the light */
+  btcFunding: string;
+  btcAtr: string;
+  /** The close until which the coin is in cooldown after a liquidation */
+  cooldownUntil: string;
 }
 
 /** A take-profit leg in words: its price, the share of the size it closes, and the R multiple and gain it stands for ('' when unknown). */
@@ -669,6 +706,37 @@ export const en = {
       killSwitch: 'The kill switch is on: opening orders are refused, so no signal can be followed.',
       exitsUnavailable: 'Take-profit and trailing exits are offered in paper trading and against the local mock only. A followed signal needs its trailing stop, so following is disabled here.',
     },
+    /** The regime shadow (docs/proposals/regime-snowball-v2.1.md) read beside the rule: what it decided at the last daily close, and its readings */
+    shadow: {
+      light: { GREEN: 'Green light', RED: 'Red light' } satisfies Record<RegimeState, string>,
+      /** One sentence per decision, from its figures */
+      sentence: {
+        breakout: (s: ShadowText) => `${s.light} | Enter: the close ${s.close} cleared the line ${s.line} by ${s.margin}; half stake`,
+        acceptance: (s: ShadowText) => `${s.light} | Enter (acceptance): the close ${s.close} held above the pending line ${s.level}; half stake`,
+        retest: (s: ShadowText) => `${s.light} | Enter (retest): the low came back near the line ${s.level} and the close ${s.close} held above it; half stake`,
+        'no-signal': (s: ShadowText) =>
+          `${s.light} | No signal | waiting for a close ≥ ${s.need} (the line ${s.line} + ${s.thin}); a close between ${s.line} and ${s.need} is noted as pending and enters if the next close is still above the line`,
+        'no-channel': (s: ShadowText) => `${s.light} | No signal | the channel is not full yet`,
+        thin: (s: ShadowText) => `${s.light} | Thin breakout: the close ${s.close} cleared the line ${s.line} by only ${s.margin}: noted as pending; enters if tomorrow's close is still above ${s.line}`,
+        'pending-wait': (s: ShadowText) => `${s.light} | Waiting: pending line ${s.level}, ${s.barsLeft} closes left; enters on a pullback to ${s.retestTo} or below that closes above the line`,
+        'regime-red': (s: ShadowText) => {
+          const why = [s.btcFunding === '' ? '' : `BTC funding ${s.btcFunding}/8h (≥ ${s.vetoFunding})`, s.btcAtr === '' ? '' : `BTC ATR ${s.btcAtr} (≥ ${s.vetoWild})`].filter((x) => x !== '').join(' or ');
+          return `${s.light}${why === '' ? '' : `: ${why}`} | no new campaign`;
+        },
+        'veto-funding': (s: ShadowText) => `${s.light} | Waiting: this coin's funding ${s.funding}/8h ≥ ${s.vetoFunding}`,
+        'veto-wild': (s: ShadowText) => `${s.light} | Waiting: this coin's ATR ${s.atr} ≥ ${s.vetoWild}`,
+        'veto-cooldown': (s: ShadowText) => `${s.light} | Waiting: liquidation cooldown until ${s.cooldownUntil}`,
+        open: (s: ShadowText) => `${s.light} | In a campaign: the shadow is already in`,
+        cash: (s: ShadowText) => `${s.light} | Not enough cash for the minimum stake`,
+        'min-size': (s: ShadowText) => `${s.light} | The stake buys less than the minimum order`,
+      } satisfies Record<ShadowCase, (s: ShadowText) => string>,
+      /** The chips under the sentence */
+      asOf: (close: string) => `At the ${close} close`,
+      atr: (v: string) => `ATR ${v}`,
+      funding: (v: string) => `Funding ${v}/8h`,
+      tests: (n: number) => `Line tested ${n}×`,
+      cooldown: (until: string) => `Cooldown until ${until}`,
+    },
   },
 
   /** The confirmation sheet of a followed signal. */
@@ -1210,7 +1278,7 @@ export const en = {
     // the chart
     chart: 'Pot value',
     chartEmpty: 'No close processed yet: the lines start at the first step.',
-    line: { value: 'Pot value', banked: 'Banked', heldBtc: 'Start value held in BTC' },
+    line: { value: 'Pot value', banked: 'Banked', heldBtc: 'Start value held in BTC', atr3: '3 ATR shadow', regime: 'Regime shadow' },
     replayLine: (structure: string, own: boolean) => (own ? `Replay, ${structure} (the pot's)` : `Replay, ${structure}`),
     latest: 'latest',
     replayOff: 'Replay unavailable: the pot has not started.',

@@ -1,4 +1,4 @@
-import { D, potRungLevel } from '@pegasus/shared';
+import { D, potRungLevel, type RegimeParams } from '@pegasus/shared';
 import { mean, median } from '../stats.js';
 import type { Banking, CampaignConfig, CampaignMode, CampaignRecord, CampaignResult, PotSample } from './types.js';
 
@@ -71,6 +71,10 @@ export interface CampaignSummary {
     /** The experiments (C15, C16); null when not run */
     stop: string | null;
     atrLeverage: string | null;
+    /** UTC hour the daily bars close at; 0: the exchange's own daily and 12-hour bars */
+    cutHour: number;
+    /** The regime layers (C17 to C19); null when not run */
+    regime: RegimeParams | null;
     funding: boolean;
     /** Adds cut to what the exchange accepts: notional within maxLever x the position's margin */
     exchangeCap: boolean;
@@ -96,6 +100,8 @@ export interface CampaignSummary {
     /** Still open at the end: in the multiples at their mark */
     open: number;
     adds: number;
+    /** By how the entry was taken: breakout, acceptance, retest (C17, C18) */
+    byMode: Record<string, number>;
     multiples: MultipleStats;
     byInstrument: Record<string, { count: number; lost: number; mean: number }>;
     /** The five largest multiples */
@@ -194,6 +200,8 @@ export function buildCampaignSummary(result: CampaignResult, config: CampaignCon
       feeRate: config.params.feeRate,
       stop: config.params.stop ?? null,
       atrLeverage: config.params.atrLeverage ?? null,
+      cutHour: config.cutHour ?? 0,
+      regime: config.params.regime ?? null,
       funding: config.funding,
       exchangeCap: config.exchangeCap,
       maintenance: result.maintenance,
@@ -215,6 +223,7 @@ export function buildCampaignSummary(result: CampaignResult, config: CampaignCon
       harvested: campaigns.filter((c) => c.end === 'harvest').length,
       open: campaigns.filter((c) => c.open).length,
       adds: campaigns.reduce((a, c) => a + c.adds, 0),
+      byMode: count(campaigns, (c) => c.mode),
       multiples: multipleStats(campaigns),
       byInstrument,
       top,
@@ -238,8 +247,16 @@ export function formatCampaignSummary(s: CampaignSummary): string {
     `rule: close above the ${run.entryChannel}-day high, long at ${run.leverage}x isolated, ${run.structure === 'pyramid' ? `adds every ${pct(Number(run.addStep), 0)} (pyramid)` : 'no adds'}, ` +
       `out below the ${run.exitChannel}-day low; fee ${pct(Number(run.feeRate), 2)}, funding ${run.funding ? 'charged' : 'not charged'}` +
       (run.stop !== null ? `; stop ${pct(Number(run.stop), 1)} below the last add price` : '') +
-      (run.atrLeverage !== null ? `; leverage per entry: liquidation ${run.atrLeverage} ATRs below it` : ''),
+      (run.atrLeverage !== null ? `; leverage per entry: liquidation ${run.atrLeverage} ATRs below it` : '') +
+      (run.cutHour !== 0 ? `; daily close at ${String(run.cutHour).padStart(2, '0')}:00 UTC, bars built from 4-hour candles` : ''),
   );
+  if (run.regime !== null) {
+    const r = run.regime;
+    lines.push(
+      `regime layers: red (no entry) at a BTC 3-day funding mean of ${pct(Number(r.vetoFunding), 2)} per 8h or a BTC ATR20 of ${pct(Number(r.vetoWild), 0)} of the close; the same readings veto an instrument, ` +
+        `as does a liquidation within ${r.cooldownDays} days; a breakout under ${pct(Number(r.thinMargin), 1)} over the channel waits ${r.pendingBars} closes for ${r.entry === 'breakout' ? 'nothing (entered at once)' : r.entry === 'accept' ? 'the acceptance' : 'the acceptance or a retest'}`,
+    );
+  }
   const byRate = new Map<string, string[]>();
   for (const [instId, rate] of Object.entries(run.maintenance)) byRate.set(rate, [...(byRate.get(rate) ?? []), instId.split('-')[0] ?? instId]);
   lines.push(
@@ -253,7 +270,8 @@ export function formatCampaignSummary(s: CampaignSummary): string {
   lines.push('');
   lines.push(`signals: ${s.signals.entries} entries, ${s.signals.taken} taken; skipped: ${list(s.signals.skipped)}; no next bar: ${s.signals.noNextBar}`);
   lines.push(
-    `campaigns: ${c.count} (${c.liquidated} liquidated, ${c.exited} exited, ${c.stopped > 0 ? `${c.stopped} stopped, ` : ''}${c.harvested > 0 ? `${c.harvested} closed by a harvest, ` : ''}${c.open} open at the end, marked), ${c.adds} adds`,
+    `campaigns: ${c.count} (${c.liquidated} liquidated, ${c.exited} exited, ${c.stopped > 0 ? `${c.stopped} stopped, ` : ''}${c.harvested > 0 ? `${c.harvested} closed by a harvest, ` : ''}${c.open} open at the end, marked), ${c.adds} adds` +
+      (run.regime !== null ? `; entered by ${list(c.byMode)}` : ''),
   );
   const m = c.multiples;
   lines.push(
@@ -286,10 +304,10 @@ export function formatCampaignSummary(s: CampaignSummary): string {
 // ---- files ----
 
 export function campaignsCsv(campaigns: readonly CampaignRecord[]): string {
-  const header = 'instId,signalBar,entryTime,entryPx,endTime,end,stake,contracts,adds,harvested,proceeds,multiple,peak,fees,funding,open';
+  const header = 'instId,signalBar,mode,entryTime,entryPx,endTime,end,stake,contracts,adds,harvested,proceeds,multiple,peak,fees,funding,open';
   const iso = (ts: number): string => new Date(ts).toISOString();
   const rows = campaigns.map((c) =>
-    [c.instId, iso(c.signalTs), iso(c.entryTime), c.entryPx, iso(c.endTime), c.end, c.stake, c.contracts, c.adds, c.harvested, c.proceeds, c.multiple, c.peak, c.fees, c.funding, c.open]
+    [c.instId, iso(c.signalTs), c.mode, iso(c.entryTime), c.entryPx, iso(c.endTime), c.end, c.stake, c.contracts, c.adds, c.harvested, c.proceeds, c.multiple, c.peak, c.fees, c.funding, c.open]
       .map(String)
       .join(','),
   );

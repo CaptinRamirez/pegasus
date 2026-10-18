@@ -1,4 +1,4 @@
-import type { CampaignParams, Candle, FundingRecord, Instrument, PotParams } from '@pegasus/shared';
+import type { CampaignParams, Candle, FundingRecord, Instrument, PotParams, RegimeEntry, RegimeSkip, RegimeView } from '@pegasus/shared';
 
 /**
  * 'pot': the product, one pot staking on the campaigns as they come.
@@ -56,6 +56,12 @@ export interface CampaignConfig {
   startCash?: string;
   /** Sample the pot at every 12-hour close, not at 00:00 UTC only: the replay beside a live pot, whose ledger samples every close */
   sampleEveryClose?: boolean;
+  /**
+   * Experiment: the UTC hour the daily bars close (and open) at; 0 when absent, the exchange's own 1Dutc / 12Hutc
+   * bars. The pot is sampled and the light (C17) read at that instant of each day. The bars must be built at this cut
+   * (loadData's cutHour).
+   */
+  cutHour?: number;
 }
 
 /** What the replay knows about one instrument. All arrays oldest first, completed periods only. */
@@ -87,6 +93,8 @@ export interface CampaignRecord {
   instId: string;
   /** Open time of the daily bar whose close gave the signal */
   signalTs: number;
+  /** How the signal was taken: a breakout (always, without the regime layers), or the acceptance or the retest of a thin one (C17, C18) */
+  mode: RegimeEntry;
   entryTime: number;
   /** Fill price of the entry */
   entryPx: string;
@@ -121,8 +129,12 @@ export interface CampaignSignalEvent {
   instId: string;
   signalTs: number;
   outcome: 'taken' | 'skipped' | 'no-next-bar';
-  /** For skipped: 'cash' = the free cash is below the minimum stake, 'min-size' = the stake does not buy the minimum order */
-  rule?: 'cash' | 'min-size';
+  /**
+   * For skipped: 'cash' = the free cash is below the minimum stake, 'min-size' = the stake does not buy the minimum
+   * order; with the regime layers (C17 to C19) 'thin' = the close set a pending level instead of entering, 'regime-red'
+   * and the vetoes = the entry was not taken
+   */
+  rule?: 'cash' | 'min-size' | RegimeSkip;
 }
 
 /** The pot at one instant. */
@@ -181,4 +193,6 @@ export interface CampaignResult {
   finishedAt: number | null;
   /** What the replay left out, for the report */
   notes: string[];
+  /** With params.regime: the light and every instrument's decision at the last daily close replayed; null otherwise */
+  regime: RegimeView | null;
 }

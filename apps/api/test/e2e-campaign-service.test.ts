@@ -28,6 +28,7 @@ import {
   type CampaignParams,
   type CampaignRecord,
   type CampaignReplayView,
+  type CampaignSignalsResponse,
   type CampaignView,
   type Candle,
   type PotParams,
@@ -439,6 +440,21 @@ describe('a whole campaign on the paper exchange', () => {
     expect(view.same?.samples[0]).toEqual({ ts: day(4) + HALF_DAY_MS, value: '56', banked: '0' });
     // 56 held in BTC from the mark at the start, 60000
     expect(view.heldBtc.at(-1)).toEqual({ ts: day(7), value: D(56).mul(59500).div(60000).toDecimalPlaces(8).toFixed() });
+    // the shadows of docs/proposals/regime-snowball-v2.1.md 11.3 beside them: the pot's structure at 3 ATR leverage, and that with
+    // the regime layers, whose decisions at the last daily close name every campaign coin
+    expect(view.atr3).toMatchObject({ structure: 'pyramid' });
+    expect(view.regime).toMatchObject({ structure: 'pyramid' });
+    expect(view.atr3?.samples.length).toBeGreaterThan(0);
+    expect(view.regime?.samples.length).toBeGreaterThan(0);
+    expect(view.decisions?.coins.map((c) => c.instId)).toEqual([BTC, ETH]);
+    expect(['GREEN', 'RED']).toContain(view.decisions?.state);
+    // and the signals route hands every campaign coin that shadow
+    const signals = await getJson<CampaignSignalsResponse>(s, '/api/campaign/signals');
+    expect(signals.rows.map((r) => r.instId)).toEqual([BTC, ETH]);
+    for (const r of signals.rows) {
+      expect(['GREEN', 'RED']).toContain(r.shadow?.state);
+      expect(r.shadow).toMatchObject({ asOf: view.decisions?.asOf, state: view.decisions?.state, params: view.decisions?.params, coin: { instId: r.instId } });
+    }
     // the same campaign on both sides: entered at the same close, at the open of 61000 with the modelled slippage
     expect(view.same?.campaigns).toMatchObject([{ instId: BTC, signalTs: day(4), entryTs: day(5), entryPx: '61030.5' }]);
     expect(view.reconciliation).toMatchObject({ tolerances: { entryPx: '0.01', multiple: '0.1' }, matched: 0, differing: 1, liveOnly: 0, replayOnly: 0 });

@@ -12,6 +12,7 @@
   "scripts": {
     "start": "tsx src/cli.ts",
     "campaign": "tsx src/campaign/cli.ts",
+    "cut-hour-sweep": "tsx src/campaign/cut-hour-sweep.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "build": "echo 'run with tsx, nothing to build'"

@@ -11,7 +11,7 @@ import { bar, DAY, HALF_DAY, instrument, T0 } from './helpers.js';
 
 function record(multiple: string, end: CampaignRecord['end'] = 'exit'): CampaignRecord {
   const times = { signalTs: T0, entryTime: T0 + DAY, endTime: T0 + 2 * DAY };
-  return { instId: 'AAA-USDT-SWAP', ...times, entryPx: '100', end, stake: '1', contracts: '', adds: 0, sales: 0, harvested: '0', proceeds: multiple, multiple, peak: '1', fees: '0', funding: '0', open: end === 'end-of-data' };
+  return { instId: 'AAA-USDT-SWAP', ...times, mode: 'breakout', entryPx: '100', end, stake: '1', contracts: '', adds: 0, sales: 0, harvested: '0', proceeds: multiple, multiple, peak: '1', fees: '0', funding: '0', open: end === 'end-of-data' };
 }
 
 describe('the distribution of the multiples', () => {
@@ -66,6 +66,8 @@ describe('the summary of a pot run', () => {
       feeRate: '0.0005',
       stop: null,
       atrLeverage: null,
+      cutHour: 0,
+      regime: null,
       funding: true,
       exchangeCap: false,
       maintenance: { 'AAA-USDT-SWAP': '0.01' },
@@ -100,9 +102,9 @@ describe('the summary of a pot run', () => {
     expect(text).toContain('the pot is alive; money next leaves it at 1000');
     expect(text).toContain('note: a note from the loader');
     const campaigns = campaignsCsv(result.campaigns).trimEnd().split('\n');
-    expect(campaigns[0]).toBe('instId,signalBar,entryTime,entryPx,endTime,end,stake,contracts,adds,harvested,proceeds,multiple,peak,fees,funding,open');
+    expect(campaigns[0]).toBe('instId,signalBar,mode,entryTime,entryPx,endTime,end,stake,contracts,adds,harvested,proceeds,multiple,peak,fees,funding,open');
     expect(campaigns).toHaveLength(2);
-    expect(campaigns[1]?.startsWith('AAA-USDT-SWAP,2022-01-04T00:00:00.000Z,2022-01-05T00:00:00.000Z,100.1,2022-01-09T00:00:00.000Z,exit,4.9294245,49,0,71.003415,67.30371375,')).toBe(true);
+    expect(campaigns[1]?.startsWith('AAA-USDT-SWAP,2022-01-04T00:00:00.000Z,breakout,2022-01-05T00:00:00.000Z,100.1,2022-01-09T00:00:00.000Z,exit,4.9294245,49,0,71.003415,67.30371375,')).toBe(true);
     // One line per harvest: when, the rung, the pot value, the target, the cash, the fraction sold and what the sales returned.
     const bankings = bankingsCsv(result.bankings).trimEnd().split('\n');
     expect(bankings[0]).toBe('time,rungs,potValue,target,fromCash,fraction,fromSales,amount');

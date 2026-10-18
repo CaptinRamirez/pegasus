@@ -1,3 +1,4 @@
+import type { RegimeParams } from './campaign-regime.js';
 import { D, Decimal, ZERO, floorToStep, type DecimalInput } from './decimal.js';
 import { previousChannel, SignalError } from './signals.js';
 import { coinToContracts } from './sizing.js';
@@ -43,6 +44,11 @@ export interface CampaignParams {
    * the entry channel's daily bars) below the entry, `leverage` at most. Absent: `leverage` for every entry.
    */
   atrLeverage?: string;
+  /**
+   * The regime layers of docs/proposals/regime-snowball-v2.1.md (campaign-regime.ts): the light, the vetoes and the
+   * waiting over the entry. A shadow beside the approved rule until the board adopts it. Absent: the rule as approved.
+   */
+  regime?: RegimeParams;
 }
 
 export const DEFAULT_CAMPAIGN_PARAMS: CampaignParams = {

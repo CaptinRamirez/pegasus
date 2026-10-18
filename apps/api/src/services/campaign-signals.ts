@@ -5,7 +5,9 @@ import {
   utcDayStart,
   type CampaignParams,
   type CampaignParamsView,
+  type CampaignReplayView,
   type CampaignServiceStatus,
+  type CampaignShadowSignal,
   type CampaignSignalRow,
   type CampaignSignalsResponse,
   type CampaignView,
@@ -38,7 +40,9 @@ import type { RiskEngine } from './risk-engine.js';
  * held long); the equity (the request's, else the account's total equity); the risk limits and the kill switch.
  *
  * When the campaign service runs on this API (CAMPAIGN_ENABLED=1, `pnpm start --campaign`), the positions on its coins
- * are the pot's: the response says so (`campaign.ownAccount`) and every plan warns CAMPAIGN_ACCOUNT.
+ * are the pot's: the response says so (`campaign.ownAccount`) and every plan warns CAMPAIGN_ACCOUNT. Each row then also
+ * carries `shadow`: what the regime shadow of the replay beside the pot (docs/proposals/regime-snowball-v2.1.md 11.3)
+ * decided for the coin at its last daily close; null without a campaign service, a replay result, or a decision on the coin.
  */
 
 export interface CampaignBarSource {
@@ -55,8 +59,8 @@ export interface CampaignSignalsDeps {
   account: AccountService;
   risk: RiskEngine;
   journal?: Pick<JournalService, 'lastOpening'> | undefined;
-  /** The campaign service, while the campaign is enabled */
-  campaign?: { view(): CampaignView } | undefined;
+  /** The campaign service, while the campaign is enabled: its view, and the replay's for the regime shadow's decisions */
+  campaign?: { view(): CampaignView; replayView(): CampaignReplayView } | undefined;
   /** The view of a disabled campaign: its settings */
   disabledView: () => CampaignView;
   log: Logger;
@@ -115,16 +119,19 @@ export class CampaignSignalsService {
     const totalNotional = this.deps.account.totalPositionNotional();
     const untracked = instIds.filter((id) => this.deps.market.liveMarkPrice(id) === undefined);
     const restMarks = untracked.length > 0 ? await this.cachedMarks(untracked, now) : new Map<string, string>();
+    const decisions = this.deps.campaign?.replayView().decisions ?? null;
     const rows = await Promise.all(
       instIds.map(async (instId): Promise<CampaignSignalRow> => {
         const tracked = this.deps.market.getInstrument(instId) !== undefined;
+        const coin = decisions?.coins.find((c) => c.instId === instId);
+        const shadow: CampaignShadowSignal | null = decisions && coin ? { asOf: decisions.asOf, state: decisions.state, btcAtrPct: decisions.btcAtrPct, btcFunding: decisions.btcFunding, params: decisions.params, coin } : null;
         try {
           const [daily, halfDay] = await Promise.all([this.cachedBars(instId, '1D', Math.max(60, params.entryChannel + 5), now), this.cachedBars(instId, '12H', 10, now)]);
           const markPx = this.deps.market.liveMarkPrice(instId) ?? restMarks.get(instId) ?? null;
           const held = this.heldLong(instId, positions);
           const short = positions.filter((p) => p.instId === instId && positionDirection(p) === 'short');
           const evaluated = evaluateCampaignSignal({ instId, daily, halfDay, markPx, params, held, shortContracts: short.length > 0 ? sumDecimals(short.map((p) => D(p.pos).abs())).toFixed() : null });
-          const row: CampaignSignalRow = { ...evaluated, tracked, plan: null };
+          const row: CampaignSignalRow = { ...evaluated, tracked, plan: null, shadow };
           const signal = row.signal;
           const stopPx = row.levels.nextExit;
           if (signal !== null && row.markPx !== null && stopPx !== null && (row.state === 'entry' || row.state === 'add')) {
@@ -169,6 +176,7 @@ export class CampaignSignalsService {
             holding: null,
             signal: null,
             plan: null,
+            shadow,
           };
         }
       }),

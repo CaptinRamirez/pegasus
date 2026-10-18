@@ -3,6 +3,7 @@ import {
   Decimal,
   DEFAULT_CAMPAIGN_PARAMS,
   DEFAULT_POT_PARAMS,
+  DEFAULT_REGIME_PARAMS,
   isDecimalString,
   type CampaignParams,
   type CampaignPotRecord,
@@ -18,6 +19,7 @@ import {
   type FundingRecord,
   type Instrument,
   type PotParams,
+  type RegimeView,
 } from '@pegasus/shared';
 import type { CacheStore } from '../data/cache.js';
 import { fundingKey, loadCandles, loadFunding, loadInstrument, type Fetchers } from '../data/load.js';
@@ -41,7 +43,16 @@ import type { CampaignInstrument, CampaignRecord, CampaignResult } from './types
  *   - the open of the running bar, when known (Fetchers.latest), filling what the last close decided (C14): the live
  *     service trades right after a close, the replay would otherwise wait 12 hours for that bar to close;
  *   - funding as the given fetchers have it: the API reads OKX's own history (what the paper exchange charged).
+ *
+ * Beside the two structures, the shadows of docs/proposals/regime-snowball-v2.1.md (11.3): the pot's structure with
+ * the leverage set so that the liquidation sits 3 ATRs below the entry (`atr3`), and that with the regime layers
+ * (`regime`, C17 to C19), whose decisions at the last daily close are returned for the SIGNALS tab. Same start, same
+ * pot, same bars; the settlements are read from 4 days before the start for the 3-day funding mean of the first
+ * closes. Without BTC-USDT-SWAP among the pot's instruments there is no light, and the regime shadow is left out.
  */
+
+/** The leverage of the shadows: the proposal of docs/strategy.md 3.4 */
+export const SHADOW_ATR_LEVERAGE = '3';
 
 const DAY_MS = 86_400_000;
 const HALF_DAY_MS = DAY_MS / 2;
@@ -85,10 +96,15 @@ export interface PotReplay {
   through: number;
   same: CampaignReplayRun;
   other: CampaignReplayRun;
+  /** The shadows: the pot's structure at 3 ATR leverage, and that with the regime layers (null without BTC among the instruments: no light) */
+  atr3: CampaignReplayRun;
+  regime: CampaignReplayRun | null;
+  /** The regime shadow's decisions at its last daily close; null when it saw no daily close yet, or without the shadow */
+  decisions: RegimeView | null;
   heldBtc: CampaignValueSample[];
   reconciliation: CampaignReconciliation;
-  /** The engine's results behind `same` and `other` */
-  results: { same: CampaignResult; other: CampaignResult };
+  /** The engine's results behind the runs */
+  results: { same: CampaignResult; other: CampaignResult; atr3: CampaignResult; regime: CampaignResult | null };
   /** What the replay went without */
   notes: string[];
 }
@@ -156,7 +172,7 @@ export async function replayPot(input: PotReplayInput, sources: PotReplaySources
     let funding: FundingRecord[] | null = null;
     if (replayed) {
       try {
-        funding = await loadFunding(instId, fetchers, cache, refresh, from - DAY_MS);
+        funding = await loadFunding(instId, fetchers, cache, refresh, from - 4 * DAY_MS);
       } catch (err) {
         funding = cache.read<FundingRecord[]>(fundingKey(instId, fetchers));
         notes.push(`${instId}: funding history not updated (${(err as Error).message})${funding ? ', using the cached settlements' : ''}`);
@@ -194,13 +210,20 @@ export async function replayPot(input: PotReplayInput, sources: PotReplaySources
     if (running) d.next = { ts: through, open: running.open };
     return d;
   });
-  const run = (structure: CampaignStructure): CampaignResult =>
-    runCampaigns(data, { ...DEFAULT_CAMPAIGN_CONFIG, params: { ...params, structure }, pot: potParams, from, to: through, startCash, sampleEveryClose: true });
+  const run = (over: Partial<CampaignParams>): CampaignResult =>
+    runCampaigns(data, { ...DEFAULT_CAMPAIGN_CONFIG, params: { ...params, ...over }, pot: potParams, from, to: through, startCash, sampleEveryClose: true });
+  // The engine runs in one go: the event loop is given a turn between the runs.
+  const turn = (): Promise<void> => new Promise<void>((resolve) => setImmediate(resolve));
   const otherStructure: CampaignStructure = pot.structure === 'pyramid' ? 'noadd' : 'pyramid';
-  const same = run(pot.structure);
-  // The engine runs in one go: the event loop is given a turn between the two runs.
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  const other = run(otherStructure);
+  const same = run({});
+  await turn();
+  const other = run({ structure: otherStructure });
+  await turn();
+  const atr3 = run({ atrLeverage: SHADOW_ATR_LEVERAGE });
+  await turn();
+  // The light is read from BTC's bars (C17): without BTC among the pot's instruments there is no regime shadow.
+  const regime = instIds.includes(HELD_INSTRUMENT) ? run({ atrLeverage: SHADOW_ATR_LEVERAGE, regime: DEFAULT_REGIME_PARAMS }) : null;
+  if (regime === null) notes.push(`${HELD_INSTRUMENT} is not among the pot's instruments: the regime shadow, which reads its light from it, is left out`);
   notes.push(...same.notes);
 
   return {
@@ -208,16 +231,31 @@ export async function replayPot(input: PotReplayInput, sources: PotReplaySources
     through,
     same: replayRun(same, pot.structure, startCash),
     other: replayRun(other, otherStructure, startCash),
+    atr3: replayRun(atr3, pot.structure, startCash),
+    regime: regime === null ? null : replayRun(regime, pot.structure, startCash),
+    decisions: regime?.regime ?? null,
     heldBtc: heldInBtc((loaded.get(HELD_INSTRUMENT) as Loaded).halfDay, pot, startCash, from, through),
     reconciliation: reconcileCampaigns(input.campaigns, same.campaigns, through, input.tolerances),
-    results: { same, other },
+    results: { same, other, atr3, regime },
     notes,
   };
 }
 
 /** The view of GET /api/campaign/replay of a replay that has just been computed. */
 export function replayView(replay: PotReplay, computedAt: number): CampaignReplayView {
-  return { status: 'ready', reason: null, computedAt, through: replay.through, same: replay.same, other: replay.other, heldBtc: replay.heldBtc, reconciliation: replay.reconciliation };
+  return {
+    status: 'ready',
+    reason: null,
+    computedAt,
+    through: replay.through,
+    same: replay.same,
+    other: replay.other,
+    heldBtc: replay.heldBtc,
+    reconciliation: replay.reconciliation,
+    atr3: replay.atr3,
+    regime: replay.regime,
+    decisions: replay.decisions,
+  };
 }
 
 const byEntry = (a: CampaignRecord, b: CampaignRecord): number => a.entryTime - b.entryTime || a.instId.localeCompare(b.instId);
@@ -227,6 +265,7 @@ function replayCampaign(c: CampaignRecord): CampaignReplayCampaign {
   return {
     instId: c.instId,
     signalTs: c.signalTs,
+    mode: c.mode,
     entryTs: c.entryTime,
     entryPx: c.entryPx,
     stake: c.stake,

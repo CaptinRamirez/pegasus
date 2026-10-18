@@ -9,7 +9,7 @@ import { ApiError } from '../lib/http';
 import { useStore } from '../store/store';
 import { initialState } from '../store/types';
 import { resetUi, useUi } from '../store/ui';
-import { ADA_TENTHS, adaScenarioResponse, campaignAccountResponse, SIGNAL_INSTRUMENTS, signalsResponse, trailingOn } from '../test/signals-fixtures';
+import { ADA_TENTHS, adaScenarioResponse, campaignAccountResponse, SIGNAL_INSTRUMENTS, shadowResponse, signalsResponse, trailingOn } from '../test/signals-fixtures';
 import { OrderTicket } from './OrderTicket';
 import { SignalsPanel } from './SignalsPanel';
 import { RISK_KEY } from './signals/riskPref';
@@ -191,6 +191,25 @@ describe('the SIGNALS tab', () => {
     expect(follow()?.disabled).toBe(false);
   });
 
+  it('the regime shadow beside the rule: its decision in one sentence, its readings as chips, its light on the coin; nothing without it', async () => {
+    campaignSignals.mockResolvedValue(shadowResponse);
+    await render();
+    await until('the coins', () => container.querySelectorAll('.sig-coin').length === 10);
+    // the state sentence stays first; the shadow's under it, waiting for the line plus the thin margin (87,245 x 1.01)
+    expect(container.querySelector('.sig-sentence')?.classList.contains('sig-shadow')).toBe(false);
+    expect(container.querySelector('.sig-shadow')?.textContent).toBe(
+      'Green light | No signal | waiting for a close ≥ 88,117.5 (the line 87,245 + 1.0%); a close between 87,245 and 88,117.5 is noted as pending and enters if the next close is still above the line',
+    );
+    expect([...container.querySelectorAll('.sig-shadow-labels span')].map((s) => s.textContent)).toEqual(['At the 2026-10-05 00:00 UTC close', 'ATR 2.5%', 'Funding 0.005%/8h', 'Line tested 5×']);
+    // the light is a class on the row (a dot by CSS), not a span: the row's texts are unchanged
+    expect(coin('BTC')?.classList.contains('sig-light-GREEN')).toBe(true);
+    expect([...(coin('BTC')?.querySelectorAll('span') ?? [])].map((s) => s.textContent).join('|')).toBe('BTC|Entry|Entry|64,180.5|broken');
+    expect(coin('ETH')?.className).not.toContain('sig-light');
+    await click(coin('ETH'));
+    expect(container.querySelector('.sig-shadow')).toBeNull();
+    expect(container.querySelector('.sig-shadow-labels')).toBeNull();
+  });
+
   it('says every warning in words; a coin without a signal cannot be followed and says what to do', async () => {
     await render();
     await until('the coins', () => coin('ADA') !== undefined);
@@ -239,12 +258,15 @@ describe('the SIGNALS tab', () => {
     expect(container.querySelector('.ticket-exits-off')?.textContent).toBe('Take-profit and trailing exits are offered in paper trading and against the local mock only.');
   });
 
-  it('in Chinese: the state, the sentence and the buttons', async () => {
+  it('in Chinese: the state, the sentence, the shadow and the buttons', async () => {
     useLangStore.setState({ lang: 'zh' });
+    campaignSignals.mockResolvedValue(shadowResponse);
     await render();
     await until('the coins', () => container.querySelector('.sig-headline') !== null);
     expect(container.querySelector('.sig-headline')?.textContent).toBe('开仓信号：做多');
     expect(container.querySelector('.sig-sentence')?.textContent).toBe('BTC 日线收在 20 日高点 63,250 之上（收盘 64,120）。规则：做多，日线跌破 10 日低点 58,900 离场。');
+    expect(container.querySelector('.sig-shadow')?.textContent).toBe('绿灯｜无信号｜等收盘 ≥ 88,117.5（线 87,245 + 1.0%）；87,245–88,117.5 之间记 pending，次日仍在线上就进');
+    expect([...container.querySelectorAll('.sig-shadow-labels span')].map((s) => s.textContent)).toEqual(['按 2026-10-05 00:00 UTC 收盘', 'ATR 2.5%', '资金费 0.005%/8h', '线被试 5 次']);
     expect(follow()?.textContent).toBe('按信号开仓');
     expect(manual()?.textContent).toBe('手动开仓');
     expect(coin('XRP')?.textContent).toContain('持仓中');

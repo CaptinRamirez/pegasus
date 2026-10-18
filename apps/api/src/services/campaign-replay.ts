@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { reconcileMismatches, replayPot, type PotReplay, type PotReplayInput, type PotReplaySources } from '@pegasus/backtest/campaign';
+import { reconcileMismatches, replayPot, replayView, type PotReplay, type PotReplayInput, type PotReplaySources } from '@pegasus/backtest/campaign';
 import type { CampaignReplayStatus, CampaignReplaySummary, CampaignReplayView, CampaignStatusReason } from '@pegasus/shared';
 import type { Logger } from '../logger.js';
 
@@ -75,8 +75,8 @@ export class CampaignReplayService extends EventEmitter<{ change: [CampaignRepla
     const { status, reason } = this.state();
     const last = this.last;
     if (!last) return { status, reason, computedAt: null, through: null, same: null, other: null, heldBtc: [], reconciliation: null };
-    const r = last.replay;
-    return { status, reason, computedAt: last.computedAt, through: r.through, same: r.same, other: r.other, heldBtc: r.heldBtc, reconciliation: r.reconciliation };
+    // the replay's own view (every run, the shadows and their decisions); the status is this service's: a failed attempt keeps the last result
+    return { ...replayView(last.replay, last.computedAt), status, reason };
   }
 
   /**

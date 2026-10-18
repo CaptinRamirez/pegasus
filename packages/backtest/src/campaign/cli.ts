@@ -85,9 +85,10 @@ async function main(): Promise<void> {
 
   const started = Date.now();
   const files = new FileCache(cacheDir);
+  // The regime layers read the settlements even when funding is not charged.
   const { data, notes } = await loadData(
-    { instIds, phases: [0, 12], openInterest: false, funding: config.funding, now: started, refresh: opts.refresh, log: progress },
-    opts.offline ? offlineFetchers() : createFetchers(),
+    { instIds, phases: [0, 12], openInterest: false, funding: config.funding || config.params.regime !== undefined, now: started, refresh: opts.refresh, log: progress, ...(config.cutHour !== undefined ? { cutHour: config.cutHour } : {}) },
+    opts.offline ? offlineFetchers(opts.fundingSource === 'okx' ? 'okx' : undefined) : createFetchers({ funding: opts.fundingSource }),
     opts.offline ? new ReadOnlyCache(files) : files,
   );
   for (const d of data) {

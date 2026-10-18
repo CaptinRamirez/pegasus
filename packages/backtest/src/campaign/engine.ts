@@ -1,5 +1,7 @@
 import {
   atr,
+  ATR_BARS,
+  atrPct,
   CAMPAIGN_MAJORS,
   campaignAction,
   campaignAddQuantity,
@@ -9,16 +11,22 @@ import {
   campaignSignals,
   campaignStake,
   campaignStopPrice,
+  channelTests,
   coinToContracts,
   contractsToCoin,
+  cooldownUntil,
   D,
   Decimal,
+  fundingMean,
   harvestContracts,
   isolatedLongEquity,
   isolatedLongLiquidationPrice,
   keptAfterHarvest,
   planHarvest,
   potFinished,
+  regimeDecision,
+  regimeState,
+  regimeVetoes,
   sameCloseOrder,
   ZERO,
   type CampaignAction,
@@ -27,6 +35,10 @@ import {
   type Candle,
   type FundingRecord,
   type Instrument,
+  type PendingLevel,
+  type RegimeCoinView,
+  type RegimeEntry,
+  type RegimeState,
 } from '@pegasus/shared';
 import type { Banking, CampaignConfig, CampaignEnd, CampaignInstrument, CampaignRecord, CampaignResult, CampaignSignalEvent, PotSample, Tiered } from './types.js';
 
@@ -120,6 +132,23 @@ import type { Banking, CampaignConfig, CampaignEnd, CampaignInstrument, Campaign
  *      price with the ATR over the entry channel's daily bars up to the signal bar, so that the
  *      liquidation sits atrLeverage ATRs below the entry, params.leverage at most. The campaign keeps
  *      that leverage as the cap of its adds (C6).
+ * C17. The regime layers (params.regime: the shadow of docs/proposals/regime-snowball-v2.1.md; the
+ *      approved rule has none). At every daily instant (00:00 UTC, or config.cutHour) the light is read from BTC-USDT-SWAP, which
+ *      must be among the instruments: its ATR20 over the close of the daily bar closing then and the
+ *      mean of its funding settlements in (T - 3 days, T) (campaign-regime.ts). The decision of an
+ *      instrument without a campaign at a daily close (C1) goes through regimeDecision with its own
+ *      ATR, funding mean, the time of its last liquidation and its pending level: a thin breakout
+ *      sets the level and enters nothing (rule 'thin'); the acceptance is the one close after it; a
+ *      RED light or a veto keeps the entry (rule 'regime-red', the veto) and sets or leaves the level pending.
+ *      The entry is then filled as C1 fills it, at the next open, and the record says how it was
+ *      taken (mode). Open campaigns add, exit and harvest as ever. Before `from` nothing is decided.
+ * C18. The retest (params.regime.entry 'either'): at any close while the level is kept, a low within
+ *      thinMargin above it and a close above it; a close that is also the acceptance is recorded as
+ *      the acceptance.
+ * C19. A pending level is the first close's over the channel that opened nothing: a later such close
+ *      does not move it; it is kept for pendingBars closes after the one that set it, then expires,
+ *      and an entry clears it. The light, the readings and every
+ *      instrument's decision at the last daily close are returned (CampaignResult.regime).
  *
  * What the replay knows at a close T: candles that closed at or before T and funding settlements
  * with time <= T. Linear contracts only; long only.
@@ -127,6 +156,7 @@ import type { Banking, CampaignConfig, CampaignEnd, CampaignInstrument, Campaign
 
 const DAY_MS = 86_400_000;
 const HALF_DAY_MS = DAY_MS / 2;
+const BTC = 'BTC-USDT-SWAP';
 
 /** A 12-hour bar with its prices parsed once. */
 interface Bar {
@@ -149,6 +179,8 @@ interface Series {
   /** Close time of a daily bar -> its index in `days`; warm-up bars have no entry */
   dayIndex: Map<number, number>;
   funding: readonly FundingRecord[] | null;
+  /** The settlements whether or not funding is charged: what the regime layers read (C17) */
+  settlements: readonly FundingRecord[] | null;
   slippage: Decimal;
   exitSlippage: Decimal;
   maintenance: Decimal;
@@ -160,6 +192,7 @@ interface Campaign {
   /** The rule with this campaign's leverage (C16) */
   p: CampaignParams;
   signalTs: number;
+  mode: RegimeEntry;
   entryTime: number;
   entryPx: Decimal;
   /** What the campaign took from the pot */
@@ -227,7 +260,10 @@ const ratio = (v: Decimal): string => v.toSignificantDigits(15).toFixed();
 
 export function runCampaigns(data: readonly CampaignInstrument[], config: CampaignConfig): CampaignResult {
   const { params, pot } = config;
+  const regime = params.regime ?? null;
   const catalogue = config.mode === 'catalogue';
+  /** The instant of each day the daily bars close at: 00:00 UTC, or the cut of the experiment */
+  const dayInstant = (config.cutHour ?? 0) * 3_600_000;
   const fee = D(params.feeRate);
   const channel = Math.max(params.entryChannel, params.exitChannel);
   const tier = (t: Tiered, inst: Instrument): Decimal => D(CAMPAIGN_MAJORS.includes(inst.baseCcy) ? t.major : t.other);
@@ -265,12 +301,14 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
       days,
       dayIndex,
       funding: config.funding ? d.funding : null,
+      settlements: d.funding,
       slippage: tier(config.costs.slippage, inst),
       exitSlippage: tier(config.costs.exitSlippage, inst),
       maintenance: maintenance(inst),
     });
   }
   const instants = [...new Set([...series.values()].flatMap((s) => [...s.openIndex.keys(), ...s.closeIndex.keys()]))].sort((a, b) => a - b);
+  if (regime !== null && !series.has(BTC)) throw new Error(`the regime layers read the light from ${BTC}, which is not among the instruments replayed`);
 
   // ---- state ----
   let cash = D(config.startCash ?? pot.start);
@@ -278,8 +316,14 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
   let rungs = 0;
   let finishedAt: number | null = null;
   const open = new Map<string, Campaign>();
-  /** Instrument -> open time of the daily bar whose signal waits for the next open */
-  const waiting = new Map<string, number>();
+  /** Instrument -> open time of the daily bar whose signal waits for the next open, and how it was taken (C17) */
+  const waiting = new Map<string, { signalTs: number; mode: RegimeEntry }>();
+  /** C17 to C19: the pending levels, the last liquidation of each instrument, the light and the decisions at the last daily close */
+  const pending = new Map<string, PendingLevel>();
+  const liquidatedAt = new Map<string, number>();
+  const decisions = new Map<string, RegimeCoinView>();
+  /** The light as last read (held in an object: it is set from a closure) */
+  const lights: { last: { closeTs: number; state: RegimeState; btcAtrPct: string | null; btcFunding: string | null } | null } = { last: null };
   const ended: CampaignRecord[] = [];
   const signals: CampaignSignalEvent[] = [];
   const samples: PotSample[] = [];
@@ -300,6 +344,7 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
   const record = (c: Campaign, endTime: number, end: CampaignEnd, proceeds: Decimal): CampaignRecord => ({
     instId: c.s.inst.instId,
     signalTs: c.signalTs,
+    mode: c.mode,
     entryTime: c.entryTime,
     entryPx: c.entryPx.toFixed(),
     endTime,
@@ -321,6 +366,7 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
   const finish = (c: Campaign, bar: Bar, end: CampaignEnd, proceeds: Decimal): void => {
     open.delete(c.s.inst.instId);
     ended.push(record(c, bar.ts, end, proceeds));
+    if (end === 'liquidated') liquidatedAt.set(c.s.inst.instId, bar.ts);
     if (!catalogue) cash = cash.plus(proceeds);
   };
 
@@ -457,8 +503,14 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
     return atr(s.days.slice(k - params.entryChannel, k + 1), params.entryChannel);
   };
 
+  /** The pot skipped an entry the regime layers had decided: the decision shown says so. */
+  const potSkipped = (instId: string, rule: 'cash' | 'min-size'): void => {
+    const view = decisions.get(instId);
+    if (view) decisions.set(instId, { ...view, entry: null, skip: rule });
+  };
+
   /** C1, C2, C16: the entry at the open of `bar`. */
-  const enter = (s: Series, bar: Bar, signalTs: number): void => {
+  const enter = (s: Series, bar: Bar, signalTs: number, mode: RegimeEntry): void => {
     const event = { instId: s.inst.instId, signalTs };
     const px = bar.open.mul(s.slippage.plus(1));
     const p = params.atrLeverage === undefined ? params : { ...params, leverage: campaignLeverage(px, atrAt(s, signalTs), s.maintenance, params).toFixed() };
@@ -470,11 +522,13 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
       const planned = campaignStake(cash, pot);
       if (planned === null) {
         signals.push({ ...event, outcome: 'skipped', rule: 'cash' });
+        potSkipped(s.inst.instId, 'cash');
         return;
       }
       contracts = campaignContracts(campaignEntryQuantity(planned, px, p), s.inst);
       if (contracts.isZero()) {
         signals.push({ ...event, outcome: 'skipped', rule: 'min-size' });
+        potSkipped(s.inst.instId, 'min-size');
         return;
       }
       qty = contractsToCoin(contracts, s.inst);
@@ -488,6 +542,7 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
       s,
       p,
       signalTs,
+      mode,
       entryTime: bar.ts,
       entryPx: px,
       stake,
@@ -518,8 +573,58 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
     return k === undefined ? null : campaignSignals(s.days.slice(Math.max(0, k - channel), k + 1), params);
   };
 
+  /** C17: an instrument's ATR20 over its close and funding mean at the daily close `now` (its bar at `k` in `days`). */
+  const readings = (s: Series, k: number | undefined, now: number): { atrPct: string | null; funding: string | null } => ({
+    atrPct: k === undefined ? null : (atrPct(s.days.slice(Math.max(0, k - ATR_BARS), k + 1))?.toFixed() ?? null),
+    funding: s.settlements === null ? null : (fundingMean(s.settlements, now)?.toFixed() ?? null),
+  });
+
+  /** C17: the light at the 00:00 UTC instant `now`, from BTC's bar closing then (none: readings unknown, the light green). */
+  const readLight = (now: number): void => {
+    const btc = series.get(BTC) as Series;
+    const r = readings(btc, btc.dayIndex.get(now), now);
+    lights.last = { closeTs: now, state: regimeState({ atrPct: r.atrPct, funding: r.funding }, regime as NonNullable<typeof regime>), btcAtrPct: r.atrPct, btcFunding: r.funding };
+  };
+
+  /**
+   * C17 to C19: the decision of an instrument without a campaign at the daily close `now` with the signals `day`:
+   * what waits for the next open, the pending level, the decision shown.
+   */
+  const decide = (s: Series, day: CampaignSignals, now: number, held: boolean): void => {
+    const { instId } = s.inst;
+    const p = regime as NonNullable<typeof regime>;
+    const k = s.dayIndex.get(now) as number;
+    const r = readings(s, k, now);
+    const liquidated = liquidatedAt.get(instId) ?? null;
+    const vetoes = regimeVetoes({ atrPct: r.atrPct, funding: r.funding, liquidatedAt: liquidated }, now, p);
+    const state = (lights.last as NonNullable<typeof lights.last>).state;
+    const d = held
+      ? { entry: null, skip: 'open' as const, pending: null, margin: day.entryHigh === null ? null : D(day.close).div(day.entryHigh).minus(1).toFixed() }
+      : regimeDecision({ signals: day, low: (s.days[k] as Candle).low, pending: pending.get(instId) ?? null, state, vetoes }, p);
+    if (d.pending) pending.set(instId, d.pending);
+    else pending.delete(instId);
+    if (d.entry) waiting.set(instId, { signalTs: day.asOf, mode: d.entry });
+    else if (d.skip !== null && d.skip !== 'no-signal' && d.skip !== 'pending-wait' && d.skip !== 'open') signals.push({ instId, signalTs: day.asOf, outcome: 'skipped', rule: d.skip });
+    decisions.set(instId, {
+      instId,
+      entry: d.entry,
+      skip: d.skip,
+      close: day.close,
+      entryHigh: day.entryHigh,
+      margin: d.margin,
+      atrPct: r.atrPct,
+      funding: r.funding,
+      cooldownUntil: cooldownUntil(liquidated, p),
+      pending: d.pending ? { level: d.pending.level, barsLeft: p.pendingBars - d.pending.bars } : null,
+      tests: channelTests(s.days.slice(0, k + 1), params.entryChannel),
+      vetoes,
+    });
+  };
+
   // ---- the replay ----
   for (const now of instants) {
+    const deciding = config.from === null || now >= config.from;
+    if (regime !== null && now % DAY_MS === dayInstant && deciding) readLight(now);
     // C3 e-h: the bars that close now, then C1: the signals of the day that closes with them.
     let closed = false;
     for (const s of series.values()) {
@@ -532,7 +637,9 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
       const liquidated = held !== undefined && closeBar(held, bar, now);
       const day = daySignals(s, now);
       if (held && !liquidated) held.action = campaignAction(day?.exit ?? false, bar.close, held.lastAddPx, params);
-      else if (day?.entry && (config.from === null || now >= config.from)) waiting.set(instId, day.asOf);
+      if (day === null || !deciding) continue;
+      if (regime !== null) decide(s, day, now, held !== undefined && !liquidated);
+      else if (day.entry && (held === undefined || liquidated)) waiting.set(instId, { signalTs: day.asOf, mode: 'breakout' });
     }
     // C13: the ladder looks at the pot these closes have marked.
     if (closed && !catalogue) harvest(now);
@@ -550,12 +657,13 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
     // C1, C9: the entries, one after the other.
     for (const instId of sameCloseOrder(entering, now)) {
       const s = series.get(instId) as Series;
-      enter(s, s.bars[s.openIndex.get(now) as number] as Bar, waiting.get(instId) as number);
+      const w = waiting.get(instId) as { signalTs: number; mode: RegimeEntry };
+      enter(s, s.bars[s.openIndex.get(now) as number] as Bar, w.signalTs, w.mode);
       waiting.delete(instId);
     }
 
     if (catalogue) continue;
-    if ((now % DAY_MS === 0 || config.sampleEveryClose === true) && (config.from === null || now >= config.from)) samples.push(sample(now));
+    if ((now % DAY_MS === dayInstant || config.sampleEveryClose === true) && (config.from === null || now >= config.from)) samples.push(sample(now));
     if (potFinished(cash, open.size, pot)) {
       finishedAt = now;
       break;
@@ -563,7 +671,7 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
   }
 
   // C1: a signal at the last close of an instrument has no next bar. (A finished pot looks at no signal any more.)
-  if (finishedAt === null) for (const [instId, signalTs] of waiting) signals.push({ instId, signalTs, outcome: 'no-next-bar' });
+  if (finishedAt === null) for (const [instId, w] of waiting) signals.push({ instId, signalTs: w.signalTs, outcome: 'no-next-bar' });
 
   // C11: campaigns still open are listed at their mark, never closed.
   const first = instants[0];
@@ -599,5 +707,16 @@ export function runCampaigns(data: readonly CampaignInstrument[], config: Campai
     end,
     finishedAt,
     notes,
+    regime:
+      regime === null || lights.last === null
+        ? null
+        : {
+            asOf: lights.last.closeTs - DAY_MS,
+            state: lights.last.state,
+            btcAtrPct: lights.last.btcAtrPct,
+            btcFunding: lights.last.btcFunding,
+            params: regime,
+            coins: [...series.keys()].map((instId) => decisions.get(instId)).filter((v): v is RegimeCoinView => v !== undefined),
+          },
   };
 }

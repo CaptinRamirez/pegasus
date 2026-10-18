@@ -1,7 +1,7 @@
 /** The campaign rule read per coin (services/campaign-signals-plan.ts, campaign-signals.ts): the states, the plan and the service. */
 import { describe, expect, it } from 'vitest';
 import { pino } from 'pino';
-import { D, DEFAULT_CAMPAIGN_PARAMS, type AccountConfig, type Balance, type CampaignView, type Candle, type Instrument, type Position, type RiskConfig, type SignalSnapshot } from '@pegasus/shared';
+import { D, DEFAULT_CAMPAIGN_PARAMS, DEFAULT_REGIME_PARAMS, type AccountConfig, type Balance, type CampaignReplayView, type CampaignView, type Candle, type Instrument, type Position, type RegimeCoinView, type RiskConfig, type SignalSnapshot } from '@pegasus/shared';
 import { loadConfig } from '../src/config.js';
 import type { AccountService } from '../src/services/account.js';
 import { disabledCampaignView } from '../src/services/campaign.js';
@@ -231,7 +231,7 @@ describe('the campaign signals service', () => {
   const config = loadConfig({ CAMPAIGN_INSTRUMENTS: 'BTC-USDT-SWAP,LINK-USDT-SWAP,DOT-USDT-SWAP' });
   const BTC: Instrument = { ...LINK, instId: 'BTC-USDT-SWAP', baseCcy: 'BTC', ctVal: '0.01', lotSz: '0.01', minSz: '0.01', tickSz: '0.1', maxLever: '100' };
 
-  function setup(more: { positions?: Position[]; balance?: Balance | null; campaign?: { view(): CampaignView } } = {}) {
+  function setup(more: { positions?: Position[]; balance?: Balance | null; campaign?: { view(): CampaignView; replayView(): CampaignReplayView } } = {}) {
     let barReads = 0;
     const daily: Record<string, Candle[]> = { 'BTC-USDT-SWAP': days({ high: '106', close: '105' }), 'LINK-USDT-SWAP': days() };
     const market = {
@@ -294,22 +294,34 @@ describe('the campaign signals service', () => {
     expect(btc?.plan?.signal).toEqual(btc?.signal);
     expect(res.rows[1]?.markPx).toBe('96.5');
     expect(res.rows[2]?.reasons[0]).toMatchObject({ code: 'BARS_UNAVAILABLE' });
+    // no campaign service: no regime shadow on any row
+    expect(res.rows.map((r) => r.shadow)).toEqual([null, null, null]);
     // the request's equity and risk win
     const asked = await service.report({ equity: '500', riskPct: '0.02' });
     expect(asked).toMatchObject({ equity: '500', equitySource: 'request', riskPct: '0.02' });
     expect(asked.rows[0]?.plan?.riskTarget).toBe('10');
   });
 
-  it('a held long: holding with the add reference of the journal; the campaign on this account is said and warned', async () => {
+  it("a held long: holding with the add reference of the journal; the campaign on this account is said and warned, and each coin carries the regime shadow's decision", async () => {
     const position: Position = { instId: 'LINK-USDT-SWAP', posSide: 'net', mgnMode: 'isolated', pos: '5', avgPx: '95', markPx: '96.5', upl: '7.5', uplRatio: '0.1', lever: '10', liqPx: '86', margin: '47.5', notionalUsd: '482.5', cTime: lastDay, uTime: lastDay };
     const running = { ...disabledCampaignView(config.campaign), status: 'running' as const, reason: null };
-    const { service } = setup({ positions: [position], campaign: { view: () => running } });
+    const coin = (instId: string): RegimeCoinView => ({ instId, entry: null, skip: 'regime-red', close: '105', entryHigh: '100', margin: '0.05', atrPct: '0.03', funding: '0.0002', cooldownUntil: null, pending: null, tests: 1, vetoes: [] });
+    const decisions = { asOf: lastDay, state: 'RED' as const, btcAtrPct: '0.07', btcFunding: '0.0002', params: DEFAULT_REGIME_PARAMS, coins: [coin('BTC-USDT-SWAP'), coin('DOT-USDT-SWAP')] };
+    const replay: CampaignReplayView = { status: 'ready', reason: null, computedAt: lastDay + DAY_MS, through: lastDay + DAY_MS, same: null, other: null, heldBtc: [], reconciliation: null, decisions };
+    const { service } = setup({ positions: [position], campaign: { view: () => running, replayView: () => replay } });
     const res = await service.report();
     expect(res.campaign).toEqual({ enabled: true, status: 'running', ownAccount: true });
     const link = res.rows[1];
     expect(link?.state).toBe('holding');
     expect(link?.holding).toMatchObject({ contracts: '5', addRef: '96', addRefSource: 'journal', addTrigger: '100.8', trailingLine: '90', tradeId: '7-LINK-USDT-SWAP' });
     expect(res.rows[0]?.plan?.warnings.map((w) => w.code)).toContain('CAMPAIGN_ACCOUNT');
+    // the regime shadow's decision travels with the coin's row (the light, BTC's readings, the thresholds and the coin's line), on a row without bars too; a coin it did not decide on has none
+    expect(res.rows[0]?.shadow).toEqual({ asOf: lastDay, state: 'RED', btcAtrPct: '0.07', btcFunding: '0.0002', params: DEFAULT_REGIME_PARAMS, coin: coin('BTC-USDT-SWAP') });
+    expect(link?.shadow).toBeNull();
+    expect(res.rows[2]).toMatchObject({ state: 'unavailable', shadow: { state: 'RED', coin: { instId: 'DOT-USDT-SWAP' } } });
+    // no replay result yet: no shadow
+    const before = setup({ campaign: { view: () => running, replayView: () => ({ ...replay, status: 'running', computedAt: null, decisions: null }) } });
+    expect((await before.service.report()).rows.map((r) => r.shadow)).toEqual([null, null, null]);
   });
 
   it('reads the bars again only after their cache time or across a close; no equity is said', async () => {

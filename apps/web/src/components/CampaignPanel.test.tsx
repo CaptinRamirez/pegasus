@@ -222,12 +222,15 @@ describe('CampaignPanel', () => {
 
   it('the replay: held BTC and both structures beside the pot, labelled by structure, and the rows that are not a match', async () => {
     await render(runningView, 'Replay through');
-    expect(ids()).toEqual(['value', 'banked', 'heldBtc', 'replaySame', 'replayOther']);
+    expect(ids()).toEqual(['value', 'banked', 'heldBtc', 'replaySame', 'replayOther', 'atr3', 'regime']);
     expect(chart.series.find((s) => s.id === 'replaySame')).toMatchObject({ color: '#3987e5', dashed: true });
     expect(chart.series.find((s) => s.id === 'value')).toMatchObject({ color: '#3987e5', dashed: false });
-    expect(texts(container, '.campaign-legend-label')).toEqual(['Pot value', 'Banked', 'Start value held in BTC', "Replay, pyramid (the pot's)", 'Replay, no-add']);
+    // the shadows: dashed, in hues of their own
+    expect(chart.series.find((s) => s.id === 'atr3')).toMatchObject({ color: '#a06be0', dashed: true });
+    expect(chart.series.find((s) => s.id === 'regime')).toMatchObject({ color: '#d65db1', dashed: true });
+    expect(texts(container, '.campaign-legend-label')).toEqual(['Pot value', 'Banked', 'Start value held in BTC', "Replay, pyramid (the pot's)", 'Replay, no-add', '3 ATR shadow', 'Regime shadow']);
     // the latest values, money in decimals
-    expect(texts(container, '.campaign-legend-item b')).toEqual(['175.75', '300.00', '62.25', '176.00', '99.00']);
+    expect(texts(container, '.campaign-legend-item b')).toEqual(['175.75', '300.00', '62.25', '176.00', '99.00', '150.00', '162.00']);
     expect(container.querySelector('.campaign-chart .campaign-replay-note')?.textContent).toBe(
       'Replay through the 2026-10-05 00:00 UTC close, computed 2026-10-05 00:02:00 UTC.',
     );
@@ -268,7 +271,7 @@ describe('CampaignPanel', () => {
       useStore.setState({ campaign: { ...runningView, replay: { status: 'failed', computedAt: replayReady.computedAt, mismatches: 2 }, serverTime: NOW + 1 } });
     });
     await flush(container, 'the earlier result is shown');
-    expect(ids()).toEqual(['value', 'banked', 'heldBtc', 'replaySame', 'replayOther']);
+    expect(ids()).toEqual(['value', 'banked', 'heldBtc', 'replaySame', 'replayOther', 'atr3', 'regime']);
     expect(container.querySelector('.campaign-chart .campaign-replay-note')?.textContent).toBe(`The last replay failed (${REPLAY_FAILURE}); the earlier result is shown.`);
     expect(texts(container, '.campaign-recon-counts .campaign-badge')[0]).toBe('match 3');
   });
@@ -357,7 +360,7 @@ describe('CampaignPanel', () => {
     expect(container.querySelector('.campaign-ran')?.textContent).toBe('3 / 20');
     expect(container.querySelector('.campaign-next-step')?.textContent).toContain('2 小时 30 分后');
     expect(texts(container, '.campaign-state')).toEqual(['持仓中', '外部平仓', '取回卖完', '强平', '离场']);
-    expect(texts(container, '.campaign-legend-label')).toEqual(['资金池估值', '已取回', '起始价值改持 BTC', '回放：浮盈加仓（本资金池）', '回放：不加仓']);
+    expect(texts(container, '.campaign-legend-label')).toEqual(['资金池估值', '已取回', '起始价值改持 BTC', '回放：浮盈加仓（本资金池）', '回放：不加仓', '影子：3 ATR', '影子：看天气']);
     expect(texts(container, '.campaign-recon-counts .campaign-badge')).toEqual(['一致 3', '有差异 1', '仅账本有 1', '仅回放有 0']);
   });
 });

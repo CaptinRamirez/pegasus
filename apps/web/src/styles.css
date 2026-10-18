@@ -579,6 +579,10 @@ a:hover { text-decoration: underline; }
 .sig-state-unavailable { color: var(--fg-dim); }
 .sig-row-entry .sig-coin-name, .sig-row-add .sig-coin-name, .sig-row-exit .sig-coin-name { color: var(--fg); }
 .sig-row-none .sig-coin-name, .sig-row-unavailable .sig-coin-name { color: var(--fg-muted); }
+/* the regime shadow's light on a coin: a dot after its name */
+.sig-light-GREEN .sig-coin-name::after, .sig-light-RED .sig-coin-name::after { content: ''; display: inline-block; width: 6px; height: 6px; margin-left: 4px; border-radius: 50%; vertical-align: middle; }
+.sig-light-GREEN .sig-coin-name::after { background: var(--up); }
+.sig-light-RED .sig-coin-name::after { background: var(--down); }
 
 .sig-card { display: flex; flex-direction: column; gap: 10px; padding: 10px 14px 14px; min-width: 0; container-type: inline-size; }
 .sig-card-head { display: flex; align-items: center; gap: 8px; }
@@ -591,6 +595,10 @@ a:hover { text-decoration: underline; }
 .sig-headline-near { color: var(--warn); }
 .sig-headline-none, .sig-headline-unavailable { color: var(--fg-muted); }
 .sig-sentence { margin: 0; font-size: 13px; line-height: 1.55; color: var(--fg); max-width: 920px; }
+.sig-shadow { color: var(--fg-muted); font-size: 12.5px; }
+.sig-shadow-labels { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.sig-shadow + .sig-shadow-labels { margin-top: -5px; }
+.sig-shadow-labels span { padding: 1px 6px; border: 1px solid var(--border); border-radius: var(--radius); font-size: 10.5px; color: var(--fg-muted); white-space: nowrap; }
 .sig-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; }
 @container (min-width: 760px) { .sig-facts { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 .sig-fact { display: flex; flex-direction: column; gap: 1px; min-width: 0; font-size: 12px; }

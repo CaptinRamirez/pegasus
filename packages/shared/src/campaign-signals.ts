@@ -1,4 +1,5 @@
-import type { CampaignServiceStatus } from './campaign-api.js';
+import type { CampaignServiceStatus, RegimeCoinView } from './campaign-api.js';
+import type { RegimeParams, RegimeState } from './campaign-regime.js';
 import type { CampaignStructure } from './campaign.js';
 import type { SignalSnapshot, TakeProfitLeg, TrailingExit } from './schemas.js';
 import type { Instrument, TdMode } from './types.js';
@@ -206,6 +207,22 @@ export interface CampaignSignalRow {
   signal: SignalSnapshot | null;
   /** For 'entry' and 'add': how to follow it */
   plan: CampaignFollowPlan | null;
+  /**
+   * The regime shadow's reading of this coin at its last daily close (docs/proposals/regime-snowball-v2.1.md 11.3),
+   * from the replay beside the pot; null (or absent) where no shadow runs: the campaign disabled, or no replay result yet
+   */
+  shadow?: CampaignShadowSignal | null;
+}
+
+/** The regime shadow at its last daily close, for one coin: the light, BTC's readings, the thresholds and the coin's decision. */
+export interface CampaignShadowSignal {
+  /** Open time of the daily bar whose close was decided on (the close is asOf + 1 day) */
+  asOf: number;
+  state: RegimeState;
+  btcAtrPct: string | null;
+  btcFunding: string | null;
+  params: RegimeParams;
+  coin: RegimeCoinView;
 }
 
 export interface CampaignSignalsResponse {

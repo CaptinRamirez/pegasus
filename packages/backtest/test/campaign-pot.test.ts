@@ -275,3 +275,15 @@ describe('a ledger file', () => {
   });
 });
 
+
+it('leaves the regime shadow out of a pot without BTC among its instruments: there is no light to read', async () => {
+  const r = await replayPot(input([], { instruments: [ADA, XRP] }), { fetchers: exchange(WORLD), cache: new MemoryCache() });
+  expect(r.regime).toBeNull();
+  expect(r.decisions).toBeNull();
+  expect(r.atr3.samples.length).toBeGreaterThan(0);
+  expect(r.notes.some((n) => n.includes('regime shadow'))).toBe(true);
+  // With BTC the shadows are there, and the regime one carries its decisions at the last daily close.
+  const withBtc = await replayPot(input(), { fetchers: exchange(WORLD), cache: new MemoryCache() });
+  expect(withBtc.regime?.samples.length).toBeGreaterThan(0);
+  expect(withBtc.decisions?.coins.map((c) => c.instId)).toEqual([BTC, ADA, XRP]);
+});

@@ -1,5 +1,5 @@
 import { normalizeOpenInterestHistory, type OkxOpenInterestHistoryRow } from '@pegasus/okx';
-import type { Candle, FundingRecord, Instrument, SignalPhase } from '@pegasus/shared';
+import { aggregateCandles, type Candle, type FundingRecord, type Instrument, type SignalPhase } from '@pegasus/shared';
 import type { InstrumentData, OiLevel } from '../types.js';
 import type { CacheStore } from './cache.js';
 
@@ -10,9 +10,10 @@ import type { CacheStore } from './cache.js';
  * without a network in the tests.
  */
 
-export type HistoryBar = '1Dutc' | '12Hutc';
+export type HistoryBar = '1Dutc' | '12Hutc' | '4H';
 
-const BAR_MS: Record<HistoryBar, number> = { '1Dutc': 86_400_000, '12Hutc': 43_200_000 };
+const BAR_MS: Record<HistoryBar, number> = { '1Dutc': 86_400_000, '12Hutc': 43_200_000, '4H': 14_400_000 };
+const HOUR_MS = 3_600_000;
 /**
  * Where the first funding page starts. Perpetual swaps on the proxy venue began in September 2019; a
  * start time of 0 is not usable (Binance reads it as absent and answers with the newest rows).
@@ -50,6 +51,12 @@ export interface LoadOptions {
   now: number;
   /** Ignore what is cached and download everything again */
   refresh: boolean;
+  /**
+   * UTC hour of the daily close. Absent or 0: the exchange's own daily and 12-hour bars. Otherwise (a multiple of
+   * four) both are built from its 4-hour candles: the daily bars open and close at that hour, the 12-hour bars at
+   * it and 12 hours later.
+   */
+  cutHour?: number;
   log?: (message: string) => void;
 }
 
@@ -184,8 +191,16 @@ export async function loadData(opts: LoadOptions, fetchers: Fetchers, cache: Cac
   const needHalfDays = opts.phases.some((phase) => phase !== 0);
   for (const instId of opts.instIds) {
     const inst = await loadInstrument(instId, fetchers, cache, opts.refresh);
-    const daily = await loadCandles(instId, '1Dutc', fetchers, cache, opts.refresh);
-    const halfDay = needHalfDays ? await loadCandles(instId, '12Hutc', fetchers, cache, opts.refresh) : [];
+    let daily: Candle[];
+    let halfDay: Candle[];
+    if (opts.cutHour !== undefined && opts.cutHour !== 0) {
+      const fourHour = await loadCandles(instId, '4H', fetchers, cache, opts.refresh);
+      daily = aggregateCandles(fourHour, BAR_MS['4H'], BAR_MS['1Dutc'], opts.cutHour * HOUR_MS);
+      halfDay = aggregateCandles(fourHour, BAR_MS['4H'], BAR_MS['12Hutc'], (opts.cutHour % 12) * HOUR_MS);
+    } else {
+      daily = await loadCandles(instId, '1Dutc', fetchers, cache, opts.refresh);
+      halfDay = needHalfDays ? await loadCandles(instId, '12Hutc', fetchers, cache, opts.refresh) : [];
+    }
     log(`${instId}: ${daily.length} daily bars${needHalfDays ? `, ${halfDay.length} half-day bars` : ''}`);
 
     let funding: FundingRecord[] | null = null;

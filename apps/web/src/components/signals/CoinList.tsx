@@ -39,7 +39,7 @@ export function CoinList({ rows, selected, instruments, onSelect }: Props) {
             type="button"
             role="option"
             aria-selected={row.instId === selected}
-            className={`sig-coin sig-row-${row.state}${row.instId === selected ? ' active' : ''}`}
+            className={`sig-coin sig-row-${row.state}${row.instId === selected ? ' active' : ''}${row.shadow === null || row.shadow === undefined ? '' : ` sig-light-${row.shadow.state}`}`}
             onClick={() => onSelect(row.instId)}
           >
             <span className="sig-coin-name">{coinOf(row.instId)}</span>

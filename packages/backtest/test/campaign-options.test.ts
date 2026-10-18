@@ -92,3 +92,35 @@ describe('campaign command line', () => {
     expect(() => parseCampaignCli(['--reconcile', 'ledger.json', '--atr-leverage', '3'])).toThrow(UsageError);
   });
 });
+
+describe('the regime flags (C17 to C19)', () => {
+  it('--regime takes the defaults, the other flags refine them and go with it only', () => {
+    expect(parseCampaignCli([]).config.params.regime).toBeUndefined();
+    expect(parseCampaignCli(['--regime']).config.params.regime).toEqual({ vetoFunding: '0.001', vetoWild: '0.06', cooldownDays: 10, thinMargin: '0.01', pendingBars: 5, entry: 'either' });
+    const refined = parseCampaignCli(['--regime', '--veto-funding', '0.0005', '--veto-wild', '0.05', '--cooldown-days', '20', '--thin-margin', '0.02', '--pending-bars', '3', '--entry', 'accept']);
+    expect(refined.config.params.regime).toEqual({ vetoFunding: '0.0005', vetoWild: '0.05', cooldownDays: 20, thinMargin: '0.02', pendingBars: 3, entry: 'accept' });
+    expect(() => parseCampaignCli(['--veto-wild', '0.05'])).toThrow(/--veto-wild go with --regime only/);
+    expect(() => parseCampaignCli(['--regime', '--entry', 'maybe'])).toThrow(UsageError);
+    expect(() => parseCampaignCli(['--regime', '--thin-margin', '1'])).toThrow(UsageError);
+    expect(() => parseCampaignCli(['--check', 'run.json', '--regime'])).toThrow(UsageError);
+    expect(() => parseCampaignCli(['--reconcile', 'l.json', '--regime'])).toThrow(UsageError);
+  });
+
+  it('--cut-hour moves the daily close to a 4-hour boundary, never with --check or --reconcile', () => {
+    expect(parseCampaignCli([]).config).not.toHaveProperty('cutHour');
+    expect(parseCampaignCli(['--cut-hour', '0']).config).not.toHaveProperty('cutHour');
+    expect(parseCampaignCli(['--cut-hour', '20']).config.cutHour).toBe(20);
+    expect(() => parseCampaignCli(['--cut-hour', '3'])).toThrow(/0, 4, 8, 12, 16 or 20/);
+    expect(() => parseCampaignCli(['--cut-hour', 'noon'])).toThrow(UsageError);
+    expect(() => parseCampaignCli(['--check', 'ref.json', '--cut-hour', '20'])).toThrow(UsageError);
+    expect(() => parseCampaignCli(['--reconcile', 'l.json', '--cut-hour', '20'])).toThrow(UsageError);
+    expect(CAMPAIGN_HELP).toContain('--cut-hour');
+  });
+
+  it('--funding-source picks the venue of the settlements', () => {
+    expect(parseCampaignCli([]).fundingSource).toBe('binance');
+    expect(parseCampaignCli(['--funding-source', 'okx']).fundingSource).toBe('okx');
+    expect(() => parseCampaignCli(['--funding-source', 'ftx'])).toThrow(UsageError);
+    expect(() => parseCampaignCli(['--check', 'run.json', '--funding-source', 'okx'])).toThrow(UsageError);
+  });
+});

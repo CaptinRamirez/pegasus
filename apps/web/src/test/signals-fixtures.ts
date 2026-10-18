@@ -1,11 +1,13 @@
-import type {
-  CampaignFollowPlan,
-  CampaignSignalBar,
-  CampaignSignalRow,
-  CampaignSignalsResponse,
-  Instrument,
-  SignalSnapshot,
-  TrailingView,
+import {
+  DEFAULT_REGIME_PARAMS,
+  type CampaignFollowPlan,
+  type CampaignShadowSignal,
+  type CampaignSignalBar,
+  type CampaignSignalRow,
+  type CampaignSignalsResponse,
+  type Instrument,
+  type SignalSnapshot,
+  type TrailingView,
 } from '@pegasus/shared';
 import { BTC, ETH, NOW, inst } from './campaign-fixtures';
 
@@ -282,6 +284,19 @@ export const campaignAccountResponse: CampaignSignalsResponse = {
   campaign: { enabled: true, status: 'running', ownAccount: true },
   rows: signalRows.map((r) => (r.plan === null ? r : { ...r, plan: { ...r.plan, warnings: [{ code: 'CAMPAIGN_ACCOUNT', params: {} }, ...r.plan.warnings] } })),
 };
+
+/** The regime shadow's reading of BTC at the last daily close: green light, no signal, a line tested five times, no cooldown */
+export const btcShadow: CampaignShadowSignal = {
+  asOf: DAILY_TS,
+  state: 'GREEN',
+  btcAtrPct: '0.025',
+  btcFunding: '0.000048',
+  params: DEFAULT_REGIME_PARAMS,
+  coin: { instId: 'BTC-USDT-SWAP', entry: null, skip: 'no-signal', close: '81808', entryHigh: '87245', margin: '-0.062319', atrPct: '0.025', funding: '0.000048', cooldownUntil: null, pending: null, tests: 5, vetoes: [] },
+};
+
+/** The same read with the regime shadow beside BTC (an API that runs it) */
+export const shadowResponse: CampaignSignalsResponse = { ...signalsResponse, rows: signalRows.map((r) => (r.instId === 'BTC-USDT-SWAP' ? { ...r, shadow: btcShadow } : r)) };
 
 /** ADA as OKX lists it: lots of a tenth of a contract */
 export const ADA_TENTHS: Instrument = { ...ADA, lotSz: '0.1', minSz: '0.1', maxLever: '50' };

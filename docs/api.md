@@ -58,7 +58,7 @@ Request bodies are validated with the zod schemas in `packages/shared/src/schema
 | POST | `/api/risk/kill-switch` | `KillSwitchRequest` (`{ enabled, reason?, rebase? }`) | `RiskState` (`cancelSweep` already reflects the new switch position); `409 DAILY_LOSS_ACTIVE` for a release without `rebase` while the daily loss limit is breached |
 | GET | `/api/campaign` | – | `CampaignView`: the campaign's status, pot, campaigns, bankings, samples and execution errors (see "Campaign"); `status: 'disabled'` while it is not enabled |
 | GET | `/api/campaign/log` | `?before&limit` (both optional; `limit` 1 to 100, default 20) | `CampaignLogPage`: `{ steps, total, next }`, the campaign's decision log newest first (see "Campaign") |
-| GET | `/api/campaign/replay` | – | `CampaignReplayView`: the replay beside the pot, its other structure, the pot's start value held in BTC and the reconciliation of the ledger with the replay, as last computed (see "The replay beside the pot"); `status: 'unavailable'` while there is no pot |
+| GET | `/api/campaign/replay` | – | `CampaignReplayView`: the replay beside the pot, its other structure, the pot's start value held in BTC, the reconciliation of the ledger with the replay and the shadows of the regime proposal, as last computed (see "The replay beside the pot"); `status: 'unavailable'` while there is no pot |
 | POST | `/api/campaign/replay` | – (a body, if any, is ignored) | `202` `CampaignReplayView` as it is now: a computation was started in the background (or one runs and another follows it); `200` with `status: 'unavailable'` when there is nothing to replay. The `campaign` message says when the new result is there |
 | GET | `/api/campaign/signals` | `?riskPct&equity` (both optional: `riskPct` a fraction below 1, default `0.01`; `equity` a positive decimal, default the account's total equity) | `CampaignSignalsResponse`: the campaign rule read per coin for every instrument of `CAMPAIGN_INSTRUMENTS`, an `entry` or an `add` with a plan to follow it by hand (see "Campaign signals"); answers while the campaign is disabled too |
 | GET | `/api/journal` | `?status&instId&source&before&limit` (all optional; `status` `open` or `closed`, `source` `manual`, `signal`, `campaign` or `external`, `before` a trade's `seq`, `limit` 1 to 200, default 50) | `JournalPage`: `{ status, reason, trades, total, next, serverTime }`, the trades of the trade journal newest first, without their fills and timeline (see "Trade journal") |
@@ -757,6 +757,17 @@ filled at the open of the bar running after it, as the live service trades right
 close over the price at the start (`btcMarkAtStart`, or when that is empty the close of the last 12-hour bar before
 the start).
 
+Beside them, the shadows of `docs/proposals/regime-snowball-v2.1.md` 11.3, on the same pot from the same start, and
+placing no orders: `atr3` replays the pot's structure with the leverage of every entry set so that the liquidation sits
+3 ATRs below it, and `regime` adds the regime layers to that (`DEFAULT_REGIME_PARAMS` of
+`packages/shared/src/campaign-regime.ts`: BTC's light, the funding and wild-market vetoes, the cooldown after a
+liquidation, the acceptance or retest of a thin breakout; `mode` on its campaigns says how an entry was taken).
+`decisions` is what the `regime` shadow decided at its last daily close (`asOf`, the open time of that bar), one line
+per instrument (`RegimeView`, `packages/shared/src/campaign-api.ts`): the light (`state`) with BTC's `btcAtrPct` and
+`btcFunding` behind it, the thresholds (`params`), and per coin the `entry` decided or why there was none (`skip`),
+the channel high and the `margin` over it, `atrPct`, `funding`, `cooldownUntil`, a `pending` thin breakout, the
+`tests` of the high and the `vetoes`. All three are null before the first result.
+
 It is computed in the background, never in a step's way: after every step that processed a 00:00 UTC close, once at
 start when a pot exists, when the pot starts, and on `POST /api/campaign/replay`. One computation at a time (one asked
 for while another runs follows it, once); one that takes more than 5 minutes is given up (`REPLAY_TIMEOUT`) and the
@@ -777,6 +788,9 @@ interface CampaignReplayView {
   other: CampaignReplayRun | null;  // the other structure, same start, same pot
   heldBtc: Array<{ ts: number; value: string }>; // one per 12-hour close from the first after the start to `through`
   reconciliation: CampaignReconciliation | null; // the ledger against `same`
+  atr3?: CampaignReplayRun | null;  // the shadow: the pot's structure at 3 ATR leverage (regime-snowball-v2.1.md 11.3); null before the first result
+  regime?: CampaignReplayRun | null; // that with the regime layers
+  decisions?: RegimeView | null;    // the regime shadow's decisions at its last daily close (packages/shared/src/campaign-api.ts)
 }
 interface CampaignReplayRun {
   structure: 'pyramid' | 'noadd';
@@ -792,6 +806,7 @@ interface CampaignReplayCampaign {
   entryTs: number;                  // the open it was filled at: the close after the signal
   entryPx: string;                  // the fill: that open x (1 + slippage)
   stake: string; adds: number;
+  mode?: 'breakout' | 'acceptance' | 'retest'; // the regime shadow: how the entry was taken
   end: 'exit' | 'liquidated' | 'open'; // a campaign the sale of a harvest closed is listed as 'exit' (its multiple holds what the harvests banked)
   endTs: number | null;             // open time of the 12-hour bar it ended in (an exit: the open it was filled at, the close of its signal)
   multiple: string | null;          // all it returned over its stake; null while open
@@ -928,6 +943,14 @@ by the page.
   limitPx, leverage } (an add: the position's liquidation after it, at its leverage setting, is above `limitPx`),
   `NOT_TRACKED` {} (an order on it is refused with `UNKNOWN_INSTRUMENT` until it is in `INSTRUMENTS`),
   `CAMPAIGN_ACCOUNT` {}, `KILL_SWITCH` {}.
+- `shadow` (`CampaignShadowSignal`): the regime shadow's reading of the coin, taken from `decisions` of the replay
+  beside the pot (`GET /api/campaign/replay`; `docs/proposals/regime-snowball-v2.1.md` 11.3): `asOf` (the open time
+  of the daily bar whose close it decided on), the light `state` (`GREEN` / `RED`) with `btcAtrPct` and `btcFunding`
+  behind it, the thresholds `params`, and `coin`, the coin's `RegimeCoinView` line (the `entry` decided or the `skip`
+  reason, the channel high and the `margin` over it, `atrPct`, `funding`, `cooldownUntil`, a `pending` thin breakout,
+  the `tests` of the high and the `vetoes`). It places no orders. null when no campaign service runs on this API,
+  before its replay's first result, and for a coin the shadow has no decision on; a row whose bars could not be read
+  (`unavailable`) still carries it.
 - The response: `{ generatedAt, params, thresholds, riskPct, equity, equitySource, campaign, rows }`. `thresholds`:
   `{ nearPct: '0.03', stopWidePct: '0.2', stopNarrowPct: '0.02', farAbovePct: '0.05', liqBufferPct: '0.01' }`.
   `equitySource` is `request`, `account` or null. `campaign`: `{ enabled, status, ownAccount }`; `ownAccount` is true

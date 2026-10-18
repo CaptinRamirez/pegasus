@@ -9,7 +9,9 @@ import { DASH, fmtUtcMinute } from '../../lib/format';
  * A colour per entity, never per rank: the pot's own structure is blue (its value solid, its replay dashed), the
  * other structure orange (dashed), the start value held in BTC aqua, the banked total yellow. These are the dark
  * slots 1-4 of the dataviz reference palette, checked with its validator on the panel's surface #10141c: every check
- * passes, and the closest pair (yellow and aqua) carries the second encoding it needs in the legend's labels.
+ * passes, and the closest pair (yellow and aqua) carries the second encoding it needs in the legend's labels. The two
+ * shadows (computed, never traded) are dashed in the purple family: violet for the 3 ATR leverage, magenta for the
+ * regime layers; both above 4.5:1 on the surface.
  */
 export const LINE_STYLE: Record<ChartLineId, { color: string; dashed: boolean }> = {
   value: { color: '#3987e5', dashed: false },
@@ -17,6 +19,8 @@ export const LINE_STYLE: Record<ChartLineId, { color: string; dashed: boolean }>
   replayOther: { color: '#d95926', dashed: true },
   heldBtc: { color: '#199e70', dashed: false },
   banked: { color: '#c98500', dashed: false },
+  atr3: { color: '#a06be0', dashed: true },
+  regime: { color: '#d65db1', dashed: true },
 };
 
 /** A line's name in the legend; a replay line is named by the structure it ran. */
@@ -28,6 +32,10 @@ export function lineLabel(line: ChartLine, t: Messages): string {
       return t.campaign.line.banked;
     case 'heldBtc':
       return t.campaign.line.heldBtc;
+    case 'atr3':
+      return t.campaign.line.atr3;
+    case 'regime':
+      return t.campaign.line.regime;
     case 'replaySame':
     case 'replayOther':
       return t.campaign.replayLine(line.structure === null ? '' : labelOf(t.campaign.structureLabel, line.structure), line.id === 'replaySame');

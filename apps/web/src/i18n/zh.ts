@@ -528,6 +528,33 @@ export const zh: Messages = {
       killSwitch: '紧急停止已开启：开仓订单会被拒绝，因此无法跟随任何信号。',
       exitsUnavailable: '止盈和移动止损只在纸面交易和本地模拟交易所中提供。跟随信号需要挂出移动止损，因此此处禁止按信号开仓。',
     },
+    shadow: {
+      light: { GREEN: '绿灯', RED: '红灯' },
+      sentence: {
+        breakout: (s) => `${s.light}｜进场：收盘 ${s.close} 高出线 ${s.line} ${s.margin}｜半注`,
+        acceptance: (s) => `${s.light}｜进场（接受）：收盘 ${s.close} 守住了 pending 线 ${s.level}｜半注`,
+        retest: (s) => `${s.light}｜进场（回踩）：最低价回到线 ${s.level} 附近，收盘 ${s.close} 守住｜半注`,
+        'no-signal': (s) => `${s.light}｜无信号｜等收盘 ≥ ${s.need}（线 ${s.line} + ${s.thin}）；${s.line}–${s.need} 之间记 pending，次日仍在线上就进`,
+        'no-channel': (s) => `${s.light}｜无信号｜通道还没满`,
+        thin: (s) => `${s.light}｜薄突破：收盘 ${s.close} 只高出线 ${s.line} ${s.margin}——记 pending，明天收盘仍在 ${s.line} 上就进`,
+        'pending-wait': (s) => `${s.light}｜等待：pending 线 ${s.level}，还剩 ${s.barsLeft} 根；回踩到 ${s.retestTo} 内并收在线上就进`,
+        'regime-red': (s) => {
+          const why = [s.btcFunding === '' ? '' : `BTC 资金费 ${s.btcFunding}/8h（≥ ${s.vetoFunding}）`, s.btcAtr === '' ? '' : `BTC ATR ${s.btcAtr}（≥ ${s.vetoWild}）`].filter((x) => x !== '').join('或');
+          return `${s.light}${why === '' ? '' : `——${why}`}｜不开新仓`;
+        },
+        'veto-funding': (s) => `${s.light}｜等待：本币资金费 ${s.funding}/8h ≥ ${s.vetoFunding}`,
+        'veto-wild': (s) => `${s.light}｜等待：本币 ATR ${s.atr} ≥ ${s.vetoWild}`,
+        'veto-cooldown': (s) => `${s.light}｜等待：强平冷却到 ${s.cooldownUntil}`,
+        open: (s) => `${s.light}｜持仓中：影子已在场内`,
+        cash: (s) => `${s.light}｜现金不够最小投入`,
+        'min-size': (s) => `${s.light}｜投入买不到最小张数`,
+      },
+      asOf: (close) => `按 ${close} 收盘`,
+      atr: (v) => `ATR ${v}`,
+      funding: (v) => `资金费 ${v}/8h`,
+      tests: (n) => `线被试 ${n} 次`,
+      cooldown: (until) => `冷却到 ${until}`,
+    },
   },
 
   follow: {
@@ -974,7 +1001,7 @@ export const zh: Messages = {
 
     chart: '资金池估值',
     chartEmpty: '尚未处理任何收盘：曲线从第一步开始。',
-    line: { value: '资金池估值', banked: '已取回', heldBtc: '起始价值改持 BTC' },
+    line: { value: '资金池估值', banked: '已取回', heldBtc: '起始价值改持 BTC', atr3: '影子：3 ATR', regime: '影子：看天气' },
     replayLine: (structure, own) => (own ? `回放：${structure}（本资金池）` : `回放：${structure}`),
     latest: '最新',
     replayOff: '回放不可用：资金池尚未启动。',

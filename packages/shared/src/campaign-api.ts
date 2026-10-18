@@ -1,4 +1,5 @@
 import type { CampaignSignals, CampaignStructure } from './campaign.js';
+import type { RegimeEntry, RegimeParams, RegimeSkip, RegimeState, RegimeVeto } from './campaign-regime.js';
 
 /**
  * What the API's campaign service (apps/api/src/services/campaign.ts) keeps about the pot it runs on the paper
@@ -394,6 +395,50 @@ export interface CampaignReplayView {
   heldBtc: CampaignValueSample[];
   /** The ledger against `same` */
   reconciliation: CampaignReconciliation | null;
+  /**
+   * The shadows (docs/proposals/regime-snowball-v2.1.md 11.3): the pot's structure with the leverage set so that the
+   * liquidation sits 3 ATRs below the entry (`atr3`), and that plus the regime layers (`regime`); same start, same
+   * pot, no orders. null before the first result, and on an API without them.
+   */
+  atr3?: CampaignReplayRun | null;
+  regime?: CampaignReplayRun | null;
+  /** What the regime shadow decided at its last daily close, instrument by instrument; null before the first result */
+  decisions?: RegimeView | null;
+}
+
+/** The regime shadow at one daily close (campaign-regime.ts), for the SIGNALS tab: one line per instrument. */
+export interface RegimeView {
+  /** Open time of the daily bar whose close was decided on (the close is asOf + 1 day) */
+  asOf: number;
+  state: RegimeState;
+  /** BTC's readings behind the light; null when not known */
+  btcAtrPct: string | null;
+  btcFunding: string | null;
+  params: RegimeParams;
+  coins: RegimeCoinView[];
+}
+
+export interface RegimeCoinView {
+  instId: string;
+  /** The entry the close decided; null for none */
+  entry: RegimeEntry | null;
+  /** Why there was no entry: the regime's reasons, 'open' for an instrument with a campaign, 'cash' / 'min-size' as the pot skipped it */
+  skip: RegimeSkip | 'open' | 'cash' | 'min-size' | null;
+  close: string;
+  /** The entry channel's high; null without the channel */
+  entryHigh: string | null;
+  /** close / entryHigh - 1 */
+  margin: string | null;
+  atrPct: string | null;
+  /** Funding mean per 8 hours over the last 3 days; null when fewer than FUNDING_MIN_RECORDS settlements are known */
+  funding: string | null;
+  /** The close until which the instrument is in cooldown after a liquidation; null when it is not */
+  cooldownUntil: number | null;
+  /** A thin breakout's level kept for the acceptance or the retest, with the closes it is still kept for */
+  pending: { level: string; barsLeft: number } | null;
+  /** Tests of the channel high in the entry channel's bars (channelTests) */
+  tests: number | null;
+  vetoes: RegimeVeto[];
 }
 
 export interface CampaignValueSample {
@@ -421,6 +466,8 @@ export interface CampaignReplayCampaign {
   instId: string;
   /** Open time of the daily bar whose close gave the entry signal, as CampaignRecord.signalTs: the signal close is signalTs + 1 day */
   signalTs: number;
+  /** How the signal was taken (the regime shadow: acceptance or retest of a thin breakout); absent on an API without it */
+  mode?: RegimeEntry;
   /** When the replay filled the entry (the open after the signal) */
   entryTs: number;
   entryPx: string;

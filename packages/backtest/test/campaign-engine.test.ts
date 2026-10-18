@@ -1,8 +1,8 @@
-import { D, dailyBarsFromHalfDays, Decimal, DEFAULT_POT_PARAMS, sameCloseOrder, type Candle, type FundingRecord, type PotParams } from '@pegasus/shared';
+import { aggregateCandles, D, dailyBarsFromHalfDays, Decimal, DEFAULT_POT_PARAMS, DEFAULT_REGIME_PARAMS, sameCloseOrder, type CampaignParams, type Candle, type FundingRecord, type PotParams } from '@pegasus/shared';
 import { describe, expect, it } from 'vitest';
 import { runCampaigns } from '../src/campaign/engine.js';
 import { DEFAULT_CAMPAIGN_COSTS } from '../src/campaign/options.js';
-import type { Banking, CampaignConfig, CampaignRecord, CampaignResult } from '../src/campaign/types.js';
+import type { Banking, CampaignConfig, CampaignInstrument, CampaignRecord, CampaignResult } from '../src/campaign/types.js';
 import { config, data, day, EXIT_DAY, FLAT_DAY, halves, NOADD, QUIET, RISE_AND_EXIT, SETUP, SHORT, SIGNAL_DAY, type Row } from './campaign-helpers.js';
 import { bar, DAY, HALF_DAY, HOUR, instrument, T0 } from './helpers.js';
 
@@ -720,5 +720,120 @@ describe('C16: the leverage from the ATR (experiment)', () => {
     const atr1 = config({ params: { ...SHORT, atrLeverage: '1' } });
     expect(only(runCampaigns([data([...SETUP, [100, 100.5, 91.01, 95]])], atr1)).end).toBe('end-of-data');
     expect(only(runCampaigns([data([...SETUP, [100, 100.5, 90.99, 95]])], atr1)).end).toBe('liquidated');
+  });
+});
+
+describe('C17 to C19: the regime layers (params.regime)', () => {
+  const LAYERS = { ...DEFAULT_REGIME_PARAMS, cooldownDays: 2, pendingBars: 2 };
+  const REGIME: CampaignParams = { ...SHORT, regime: LAYERS };
+  const regime = (over: Partial<CampaignConfig> = {}): CampaignConfig => config({ params: REGIME, ...over });
+  const btc = (rows: readonly Row[], over: Partial<CampaignInstrument> = {}): CampaignInstrument => data(rows, { inst: instrument('BTC-USDT-SWAP'), ...over });
+  /** Day 3 closes at 101.5 over the channel's 101: a thin breakout (0.5%, under the 1% margin). */
+  const THIN_DAY: readonly Row[] = [
+    [100, 100.8, 99.5, 100.5],
+    [100.5, 101.6, 100, 101.5],
+  ];
+  const THIN_SETUP: readonly Row[] = [...FLAT_DAY, ...FLAT_DAY, ...FLAT_DAY, ...THIN_DAY];
+  /** 0.2% every 8 hours from three days before the data: hot. */
+  const HOT: FundingRecord[] = Array.from({ length: 40 }, (_, i) => ({ fundingTime: T0 - 3 * DAY + i * 8 * HOUR, fundingRate: '0.002' }));
+  const FLAT_WEEK: readonly Row[] = [...FLAT_DAY, ...FLAT_DAY, ...FLAT_DAY, ...FLAT_DAY, QUIET];
+
+  it('needs BTC among the instruments; the approved rule is untouched without it', () => {
+    expect(() => runCampaigns([data(SETUP)], regime())).toThrow('BTC-USDT-SWAP');
+    const plain = runCampaigns([data([...SETUP, QUIET])], config());
+    expect(only(plain).mode).toBe('breakout');
+    expect(plain.regime).toBeNull();
+  });
+
+  it('takes a breakout at or over the thin margin as C1 does and says how', () => {
+    const result = runCampaigns([btc([...SETUP, QUIET])], regime());
+    expect(only(result)).toMatchObject({ mode: 'breakout', signalTs: day(3), entryTime: day(4) });
+    expect(result.signals).toEqual([{ instId: 'BTC-USDT-SWAP', signalTs: day(3), outcome: 'taken' }]);
+    expect(result.regime).toMatchObject({ asOf: day(3), state: 'GREEN', btcAtrPct: null, btcFunding: null, params: LAYERS });
+    expect(result.regime?.coins[0]).toMatchObject({ instId: 'BTC-USDT-SWAP', entry: 'breakout', skip: null, entryHigh: '101', close: '103', tests: 3, vetoes: [], pending: null, cooldownUntil: null });
+  });
+
+  it('C17: a thin breakout sets the level and enters at the next close above it (the acceptance)', () => {
+    // Day 4 closes at 101.8: above the level 101, and thinly above its own channel (101.6), which does not move the level.
+    const result = runCampaigns([btc([...THIN_SETUP, [101.5, 101.9, 101.2, 101.6], [101.6, 102, 101.3, 101.8], QUIET])], regime());
+    expect(only(result)).toMatchObject({ mode: 'acceptance', signalTs: day(4), entryTime: day(5) });
+    expect(result.signals).toEqual([
+      { instId: 'BTC-USDT-SWAP', signalTs: day(3), outcome: 'skipped', rule: 'thin' },
+      { instId: 'BTC-USDT-SWAP', signalTs: day(4), outcome: 'taken' },
+    ]);
+  });
+
+  it('C17: the level stays pending while the close is not above it, and the decision says so', () => {
+    const result = runCampaigns([btc([...THIN_SETUP, [101.5, 101.6, 100.3, 100.8], [100.8, 101, 100.2, 100.5]])], regime());
+    expect(result.campaigns).toHaveLength(0);
+    expect(result.regime?.coins[0]).toMatchObject({ entry: null, skip: 'pending-wait', pending: { level: '101', barsLeft: 1 } });
+  });
+
+  it('C18, C19: the retest enters at a close back at the level and above it while the level is kept; accept has no retest', () => {
+    const rows: Row[] = [...THIN_SETUP, [101.5, 101.6, 100.3, 100.8], [100.8, 101, 100.2, 100.5], [100.5, 101.2, 100.4, 101], [101, 101.4, 100.9, 101.3], QUIET];
+    const result = runCampaigns([btc(rows)], regime());
+    expect(only(result)).toMatchObject({ mode: 'retest', signalTs: day(5), entryTime: day(6) });
+    const accept = runCampaigns([btc(rows)], regime({ params: { ...SHORT, regime: { ...LAYERS, entry: 'accept' } } }));
+    expect(accept.campaigns).toHaveLength(0);
+    expect(accept.regime?.coins[0]).toMatchObject({ skip: 'pending-wait', pending: { level: '101', barsLeft: 0 } });
+  });
+
+  it('C17: a liquidation puts the instrument in cooldown: a signal within cooldownDays is not taken, the next one is', () => {
+    // Entered at the open of day 4 and liquidated inside it (low 85); day 5 closes at a new high two days after, day 6 three days after.
+    const rows: Row[] = [...SETUP, [100, 100.5, 85, 95], [95, 96, 94, 95], [95, 100, 94, 99], [99, 111, 98, 110], [110, 112, 109, 111], [111, 114, 110, 113], QUIET];
+    const result = runCampaigns([btc(rows)], regime());
+    expect(result.campaigns).toHaveLength(2);
+    expect(result.campaigns[0]).toMatchObject({ end: 'liquidated', endTime: day(4) });
+    expect(result.campaigns[1]).toMatchObject({ mode: 'breakout', signalTs: day(6), entryTime: day(7) });
+    expect(result.signals).toEqual([
+      { instId: 'BTC-USDT-SWAP', signalTs: day(3), outcome: 'taken' },
+      { instId: 'BTC-USDT-SWAP', signalTs: day(5), outcome: 'skipped', rule: 'veto-cooldown' },
+      { instId: 'BTC-USDT-SWAP', signalTs: day(6), outcome: 'taken' },
+    ]);
+    expect(result.regime?.coins[0]?.cooldownUntil).toBe(day(6));
+  });
+
+  it('C17: a red light on BTC keeps every instrument from entering, and the decisions say why', () => {
+    const result = runCampaigns([btc(FLAT_WEEK, { funding: HOT }), data([...SETUP, QUIET])], regime({ funding: false }));
+    expect(result.campaigns).toHaveLength(0);
+    expect(result.signals).toEqual([{ instId: 'AAA-USDT-SWAP', signalTs: day(3), outcome: 'skipped', rule: 'regime-red' }]);
+    expect(result.regime).toMatchObject({ state: 'RED', btcFunding: '0.002' });
+    expect(result.regime?.coins.map((c) => [c.instId, c.skip])).toEqual([
+      ['BTC-USDT-SWAP', 'no-signal'],
+      ['AAA-USDT-SWAP', 'regime-red'],
+    ]);
+  });
+
+  it('C17: an instrument with hot funding is vetoed while the light stays green', () => {
+    const result = runCampaigns([btc(FLAT_WEEK), data([...SETUP, QUIET], { funding: HOT })], regime({ funding: false }));
+    expect(result.campaigns).toHaveLength(0);
+    expect(result.signals).toEqual([{ instId: 'AAA-USDT-SWAP', signalTs: day(3), outcome: 'skipped', rule: 'veto-funding' }]);
+    expect(result.regime).toMatchObject({ state: 'GREEN' });
+    expect(result.regime?.coins[1]).toMatchObject({ instId: 'AAA-USDT-SWAP', skip: 'veto-funding', funding: '0.002', vetoes: ['veto-funding'] });
+  });
+});
+
+describe('cutHour: daily bars that close at another hour of the UTC day', () => {
+  it('replays bars anchored at 20:00 UTC exactly as the same bars anchored at 00:00, shifted', () => {
+    const cfg = config({ mode: 'pot', params: NOADD, pot: { ...DEFAULT_POT_PARAMS, start: '10', minStake: '1' } });
+    const base = runCampaigns([data(RISE_AND_EXIT)], cfg);
+    const shift = 20 * HOUR;
+    const halfDay = halves(RISE_AND_EXIT, T0 + shift);
+    const shifted = runCampaigns([{ inst: instrument(), halfDay, daily: aggregateCandles(halfDay, HALF_DAY, DAY, shift), funding: null }], { ...cfg, cutHour: 20 });
+    expect(base.campaigns).toHaveLength(1);
+    expect(shifted.campaigns.map((c) => ({ ...c, signalTs: c.signalTs - shift, entryTime: c.entryTime - shift, endTime: c.endTime - shift }))).toEqual(base.campaigns);
+    expect(shifted.bankings.map((b) => ({ ...b, ts: b.ts - shift }))).toEqual(base.bankings);
+    // the pot is sampled at the cut, once a day
+    expect(shifted.pot.length).toBe(base.pot.length);
+    expect(shifted.pot.map((s) => s.ts - shift)).toEqual(base.pot.map((s) => s.ts));
+    expect(shifted.pot.every((s) => s.ts % DAY === shift)).toBe(true);
+    expect(shifted.pot.map((s) => s.value)).toEqual(base.pot.map((s) => s.value));
+  });
+
+  it('without the cut, bars anchored at 20:00 are never sampled: the cut must match the bars', () => {
+    const halfDay = halves(RISE_AND_EXIT, T0 + 20 * HOUR);
+    const result = runCampaigns([{ inst: instrument(), halfDay, daily: aggregateCandles(halfDay, HALF_DAY, DAY, 20 * HOUR), funding: null }], config({ mode: 'pot', params: NOADD, pot: { ...DEFAULT_POT_PARAMS, start: '10', minStake: '1' } }));
+    expect(result.campaigns).toHaveLength(1);
+    expect(result.pot).toEqual([]);
   });
 });

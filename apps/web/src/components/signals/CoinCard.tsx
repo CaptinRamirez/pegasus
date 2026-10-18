@@ -1,10 +1,10 @@
 import type { ReactNode } from 'react';
-import type { CampaignFollowPlan, CampaignPlanWarningCode, CampaignSignalRow, CampaignSignalsResponse, Instrument } from '@pegasus/shared';
+import { ceilToStep, D, type CampaignFollowPlan, type CampaignPlanWarningCode, type CampaignShadowSignal, type CampaignSignalRow, type CampaignSignalsResponse, type Instrument } from '@pegasus/shared';
 import { useT, type Messages } from '../../i18n';
-import type { SignalContext } from '../../i18n/en';
+import type { ShadowCase, ShadowText, SignalContext } from '../../i18n/en';
 import { utcLocal } from '../../lib/describe';
-import { DASH, fmtCoin, fmtContracts, fmtNum, fmtPct, fmtPx, safeDecimal } from '../../lib/format';
-import { addTriggerAfter, changeFrom, coinOf, completeWarning, nextDailyClose, reasonText, shareOf, signalCloseTs, warningText, type FollowBlock } from '../../lib/signals';
+import { DASH, fmtCoin, fmtContracts, fmtNum, fmtPct, fmtPx, fmtUtcMinute, safeDecimal } from '../../lib/format';
+import { addTriggerAfter, changeFrom, coinOf, completeWarning, DAY_MS, nextDailyClose, reasonText, shareOf, signalCloseTs, warningText, type FollowBlock } from '../../lib/signals';
 import { StateBadge } from './CoinList';
 import { SignalChart } from './SignalChart';
 
@@ -28,6 +28,40 @@ export function stateSentence(row: CampaignSignalRow, res: CampaignSignalsRespon
   }
   if (row.state === 'exit') parts.push(t.signals.exitAdvice);
   return t.signals.joinSentences(parts);
+}
+
+/** The regime shadow's decision for the coin at the last daily close in one sentence, its figures formatted (funding to 3 decimals, ATR and margins to 1). */
+export function shadowSentence(shadow: CampaignShadowSignal, inst: Instrument | undefined, t: Messages): string {
+  const { coin, params } = shadow;
+  const overThin = D(1).plus(params.thinMargin);
+  // A trigger price is rounded up to the tick: a close at the printed price is enough.
+  const plusThin = (px: string | null) => {
+    const v = safeDecimal(px)?.mul(overThin) ?? null;
+    return v === null ? null : inst ? ceilToStep(v, inst.tickSz) : v;
+  };
+  const over = (v: string | null, threshold: string): string | null => (v !== null && D(v).gte(threshold) ? v : null);
+  const pct = (v: string | null, dp: number) => (v === null ? '' : fmtPct(v, dp));
+  const s: ShadowText = {
+    light: t.signals.shadow.light[shadow.state],
+    close: fmtPx(coin.close, inst),
+    line: fmtPx(coin.entryHigh, inst),
+    margin: fmtPct(coin.margin, 1),
+    need: fmtPx(plusThin(coin.entryHigh), inst),
+    thin: fmtPct(params.thinMargin, 1),
+    level: fmtPx(coin.pending?.level ?? null, inst),
+    barsLeft: coin.pending === null ? '' : String(coin.pending.barsLeft),
+    retestTo: fmtPx(plusThin(coin.pending?.level ?? null), inst),
+    funding: pct(coin.funding, 3),
+    atr: pct(coin.atrPct, 1),
+    vetoFunding: fmtPct(params.vetoFunding, 3),
+    vetoWild: fmtPct(params.vetoWild, 1),
+    btcFunding: pct(over(shadow.btcFunding, params.vetoFunding), 3),
+    btcAtr: pct(over(shadow.btcAtrPct, params.vetoWild), 1),
+    cooldownUntil: coin.cooldownUntil === null ? '' : fmtUtcMinute(coin.cooldownUntil),
+  };
+  const skip = coin.skip ?? 'no-signal';
+  const key: ShadowCase = coin.entry ?? (skip === 'no-signal' && coin.entryHigh === null ? 'no-channel' : skip);
+  return t.signals.shadow.sentence[key](s);
 }
 
 
@@ -161,6 +195,8 @@ export function CoinCard({ row, res, inst, block, manualBlock, onFollow, onManua
   const exitLine = row.holding?.trailingLine ?? row.levels.nextExit;
   const followable = row.state === 'entry' || row.state === 'add';
   const distance = safeDecimal(row.entryDistancePct);
+  // an older API sends no shadow
+  const shadow = row.shadow ?? null;
 
   return (
     <div className="sig-card">
@@ -173,6 +209,18 @@ export function CoinCard({ row, res, inst, block, manualBlock, onFollow, onManua
       </div>
       <div className={`sig-headline sig-headline-${row.state}`}>{t.signals.headline[row.state]}</div>
       <p className="sig-sentence">{stateSentence(row, res, inst, t)}</p>
+      {shadow !== null && (
+        <>
+          <p className="sig-sentence sig-shadow">{shadowSentence(shadow, inst, t)}</p>
+          <div className="sig-shadow-labels">
+            <span>{t.signals.shadow.asOf(fmtUtcMinute(shadow.asOf + DAY_MS))}</span>
+            {shadow.coin.atrPct !== null && <span>{t.signals.shadow.atr(fmtPct(shadow.coin.atrPct, 1))}</span>}
+            {shadow.coin.funding !== null && <span>{t.signals.shadow.funding(fmtPct(shadow.coin.funding, 3))}</span>}
+            {shadow.coin.tests !== null && <span>{t.signals.shadow.tests(shadow.coin.tests)}</span>}
+            {shadow.coin.cooldownUntil !== null && <span>{t.signals.shadow.cooldown(fmtUtcMinute(shadow.coin.cooldownUntil))}</span>}
+          </div>
+        </>
+      )}
 
       <div className="sig-actions">
         <button className="btn btn-buy sig-follow" disabled={block !== null} onClick={onFollow} title={block === null ? t.signals.followTitle : t.signals.block[block]}>

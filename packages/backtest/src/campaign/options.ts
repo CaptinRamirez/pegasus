@@ -1,5 +1,17 @@
 import { parseArgs } from 'node:util';
-import { CAMPAIGN_INSTRUMENTS, CAMPAIGN_MAINTENANCE, D, DEFAULT_CAMPAIGN_PARAMS, DEFAULT_POT_PARAMS, isDecimalString, type CampaignParams, type CampaignStructure } from '@pegasus/shared';
+import {
+  CAMPAIGN_INSTRUMENTS,
+  CAMPAIGN_MAINTENANCE,
+  D,
+  DEFAULT_CAMPAIGN_PARAMS,
+  DEFAULT_POT_PARAMS,
+  DEFAULT_REGIME_PARAMS,
+  isDecimalString,
+  type CampaignParams,
+  type CampaignStructure,
+  type RegimeEntryModes,
+  type RegimeParams,
+} from '@pegasus/shared';
 import { oneOf, positiveInt, UsageError, utcDate } from '../options.js';
 import type { CampaignConfig, CampaignCosts } from './types.js';
 
@@ -59,6 +71,27 @@ come, one campaign per instrument. Fractions are fractions: 0.05 = 5%.
   --atr-leverage k        experiment: the leverage of each entry set so that its liquidation sits k ATRs
                           (over the entry channel's daily bars) below the entry, --leverage at most
                           (default: none, --leverage for every entry)
+  --cut-hour h            experiment: the UTC hour the daily bars close at (0, 4, 8, 12, 16 or 20; default 0, the
+                          exchange's own daily and 12-hour bars). Another hour builds both from 4-hour candles: the
+                          daily bar closes at h, the 12-hour bars at h and 12 hours later, the pot is sampled at h
+  --regime                shadow (docs/proposals/regime-snowball-v2.1.md, C17 to C19): the light on BTC, the
+                          vetoes and the waiting over the entry, with the defaults below; BTC must be replayed
+  --veto-funding f        with --regime: 3-day funding mean per 8 hours at or above which BTC is red and an
+                          instrument is vetoed (default ${DEFAULT_REGIME_PARAMS.vetoFunding})
+  --veto-wild f           with --regime: ATR20 over the close at or above which BTC is red and an instrument is
+                          vetoed (default ${DEFAULT_REGIME_PARAMS.vetoWild})
+  --cooldown-days n       with --regime: days after a liquidation during which the instrument does not enter
+                          (default ${DEFAULT_REGIME_PARAMS.cooldownDays})
+  --thin-margin f         with --regime: a close over the entry channel by less than f waits instead of entering
+                          (default ${DEFAULT_REGIME_PARAMS.thinMargin})
+  --pending-bars n        with --regime: daily closes a pending level is kept for after the close that set it
+                          (default ${DEFAULT_REGIME_PARAMS.pendingBars})
+  --entry breakout|accept|either
+                          with --regime: thin breakouts enter at once, wait for the next close, or for the next
+                          close or a retest (default ${DEFAULT_REGIME_PARAMS.entry})
+  --funding-source binance|okx
+                          where the funding settlements come from: Binance, the proxy with the whole history
+                          (default), or OKX's own, of which the exchange keeps about three months
   --no-funding            do not charge funding
   --offline               read the cache only and never download: for a frozen data set
   --refresh               download the history again instead of extending the cache
@@ -97,6 +130,8 @@ export interface CampaignCliOptions {
   check: string | null;
   /** --reconcile: the ledger file, as typed */
   reconcile: string | null;
+  /** --funding-source */
+  fundingSource: 'binance' | 'okx';
 }
 
 function positive(name: string, value: string): string {
@@ -104,10 +139,19 @@ function positive(name: string, value: string): string {
   return value;
 }
 
+function fraction(name: string, value: string): string {
+  if (!isDecimalString(value) || D(value).lt(0) || D(value).gte(1)) throw new UsageError(`--${name} takes a fraction from 0 below 1, got "${value}"`);
+  return value;
+}
+
+/** The flags of the regime layers: only with --regime. */
+const REGIME_FLAGS = ['veto-funding', 'veto-wild', 'cooldown-days', 'thin-margin', 'pending-bars', 'entry'] as const;
 /** Flags that say what is replayed: with --check the reference file says it. */
-const RULE_FLAGS = ['from', 'to', 'pot', 'min-stake', 'catalogue', 'entry-channel', 'exit-channel', 'leverage', 'add-step', 'stop', 'atr-leverage', 'no-funding', 'refresh'] as const;
+const RULE_FLAGS = ['from', 'to', 'pot', 'min-stake', 'catalogue', 'entry-channel', 'exit-channel', 'leverage', 'add-step', 'stop', 'atr-leverage', 'cut-hour', 'regime', ...REGIME_FLAGS, 'funding-source', 'no-funding', 'refresh'] as const;
+/** Daily closes the bars can be built at: the exchange's own (0) or a boundary of its 4-hour candles */
+const CUT_HOURS: readonly number[] = [0, 4, 8, 12, 16, 20];
 /** Flags that do not go with --reconcile: the ledger's pot says what is replayed, and nothing is written. */
-const NOT_WITH_RECONCILE = ['from', 'to', 'structure', 'pot', 'min-stake', 'catalogue', 'exchange-limits', 'entry-channel', 'exit-channel', 'leverage', 'add-step', 'stop', 'atr-leverage', 'no-funding', 'check', 'out'] as const;
+const NOT_WITH_RECONCILE = ['from', 'to', 'structure', 'pot', 'min-stake', 'catalogue', 'exchange-limits', 'entry-channel', 'exit-channel', 'leverage', 'add-step', 'stop', 'atr-leverage', 'cut-hour', 'regime', ...REGIME_FLAGS, 'funding-source', 'no-funding', 'check', 'out'] as const;
 
 export function parseCampaignCli(argv: readonly string[]): CampaignCliOptions {
   const string = { type: 'string' } as const;
@@ -133,6 +177,15 @@ export function parseCampaignCli(argv: readonly string[]): CampaignCliOptions {
         'add-step': string,
         stop: string,
         'atr-leverage': string,
+        'cut-hour': string,
+        regime: boolean,
+        'veto-funding': string,
+        'veto-wild': string,
+        'cooldown-days': string,
+        'thin-margin': string,
+        'pending-bars': string,
+        entry: string,
+        'funding-source': string,
         'no-funding': boolean,
         offline: boolean,
         refresh: boolean,
@@ -180,6 +233,22 @@ export function parseCampaignCli(argv: readonly string[]): CampaignCliOptions {
     if (D(params.stop).gte(1)) throw new UsageError('--stop must be below 1');
   }
   if (values['atr-leverage'] !== undefined) params.atrLeverage = positive('atr-leverage', values['atr-leverage']);
+  const cutHour = values['cut-hour'] !== undefined ? Number(values['cut-hour']) : 0;
+  if (!CUT_HOURS.includes(cutHour)) throw new UsageError(`--cut-hour takes 0, 4, 8, 12, 16 or 20 (a UTC hour on a 4-hour boundary), got "${values['cut-hour']}"`);
+  const regimeFlags = REGIME_FLAGS.filter((flag) => values[flag] !== undefined);
+  if (values.regime !== true && regimeFlags.length > 0) throw new UsageError(`${regimeFlags.map((flag) => `--${flag}`).join(', ')} go with --regime only`);
+  if (values.regime === true) {
+    const r = DEFAULT_REGIME_PARAMS;
+    const regime: RegimeParams = {
+      vetoFunding: values['veto-funding'] !== undefined ? positive('veto-funding', values['veto-funding']) : r.vetoFunding,
+      vetoWild: values['veto-wild'] !== undefined ? positive('veto-wild', values['veto-wild']) : r.vetoWild,
+      cooldownDays: values['cooldown-days'] !== undefined ? positiveInt('cooldown-days', values['cooldown-days']) : r.cooldownDays,
+      thinMargin: values['thin-margin'] !== undefined ? fraction('thin-margin', values['thin-margin']) : r.thinMargin,
+      pendingBars: values['pending-bars'] !== undefined ? positiveInt('pending-bars', values['pending-bars']) : r.pendingBars,
+      entry: values.entry !== undefined ? oneOf<RegimeEntryModes>('entry', values.entry, ['breakout', 'accept', 'either']) : r.entry,
+    };
+    params.regime = regime;
+  }
   const config: CampaignConfig = {
     mode,
     params,
@@ -190,6 +259,7 @@ export function parseCampaignCli(argv: readonly string[]): CampaignCliOptions {
     exchangeCap: limits,
     costs: limits ? DEFAULT_CAMPAIGN_COSTS : REFERENCE_CAMPAIGN_COSTS,
   };
+  if (cutHour !== 0) config.cutHour = cutHour;
   let instIds: string[] | null = null;
   if (values.inst !== undefined) {
     instIds = values.inst
@@ -210,5 +280,6 @@ export function parseCampaignCli(argv: readonly string[]): CampaignCliOptions {
     cache: values.cache ?? null,
     check: values.check ?? null,
     reconcile: values.reconcile ?? null,
+    fundingSource: values['funding-source'] !== undefined ? oneOf<'binance' | 'okx'>('funding-source', values['funding-source'], ['binance', 'okx']) : 'binance',
   };
 }

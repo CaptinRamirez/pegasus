@@ -232,3 +232,35 @@ describe('loadData', () => {
     expect(binanceSymbol('ETH-USDT-SWAP')).toBe('ETHUSDT');
   });
 });
+
+describe('loadData at another daily close (cutHour)', () => {
+  it('builds the daily and 12-hour bars from 4-hour candles anchored at the cut and asks for no other bars', async () => {
+    const asked: string[] = [];
+    // 4-hour candles from 00:00 of T0 to 76:00, the last one forming
+    const fourHours = Array.from({ length: 20 }, (_, i) => ({ ...bar(T0 + i * 4 * HOUR, 100 + i, 101 + i, 99 + i, 100.5 + i), confirm: i < 19 }));
+    const fetchers: Fetchers = {
+      instrument: async (instId) => instrument(instId),
+      candles: async (_instId, barName, after) => {
+        asked.push(barName);
+        return barName === '4H' ? fourHours.filter((c) => after === undefined || c.ts < after) : [];
+      },
+      openInterest: async () => [],
+      funding: async () => [],
+      fundingPageSize: 1,
+    };
+    const cache = new MemoryCache();
+    const { data } = await loadData({ instIds: ['AAA-USDT-SWAP'], phases: [0, 12], openInterest: false, funding: false, now: T0 + 4 * DAY, refresh: false, cutHour: 20 }, fetchers, cache);
+    const [d] = data;
+    // the pager asks for the page before the oldest one and gets none: 4-hour candles are all it asks for
+    expect(asked.length).toBeGreaterThan(0);
+    expect(asked.every((barName) => barName === '4H')).toBe(true);
+    // days from 20:00 to 20:00: the one from 68:00 lacks its last candles
+    expect(d?.daily.map((c) => (c.ts - T0) / HOUR)).toEqual([20, 44]);
+    expect(d?.daily[0]).toMatchObject({ open: '105', high: '111', low: '104', close: '110.5', confirm: true });
+    // 12-hour bars of that cut open at 08:00 and 20:00
+    expect(d?.halfDay.map((c) => (c.ts - T0) / HOUR)).toEqual([8, 20, 32, 44, 56]);
+    expect(d?.halfDay.every((c) => c.confirm)).toBe(true);
+    // the 4-hour candles are cached like any series
+    expect(cache.read<unknown[]>('AAA-USDT-SWAP.candles-4H')).toHaveLength(19);
+  });
+});

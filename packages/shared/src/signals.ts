@@ -731,30 +731,42 @@ export function phaseDayStart(ts: number, phase: SignalPhase): number {
 }
 
 /**
- * Daily candles that open at phase:00 UTC, each built from the two consecutive 12-hour UTC candles
- * that open at phase:00 and 12 hours later. A day is emitted only when both halves are present and
- * is confirmed only when both are. Oldest first.
+ * Candles of `periodMs` built from the consecutive candles of `barMs` they are made of, each period opening `anchorMs`
+ * past a multiple of `periodMs` (UTC: an anchor of 20 hours gives days that open and close at 20:00 UTC). A period is
+ * emitted only when every bar of it is present and is confirmed only when all are. Oldest first.
  */
-export function dailyBarsFromHalfDays(halfDayCandles: readonly Candle[], phase: SignalPhase): Candle[] {
+export function aggregateCandles(candles: readonly Candle[], barMs: number, periodMs: number, anchorMs = 0): Candle[] {
+  const n = periodMs / barMs;
+  if (!Number.isInteger(n) || n < 1) throw new SignalError('BAD_INPUT', 'periodMs must be a multiple of barMs');
   const byTs = new Map<number, Candle>();
-  for (const c of halfDayCandles) byTs.set(c.ts, c);
+  for (const c of candles) byTs.set(c.ts, c);
   const out: Candle[] = [];
   for (const first of [...byTs.values()].sort((a, b) => a.ts - b.ts)) {
-    if (phaseDayStart(first.ts, phase) !== first.ts) continue;
-    const second = byTs.get(first.ts + HALF_DAY_MS);
-    if (!second) continue;
+    if ((((first.ts - anchorMs) % periodMs) + periodMs) % periodMs !== 0) continue;
+    const parts: Candle[] = [first];
+    for (let k = 1; k < n; k++) {
+      const part = byTs.get(first.ts + k * barMs);
+      if (!part) break;
+      parts.push(part);
+    }
+    if (parts.length < n) continue;
     out.push({
       ts: first.ts,
       open: first.open,
-      high: Decimal.max(first.high, second.high).toFixed(),
-      low: Decimal.min(first.low, second.low).toFixed(),
-      close: second.close,
-      vol: D(first.vol).plus(second.vol).toFixed(),
-      volCcy: D(first.volCcy).plus(second.volCcy).toFixed(),
-      confirm: first.confirm && second.confirm,
+      high: Decimal.max(...parts.map((c) => c.high)).toFixed(),
+      low: Decimal.min(...parts.map((c) => c.low)).toFixed(),
+      close: (parts[n - 1] as Candle).close,
+      vol: parts.reduce((sum, c) => sum.plus(c.vol), ZERO).toFixed(),
+      volCcy: parts.reduce((sum, c) => sum.plus(c.volCcy), ZERO).toFixed(),
+      confirm: parts.every((c) => c.confirm),
     });
   }
   return out;
+}
+
+/** Daily candles that open at phase:00 UTC, each the two consecutive 12-hour UTC candles that open at phase:00 and 12 hours later. */
+export function dailyBarsFromHalfDays(halfDayCandles: readonly Candle[], phase: SignalPhase): Candle[] {
+  return aggregateCandles(halfDayCandles, HALF_DAY_MS, 2 * HALF_DAY_MS, phase * HOUR_MS);
 }
 
 /**

@@ -5,6 +5,7 @@ import {
   buildSignalReport,
   classifyRegime,
   computeIndicators,
+  aggregateCandles,
   dailyBarsFromHalfDays,
   DEFAULT_TREND_PARAMS,
   efficiencyRatio,
@@ -370,6 +371,26 @@ describe('second daily cut', () => {
       { ts: day + 36 * H, open: '105', high: '106', low: '100', close: '101', vol: '3', volCcy: '0.5', confirm: false },
     ]);
     expect(dailyBarsFromHalfDays([], 12)).toEqual([]);
+  });
+
+  it('aggregateCandles builds any period from its bars, anchored at an hour of the day', () => {
+    const four = (i: number, confirm = true): Candle => ({ ts: day + i * 4 * H, open: String(100 + i), high: String(101 + i), low: String(99 + i), close: String(100.5 + i), vol: '1', volCcy: '2', confirm });
+    // 4-hour bars from 00:00 of `day` to 04:00 two days later, the last one forming
+    const bars = Array.from({ length: 13 }, (_, i) => four(i, i < 12));
+    // days that close at 20:00: 20:00 to 20:00 the next day
+    expect(aggregateCandles(bars, 4 * H, 24 * H, 20 * H)).toEqual([{ ts: day + 20 * H, open: '105', high: '111', low: '104', close: '110.5', vol: '6', volCcy: '12', confirm: true }]);
+    // 12-hour bars of that cut open at 08:00 and 20:00; the one from 08:00 of the third day lacks its bars
+    expect(aggregateCandles(bars, 4 * H, 12 * H, 8 * H).map((c) => [(c.ts - day) / H, c.confirm])).toEqual([
+      [8, true],
+      [20, true],
+      [32, true],
+    ]);
+    // the UTC day is the 00:00 anchor; the third day has its forming first bar only
+    expect(aggregateCandles(bars, 4 * H, 24 * H).map((c) => [(c.ts - day) / H, c.confirm])).toEqual([
+      [0, true],
+      [24, true],
+    ]);
+    expect(() => aggregateCandles(bars, 4 * H, 10 * H)).toThrow(/multiple/);
   });
 });
 

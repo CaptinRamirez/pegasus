@@ -85,10 +85,14 @@ describe('the chart', () => {
       ['heldBtc', null],
       ['replaySame', 'pyramid'],
       ['replayOther', 'noadd'],
+      ['atr3', null],
+      ['regime', null],
     ]);
     expect(all[3]?.points.at(-1)).toEqual({ ts: LAST_CLOSE, value: '176' });
-    // a failed first attempt has nothing to draw
+    expect(all[6]?.points.at(-1)).toEqual({ ts: LAST_CLOSE, value: '162' });
+    // a failed first attempt has nothing to draw; an API without the shadows (the fields absent or null) draws none
     expect(campaignChartLines(runningView, replayFailed).map((l) => l.id)).toEqual(['value', 'banked']);
+    expect(campaignChartLines(runningView, { ...replayReady, atr3: null, regime: null }).map((l) => l.id)).toEqual(['value', 'banked', 'heldBtc', 'replaySame', 'replayOther']);
   });
 
   it('the legend reads the value at the close under the crosshair, or the latest', () => {

@@ -238,6 +238,8 @@ export const replayReady: CampaignReplayView = {
   through: LAST_CLOSE,
   same: run('pyramid', ['140', '152', '161', '158', '171', '176']),
   other: run('noadd', ['90', '92', '95', '94', '97', '99']),
+  atr3: run('pyramid', ['140', '146', '151', '149', '150', '150']),
+  regime: run('pyramid', ['140', '147', '155', '153', '160', '162']),
   heldBtc: [0, 1, 2, 3, 4, 5].map((k) => ({ ts: LAST_CLOSE - (5 - k) * HALF_DAY, value: ['58', '59', '57.5', '60', '61', '62.25'][k] ?? '0' })),
   reconciliation: {
     tolerances: { entryPx: '0.005', stake: '0.01' },

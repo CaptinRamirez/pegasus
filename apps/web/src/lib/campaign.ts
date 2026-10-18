@@ -78,7 +78,7 @@ export const pad2 = (n: number): string => String(n).padStart(2, '0');
 
 // ---- the chart ----
 
-export type ChartLineId = 'value' | 'banked' | 'heldBtc' | 'replaySame' | 'replayOther';
+export type ChartLineId = 'value' | 'banked' | 'heldBtc' | 'replaySame' | 'replayOther' | 'atr3' | 'regime';
 
 export interface ChartPoint {
   /** A 12-hour close, epoch ms */
@@ -90,13 +90,14 @@ export interface ChartPoint {
 export interface ChartLine {
   id: ChartLineId;
   points: ChartPoint[];
-  /** The structure a replay line ran; null for the other lines */
+  /** The structure a replay line (replaySame, replayOther) ran; null for the other lines */
   structure: CampaignStructure | null;
 }
 
 /**
  * The lines of the pot chart: its value and its banked total at every close processed, then, when the replay has a
- * result, the pot's start value held in BTC and the replay of each structure (the pot's own first).
+ * result, the pot's start value held in BTC, the replay of each structure (the pot's own first) and the two shadows
+ * (3 ATR leverage, and that with the regime layers) when the API gives them.
  */
 export function campaignChartLines(view: Pick<CampaignView, 'samples'>, replay: CampaignReplayView | null): ChartLine[] {
   const lines: ChartLine[] = [
@@ -107,6 +108,8 @@ export function campaignChartLines(view: Pick<CampaignView, 'samples'>, replay: 
   if (replay.heldBtc.length > 0) lines.push({ id: 'heldBtc', structure: null, points: replay.heldBtc.map((s) => ({ ts: s.ts, value: s.value })) });
   if (replay.same !== null) lines.push({ id: 'replaySame', structure: replay.same.structure, points: replay.same.samples.map((s) => ({ ts: s.ts, value: s.value })) });
   if (replay.other !== null) lines.push({ id: 'replayOther', structure: replay.other.structure, points: replay.other.samples.map((s) => ({ ts: s.ts, value: s.value })) });
+  if (replay.atr3 !== null && replay.atr3 !== undefined) lines.push({ id: 'atr3', structure: null, points: replay.atr3.samples.map((s) => ({ ts: s.ts, value: s.value })) });
+  if (replay.regime !== null && replay.regime !== undefined) lines.push({ id: 'regime', structure: null, points: replay.regime.samples.map((s) => ({ ts: s.ts, value: s.value })) });
   return lines;
 }
 
