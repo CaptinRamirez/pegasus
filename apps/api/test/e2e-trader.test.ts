@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { pino } from 'pino';
 import { startMockOkx, type MockOkxHandle } from '@pegasus/mock-okx';
-import { D, type Candle, type TraderBar, type TraderDecision, type TraderDossier, type TraderLogRecord, type TraderView } from '@pegasus/shared';
+import { D, type Candle, type TraderBar, type TraderDecision, type TraderDossier, type TraderLogRecord, type TraderMacro, type TraderView } from '@pegasus/shared';
 import type { FastifyInstance } from 'fastify';
 import { loadConfig, type AppConfig } from '../src/config.js';
 import { MemoryStore } from '../src/db/store.js';
@@ -50,7 +50,7 @@ class ScriptedModel implements TraderModel {
   }
 }
 
-const decide = (over: Partial<TraderDecision>): TraderDecision => ({ action: 'flat', entryType: 'market', limitPrice: null, stopPx: null, targetPx: null, confidence: 0.55, reasons: ['测试'], invalidation: '测试', oneLiner: '测试', ...over });
+const decide = (over: Partial<TraderDecision>): TraderDecision => ({ action: 'flat', entryType: 'market', limitPrice: null, stopPx: null, targetPx: null, confidence: 0.55, reasons: ['测试'], invalidation: '测试', oneLiner: '测试', recheckMinutes: 60, wakeAbove: null, wakeBelow: null, ...over });
 
 /** Flat synthetic candles around PRICE, confirmed up to the clock; the forming bar last. */
 function sources(clock: { now: number }, mark: () => string | null): TraderDossierSources {
@@ -75,6 +75,8 @@ function sources(clock: { now: number }, mark: () => string | null): TraderDossi
 }
 
 interface Stack {
+  /** What the macro source returns: the test sets it */
+  macro: TraderMacro;
   mock: MockOkxHandle;
   deps: Deps;
   config: AppConfig;
@@ -95,7 +97,7 @@ async function waitFor<T>(fn: () => T | undefined | null | false, timeoutMs = 50
   }
 }
 
-async function startStack(maxTradesPerDay: string, start: number): Promise<Stack> {
+async function startStack(maxTradesPerDay: string, start: number, cadence: 'hourly' | 'model' = 'hourly'): Promise<Stack> {
   const dir = mkdtempSync(join(tmpdir(), 'pegasus-trader-'));
   const mock = await startMockOkx({ port: 0, seed: 7, tickIntervalMs: 50, volatility: 0, posMode: 'net_mode', initialPrices: { [BTC]: String(PRICE) }, initialBalanceUsdt: '5600' });
   const config = loadConfig({
@@ -111,6 +113,7 @@ async function startStack(maxTradesPerDay: string, start: number): Promise<Stack
     RISK_MAX_TOTAL_POSITION_NOTIONAL: '200000',
     TRADER_ENABLED: '1',
     TRADER_MAX_TRADES_PER_DAY: maxTradesPerDay,
+    TRADER_CADENCE: cadence,
     TRADER_STATE_FILE: join(dir, 'trader-state.json'),
     TRADER_LOG_FILE: join(dir, 'trader-log.jsonl'),
   });
@@ -135,6 +138,8 @@ async function startStack(maxTradesPerDay: string, start: number): Promise<Stack
   await waitFor(() => market.book(BTC) && market.liveMarkPrice(BTC) && account.ready && account.balance, 10_000, 'market data + paper account stream');
   const clock = { now: start };
   const model = new ScriptedModel();
+  // never the network: the test's calendar and headlines
+  const macro: TraderMacro = { calendar: [], headlines: [], notes: [] };
   const service = new TraderService(config.trader, { clients, market, account, risk, orders, log }, {
     now: () => clock.now,
     sleep: async () => {
@@ -142,13 +147,15 @@ async function startStack(maxTradesPerDay: string, start: number): Promise<Stack
     },
     model,
     sources: sources(clock, () => market.liveMarkPrice(BTC) ?? null),
+    macro: { read: async () => structuredClone(stack.macro) },
     checkEveryMs: 0,
     pollMs: 1,
     pollAttempts: 2,
   });
   deps.trader = service;
+  const stack: Stack = { macro, mock, deps, config, app, clock, model, service, dir };
   await service.start();
-  return { mock, deps, config, app, clock, model, service, dir };
+  return stack;
 }
 
 async function stopStack(s: Stack): Promise<void> {
@@ -347,5 +354,71 @@ describe('the trader keeps its position covered and its books straight', () => {
     await closeAt(s, DAY + 18 * H);
     expect(s.model.calls).toBe(calls + 1);
     expect(s.service.view().status).toBe('holding');
+  });
+});
+
+describe('the model decides when it looks again', () => {
+  let s: Stack;
+  const CPI = DAY + 15 * H + 20 * 60_000;
+  beforeAll(async () => {
+    s = await startStack('5', DAY + 12 * H + 50 * 60_000, 'model');
+    s.macro.calendar = [{ time: CPI, title: 'CPI m/m', country: 'USD', impact: 'High', forecast: '0.3%', previous: '0.4%', minutesFromNow: 0 }];
+    s.macro.headlines = [{ time: DAY + 12 * H, source: 'Federal Reserve', title: 'Federal Reserve issues FOMC statement', minutesAgo: 60 }];
+  }, 30_000);
+  afterAll(async () => {
+    await stopStack(s);
+  });
+
+  it('is asked at the session s open, with the calendar and the headlines, and not again before its recheck time', async () => {
+    expect(s.model.calls).toBe(0);
+    expect(s.service.view().nextCallAt).toBe(DAY + 13 * H);
+    s.model.queue.push(decide({ action: 'flat', recheckMinutes: 120, wakeAbove: '60100', wakeBelow: null, oneLiner: '区间内，两小时后再看' }));
+    await closeAt(s, DAY + 13 * H);
+    expect(s.model.calls).toBe(1);
+    const dossier = s.model.dossiers[0] as TraderDossier;
+    expect(dossier.triggers).toEqual(['session open']);
+    expect(dossier.macro.calendar.map((e) => e.title)).toEqual(['CPI m/m']);
+    expect(dossier.macro.headlines.map((h) => h.source)).toEqual(['Federal Reserve']);
+    expect(dossier.previous).toBeNull();
+    expect(s.service.view()).toMatchObject({ cadence: 'model', wake: { at: DAY + 15 * H, above: '60100', below: null }, nextCallAt: DAY + 15 * H });
+    for (const m of [15, 30, 45, 60, 75]) await closeAt(s, DAY + 13 * H + m * 60_000);
+    expect(s.model.calls).toBe(1);
+  });
+
+  it('is woken early when the price reaches its level, and sees its previous decision', async () => {
+    await moveTo(s, '60200');
+    await closeAt(s, DAY + 14 * H + 30 * 60_000);
+    expect(s.model.calls).toBe(2);
+    const dossier = s.model.dossiers[1] as TraderDossier;
+    expect(dossier.triggers).toEqual(['price reached 60100']);
+    expect(dossier.previous).toMatchObject({ action: 'flat', oneLiner: '区间内，两小时后再看', wakeAbove: '60100' });
+    await moveTo(s, String(PRICE));
+  });
+
+  it('is asked right after a high-impact US release, and rests for the day when it says so', async () => {
+    // the answer at 14:30 (the queue was empty: flat, 60 minutes, no levels) puts the next look at 15:30
+    await closeAt(s, DAY + 14 * H + 45 * 60_000);
+    await closeAt(s, DAY + 15 * H);
+    await closeAt(s, DAY + 15 * H + 15 * 60_000);
+    expect(s.model.calls).toBe(2);
+    s.model.queue.push(decide({ action: 'flat', recheckMinutes: 480, wakeAbove: '61000', wakeBelow: '59000' }));
+    await closeAt(s, DAY + 15 * H + 30 * 60_000);
+    expect(s.model.calls).toBe(3);
+    expect((s.model.dossiers[2] as TraderDossier).triggers).toEqual(['scheduled recheck', 'high-impact release out: CPI m/m']);
+    for (let m = 45; m <= 5 * 60 + 45; m += 15) await closeAt(s, DAY + 15 * H + m * 60_000);
+    expect(s.model.calls).toBe(3);
+    expect(s.service.view().nextCallAt).toBe(DAY + 24 * H + 13 * H);
+    // the next day's session opens with a call
+    await closeAt(s, DAY + 24 * H + 13 * H);
+    expect(s.model.calls).toBe(4);
+    expect((s.model.dossiers[3] as TraderDossier).triggers).toEqual(['session open']);
+  });
+
+  it('shows the last decision again after a restart, from the log', async () => {
+    const again = new TraderService(s.config.trader, { clients: s.deps.clients, market: s.deps.market, account: s.deps.account, risk: s.deps.risk, orders: s.deps.orders, log }, { now: () => s.clock.now, model: s.model, macro: { read: async () => s.macro }, checkEveryMs: 0 });
+    await again.start();
+    // the log's time of the decision: a few seconds after the close it was taken at
+    expect(again.view().last).toMatchObject({ ts: DAY + 24 * H + 13 * H + 5_000, decision: { action: 'flat' } });
+    again.stop();
   });
 });

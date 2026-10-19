@@ -2,6 +2,8 @@ node_modules/
 dist/
 # the page built for the --campaign stack (scripts/start.mjs), apart from the one another stack serves
 dist-campaign/
+# and the one built for the --trader stack
+dist-trader/
 build/
 .env
 .env.*

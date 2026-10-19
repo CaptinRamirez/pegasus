@@ -76,6 +76,27 @@ describe('TraderPanel', () => {
     expect(container.querySelectorAll('.trader-log tbody tr')).toHaveLength(2);
   });
 
+  it('the log shows the one-liner, expands to the reasons, and the status shows the wake levels and releases', async () => {
+    await render(enabledView, en.trader.statusLabel.holding);
+    await flush(container, 'model timed out');
+    const log = container.querySelector('.trader-log') as HTMLElement;
+    expect(log.textContent).toContain('Waiting for the CPI print');
+    expect(log.textContent).not.toContain('Volume is thin');
+    const toggle = log.querySelector('button[aria-expanded]') as HTMLButtonElement;
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    await act(async () => toggle.click());
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(log.textContent).toContain('Volume is thin before the release');
+    expect(log.textContent).toContain('A break of 83,000 on volume');
+    expect(log.textContent).toContain('hourly close');
+    expect(log.textContent).toContain('earlier above 83,000');
+    const status = container.querySelector('.trader-status')?.textContent ?? '';
+    expect(status).toContain('above 83,000');
+    expect(status).toContain('below 81,200');
+    expect(status).toContain(en.trader.cadenceLabel.model);
+    expect(container.querySelector('.trader-upcoming')?.textContent).toContain('CPI m/m');
+  });
+
   it('a disabled view: only the note about the trader stack', async () => {
     await render(disabledTraderView, en.trader.disabledTitle);
     expect(container.textContent).toContain('pnpm start --trader');

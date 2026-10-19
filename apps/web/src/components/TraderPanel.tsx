@@ -1,5 +1,5 @@
-import type { ReactNode } from 'react';
-import type { TraderLastDecision, TraderLogRecord, TraderView } from '@pegasus/shared';
+import { useState, type ReactNode } from 'react';
+import type { TraderDecision, TraderLastDecision, TraderLogRecord, TraderTradeResult, TraderView } from '@pegasus/shared';
 import { useTrader, useTraderLog } from '../hooks/useTrader';
 import { labelOf, useT } from '../i18n';
 import { DASH, fmtContracts, fmtLocalMinute, fmtNum, fmtPct, fmtPx, fmtSigned, fmtUtcMinute, signOf } from '../lib/format';
@@ -48,6 +48,10 @@ function StatusCard({ view }: { view: TraderView }) {
           </>
         )}
       </Field>
+      {view.wake !== null && (view.wake.above !== null || view.wake.below !== null) && (
+        <div className="campaign-note dim num">{t.trader.wakeLine(view.wake.above === null ? null : fmtPx(view.wake.above), view.wake.below === null ? null : fmtPx(view.wake.below))}</div>
+      )}
+      <Field k={t.trader.cadence}>{labelOf(t.trader.cadenceLabel, view.cadence)}</Field>
       <Field k={t.trader.model}>{view.model}</Field>
       <div className="campaign-note trader-guardrails" title={t.trader.guardrails}>
         {t.trader.guardrailsLine({
@@ -60,6 +64,24 @@ function StatusCard({ view }: { view: TraderView }) {
           leverage: g.maxLeverage,
         })}
       </div>
+    </section>
+  );
+}
+
+function UpcomingCard({ upcoming }: { upcoming: TraderView['upcoming'] }) {
+  const t = useT();
+  return (
+    <section className="campaign-card trader-upcoming">
+      <h4>{t.trader.upcoming}</h4>
+      <ul className="campaign-notes">
+        {upcoming.map((e, i) => (
+          <li key={`${e.time}-${i}`}>
+            <span className="num">{when(e.time)}</span> {e.country} <span className={e.impact === 'High' ? 'neg' : 'dim'}>{e.impact === 'High' ? t.trader.impactHigh : e.impact}</span> {e.title}
+            {e.forecast !== '' && <span className="dim"> · {t.trader.forecast} {e.forecast}</span>}
+            {e.previous !== '' && <span className="dim"> · {t.trader.previousValue} {e.previous}</span>}
+          </li>
+        ))}
+      </ul>
     </section>
   );
 }
@@ -222,17 +244,92 @@ function RecentTable({ recent }: { recent: TraderView['recent'] }) {
   );
 }
 
+/** The recheck time of a record: its time plus the minutes asked, up to the next 15-minute close. */
+const nextLookAt = (ts: number, minutes: number): number => Math.ceil((ts + minutes * 60_000) / 900_000) * 900_000;
+
+function DecisionDetail({ r, d }: { r: TraderLogRecord; d: TraderDecision }) {
+  const t = useT();
+  const px = (v: string | null): string | null => (v === null ? null : fmtPx(v));
+  return (
+    <>
+      <ul className="campaign-notes trader-reasons">
+        {d.reasons.map((x, i) => (
+          <li key={i}>{x}</li>
+        ))}
+      </ul>
+      <div className="campaign-note">
+        {t.trader.invalidation}: {d.invalidation}
+      </div>
+      <div className="campaign-note dim">
+        {t.trader.confidence}: {fmtPct(d.confidence, 0)}
+      </div>
+      {r.triggers !== undefined && r.triggers.length > 0 && (
+        <div className="campaign-note dim">
+          {t.trader.triggers}: {r.triggers.join(', ')}
+        </div>
+      )}
+      <div className="campaign-note dim num">{t.trader.nextLook(d.recheckMinutes, when(nextLookAt(r.ts, d.recheckMinutes)), px(d.wakeAbove), px(d.wakeBelow))}</div>
+    </>
+  );
+}
+
+function ResultLine({ x }: { x: TraderTradeResult }) {
+  const t = useT();
+  return (
+    <>
+      {labelOf(t.trader.side, x.side)} · {t.trader.pnl} <Pnl v={x.pnl} /> · {t.trader.end} {labelOf(t.trader.endLabel, x.end)}
+    </>
+  );
+}
+
 function LogRow({ r }: { r: TraderLogRecord }) {
   const t = useT();
-  const action = r.decision ? labelOf(t.trader.action, r.decision.action) : '';
-  const text = r.verdict ?? r.decision?.oneLiner ?? '';
+  const [open, setOpen] = useState(false);
+  const d = r.decision ?? null;
+  const side = (x: 'long' | 'short'): string => labelOf(t.trader.side, x);
+  const tp = (v: string | null): string => (v === null ? DASH : fmtPx(v));
+  let body: ReactNode = null;
+  if (r.error !== undefined) body = <span className="neg">{r.error}</span>;
+  else if (d !== null) {
+    body = (
+      <>
+        <div className="trader-oneliner">{d.oneLiner}</div>
+        {r.verdict !== undefined && r.verdict !== '' && r.verdict !== d.action && <div className="campaign-note dim">{r.verdict}</div>}
+      </>
+    );
+  } else if (r.order !== undefined) {
+    const o = r.order;
+    body = t.trader.orderLine(side(o.side === 'buy' ? 'long' : 'short'), fmtContracts(o.contracts), fmtPx(o.entryPx), fmtPx(o.stopPx), tp(o.targetPx), o.leverage);
+  } else if (r.result !== undefined) {
+    body = <ResultLine x={r.result} />;
+  } else if (r.control !== undefined) {
+    const c = r.control;
+    body = 'direction' in c ? t.trader.controlLine(side(c.direction), fmtPx(c.entryPx), fmtPx(c.stopPx), tp(c.targetPx)) : <ResultLine x={c} />;
+  } else if (r.verdict !== undefined) body = r.verdict;
   return (
-    <tr>
-      <td className="left">{when(r.ts)}</td>
-      <td className="left">{labelOf(t.trader.kind, r.kind)}</td>
-      <td className="left">{action}</td>
-      <td className="left">{r.error === undefined ? text : <span className="neg">{r.error}</span>}</td>
-    </tr>
+    <>
+      <tr>
+        <td className="left">{when(r.ts)}</td>
+        <td className="left">{labelOf(t.trader.kind, r.kind)}</td>
+        <td className="left">{d !== null && <span className={`campaign-badge trader-action-${d.action}`}>{labelOf(t.trader.action, d.action)}</span>}</td>
+        <td className="left">
+          {d !== null && r.error === undefined ? (
+            <button type="button" className="trader-toggle" aria-expanded={open} onClick={() => setOpen(!open)}>
+              {body}
+            </button>
+          ) : (
+            body
+          )}
+        </td>
+      </tr>
+      {open && d !== null && (
+        <tr className="trader-log-detail">
+          <td colSpan={4} className="left">
+            <DecisionDetail r={r} d={d} />
+          </td>
+        </tr>
+      )}
+    </>
   );
 }
 
@@ -284,6 +381,7 @@ export function TraderPanel() {
         <StatusCard view={view} />
         <LastCard last={view.last} />
         {view.position !== null && <PositionCard position={view.position} />}
+        {view.upcoming.length > 0 && <UpcomingCard upcoming={view.upcoming} />}
         <TodayCard view={view} />
         {view.control !== null && <ControlCard control={view.control} />}
       </div>

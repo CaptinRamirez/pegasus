@@ -643,7 +643,8 @@ at 10x on a hard-capped pot. Settings (`.env`):
 | `TRADER_DAILY_LOSS_PCT` | `0.06` | loss of the day, fraction of the day's starting equity, at which it stops for the day |
 | `TRADER_MAX_CONSECUTIVE_LOSSES` | `3` | after this many losses in a row it pauses 24 hours |
 | `TRADER_MODEL` / `TRADER_EFFORT` | `claude-opus-5-5` / `high` | the model (the SDK reads `ANTHROPIC_API_KEY` from the environment; without it the trader is `blocked`) and its effort |
-| `TRADER_CADENCE` | `hourly` | `hourly`: the hourly closes and the 15-minute closes that trigger an event; `15m`: every 15-minute close |
+| `TRADER_CADENCE` | `model` | `model`: the model names at every decision when it looks again (15 to 480 minutes) and the prices that wake it earlier; it is also asked at the session's first close of the day, near its stop or target, and right after a high-impact US release. `hourly`: the hourly closes and the 15-minute closes that cross a level of the day; `15m`: every 15-minute close |
+| `TRADER_NEWS` | `1` | the economic calendar (ForexFactory's weekly feed: time, impact, forecast, previous) and the last six hours of headlines from the Federal Reserve, CNBC Economy, MarketWatch and Cointelegraph in the dossier (`services/trader-macro.ts`) |
 | `TRADER_CONTROL` | `1` | the coin-flip control beside the trader |
 | `TRADER_CALENDAR` | | scheduled events the model is told about, `YYYY-MM-DD name;...` |
 | `TRADER_STATE_FILE` / `TRADER_LOG_FILE` | `data/trader-state.json` / `data/trader-log.jsonl` | its state and its decision log |
@@ -1076,6 +1077,9 @@ stack; where the trader is disabled the view has `enabled: false` and status `di
 GET /api/trader -> TraderView (packages/shared/src/trader.ts)
 {
   enabled: boolean;
+  cadence: 'model' | 'hourly' | '15m';
+  wake: { at: number; above: string | null; below: string | null; setAt: number } | null;   // the next look the model asked for
+  upcoming: TraderMacroEvent[];                      // releases still to come in the next day
   status: 'disabled' | 'blocked' | 'idle' | 'in-session' | 'holding';
   reason: { code: string; message: string } | null;   // blocked: STATE_UNREADABLE, NO_MODEL_CREDENTIALS, ACCOUNT_UNAVAILABLE, FOREIGN_POSITION (a position on its account it did not open: it asks and opens nothing until it is closed)
   instId: string;

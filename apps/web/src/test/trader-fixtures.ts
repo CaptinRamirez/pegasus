@@ -27,10 +27,30 @@ export const decision: TraderDecision = {
   reasons: ['EMA 5 > 10 > 21 on 1H', 'Price holds above the VWAP'],
   invalidation: 'A 1H close below 81,500',
   oneLiner: 'Long the retest of the VWAP',
+  recheckMinutes: 60,
+  wakeAbove: '83000',
+  wakeBelow: '81200',
+};
+
+export const flatDecision: TraderDecision = {
+  ...decision,
+  action: 'flat',
+  stopPx: null,
+  targetPx: null,
+  reasons: ['Volume is thin before the release'],
+  invalidation: 'A break of 83,000 on volume',
+  oneLiner: 'Waiting for the CPI print',
+  recheckMinutes: 45,
 };
 
 export const enabledView: TraderView = {
   enabled: true,
+  cadence: 'model',
+  wake: { at: NOW + 30 * 60_000, above: '83000', below: '81200', setAt: NOW - 30 * 60_000 },
+  upcoming: [
+    { time: NOW + 90 * 60_000, title: 'CPI m/m', country: 'USD', impact: 'High', forecast: '0.3%', previous: '0.2%', minutesFromNow: 90 },
+    { time: NOW + 300 * 60_000, title: 'Crude Oil Inventories', country: 'USD', impact: 'Medium', forecast: '', previous: '1.2M', minutesFromNow: 300 },
+  ],
   status: 'holding',
   reason: null,
   instId: 'BTC-USDT-SWAP',
@@ -67,6 +87,6 @@ export const disabledTraderView: TraderView = {
 };
 
 export const traderLog: TraderLogRecord[] = [
-  { ts: NOW - 30 * 60_000, kind: 'decision', instId: 'BTC-USDT-SWAP', decision, verdict: 'ok' },
+  { ts: NOW - 30 * 60_000, kind: 'decision', instId: 'BTC-USDT-SWAP', decision: flatDecision, verdict: 'flat', triggers: ['hourly close'] },
   { ts: NOW - 90 * 60_000, kind: 'error', instId: 'BTC-USDT-SWAP', error: 'model timed out' },
 ];

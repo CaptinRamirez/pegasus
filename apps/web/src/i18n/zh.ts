@@ -168,6 +168,17 @@ export const zh: Messages = {
     sessionLine: (start, end) => `UTC ${start} 至 ${end}`,
     nextCall: '下次调用',
     noNextCall: '无安排',
+    cadence: '节奏',
+    cadenceLabel: { model: 'Claude 自己决定', hourly: '整点和事件', '15m': '每 15 分钟' },
+    wakeLine: (above: string | null, below: string | null) => `或价格${[above === null ? null : `升破 ${above}`, below === null ? null : `跌破 ${below}`].filter((x) => x !== null).join('、')}时提前`,
+    upcoming: '即将公布的数据',
+    forecast: '预期',
+    previousValue: '前值',
+    impactHigh: '高',
+    nextLook: (min: number, at: string, above: string | null, below: string | null) =>
+      `${min} 分钟后再看（${at}）${above === null && below === null ? '' : `，提前条件：${[above === null ? null : `升破 ${above}`, below === null ? null : `跌破 ${below}`].filter((x) => x !== null).join('、')}`}`,
+    orderLine: (side: string, contracts: string, entry: string, stop: string, target: string, leverage: string) => `${side} ${contracts} 张 @ ${entry}，止损 ${stop}，目标 ${target}，${leverage} 倍`,
+    controlLine: (side: string, entry: string, stop: string, target: string) => `抛硬币：${side} @ ${entry}，止损 ${stop}，目标 ${target}`,
     model: '模型',
     guardrails: '护栏',
     guardrailsLine: (g) =>

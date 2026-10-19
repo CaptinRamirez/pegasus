@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { D } from '../src/decimal.js';
-import { checkDecision, DEFAULT_TRADER_GUARDRAILS, emaAlignment, emaLast, emaSeries, estimateUsd, inTraderSession, macd, minutesTo, roundLevels, rsi, traderSize, volumeRatio, vwap, type TraderDecision, type TraderPosition } from '../src/trader.js';
+import { checkDecision, DEFAULT_TRADER_GUARDRAILS, wakeOf, emaAlignment, emaLast, emaSeries, estimateUsd, inTraderSession, macd, minutesTo, roundLevels, rsi, traderSize, volumeRatio, vwap, type TraderDecision, type TraderPosition } from '../src/trader.js';
 import type { Candle, Instrument } from '../src/types.js';
 
 const inst: Instrument = {
@@ -25,7 +25,7 @@ const inst: Instrument = {
 
 const bar = (ts: number, close: number, vol = 1): Candle => ({ ts, open: String(close), high: String(close + 1), low: String(close - 1), close: String(close), vol: String(vol), volCcy: '0', confirm: true });
 
-const decision = (over: Partial<TraderDecision>): TraderDecision => ({ action: 'flat', entryType: 'market', limitPrice: null, stopPx: null, targetPx: null, confidence: 0.5, reasons: ['r'], invalidation: 'i', oneLiner: 'o', ...over });
+const decision = (over: Partial<TraderDecision>): TraderDecision => ({ action: 'flat', entryType: 'market', limitPrice: null, stopPx: null, targetPx: null, confidence: 0.5, reasons: ['r'], invalidation: 'i', oneLiner: 'o', recheckMinutes: 60, wakeAbove: null, wakeBelow: null, ...over });
 
 describe('indicators', () => {
   it('EMA is seeded with the simple average and then smoothed with 2 / (n + 1)', () => {
@@ -145,5 +145,19 @@ describe('cost estimate', () => {
   it('prices the tokens at the model rates', () => {
     expect(estimateUsd('claude-opus-5-5', { inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0 }).toFixed()).toBe('4');
     expect(estimateUsd('claude-opus-5-5', { inputTokens: 6000, outputTokens: 2000, cacheReadTokens: 3000 }).toFixed(4)).toBe('0.0646');
+  });
+});
+
+describe('wakeOf', () => {
+  const bar = Date.UTC(2026, 9, 19, 13, 0);
+  const M = 60_000;
+  it('keeps the recheck within 15 to 480 minutes, on a 15-minute close, with the wake levels that are prices', () => {
+    expect(wakeOf(decision({ recheckMinutes: 120, wakeAbove: '82428.5', wakeBelow: '81682' }), bar)).toEqual({ at: bar + 120 * M, above: '82428.5', below: '81682', setAt: bar });
+    expect(wakeOf(decision({ recheckMinutes: 5 }), bar).at).toBe(bar + 15 * M);
+    expect(wakeOf(decision({ recheckMinutes: 2000 }), bar).at).toBe(bar + 480 * M);
+    // 50 minutes is the 15-minute close after it: one hour
+    expect(wakeOf(decision({ recheckMinutes: 50 }), bar).at).toBe(bar + 60 * M);
+    expect(wakeOf(decision({ recheckMinutes: Number.NaN, wakeAbove: 'soon', wakeBelow: '-3' }), bar)).toEqual({ at: bar + 60 * M, above: null, below: null, setAt: bar });
+    expect(wakeOf(null, bar).at).toBe(bar + 60 * M);
   });
 });

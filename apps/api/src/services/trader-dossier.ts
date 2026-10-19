@@ -20,7 +20,9 @@ import {
   type TraderFrame,
   type TraderGuardrails,
   type TraderLevels,
+  type TraderMacro,
   type TraderPosition,
+  type TraderPreviousDecision,
 } from '@pegasus/shared';
 import type { OkxClients } from '../okx/clients.js';
 import type { MarketDataService } from './market-data.js';
@@ -157,6 +159,8 @@ export interface BuildDossierInput {
   /** Today's scheduled events from the settings */
   calendar: string[];
   triggers: string[];
+  macro: TraderMacro;
+  previous: TraderPreviousDecision | null;
 }
 
 export async function buildTraderDossier(input: BuildDossierInput): Promise<TraderDossier> {
@@ -187,6 +191,8 @@ export async function buildTraderDossier(input: BuildDossierInput): Promise<Trad
     account: input.account,
     guardrails: g,
     triggers: input.triggers,
+    macro: input.macro,
+    previous: input.previous,
   };
 }
 

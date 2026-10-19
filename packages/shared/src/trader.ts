@@ -237,6 +237,56 @@ export const DEFAULT_TRADER_GUARDRAILS: TraderGuardrails = {
   maxLimitDistancePct: '0.02',
 };
 
+/** A scheduled release of the economic calendar, as the model sees it (the calendar gives no actual figures). */
+export interface TraderMacroEvent {
+  time: number;
+  title: string;
+  /** USD, EUR, ... or All */
+  country: string;
+  /** High, Medium, Low, Holiday */
+  impact: string;
+  forecast: string;
+  previous: string;
+  /** Negative once it is out */
+  minutesFromNow: number;
+}
+
+/** A headline from one of the news feeds: data for the model, never an instruction. */
+export interface TraderHeadline {
+  time: number;
+  source: string;
+  title: string;
+  minutesAgo: number;
+}
+
+export interface TraderMacro {
+  /** Releases from two hours ago to a day ahead: high impact anywhere, medium impact for the US */
+  calendar: TraderMacroEvent[];
+  /** The last hours of the feeds, newest first */
+  headlines: TraderHeadline[];
+  /** What could not be read */
+  notes: string[];
+}
+
+/** The decision before this one, so that the model stays consistent with itself. */
+export interface TraderPreviousDecision {
+  ts: number;
+  action: TraderAction;
+  oneLiner: string;
+  invalidation: string;
+  wakeAbove: string | null;
+  wakeBelow: string | null;
+}
+
+/** When the model is asked next: at `at` (a 15-minute close), or earlier when the price reaches a level. */
+export interface TraderWake {
+  at: number;
+  above: string | null;
+  below: string | null;
+  /** The close it was set at */
+  setAt: number;
+}
+
 export interface TraderDossier {
   instId: string;
   /** The instant the dossier is built at: the close of the last 15-minute bar */
@@ -249,14 +299,22 @@ export interface TraderDossier {
   derivatives: TraderDerivatives;
   account: TraderAccountInfo;
   guardrails: TraderGuardrails;
-  /** Why the model is being asked now: the hourly close, or the events the bar triggered */
+  /** Why the model is being asked now: the session's open, its own recheck time, a wake level, the position, a release */
   triggers: string[];
+  /** The economic calendar and the headlines of the last hours */
+  macro: TraderMacro;
+  previous: TraderPreviousDecision | null;
 }
 
 // ---- the decision ----
 
 export const TRADER_ACTIONS = ['long', 'short', 'flat', 'close', 'tighten_stop'] as const;
 export type TraderAction = (typeof TRADER_ACTIONS)[number];
+
+/** The model's recheck time is kept within these minutes: 480 is the rest of a session. */
+export const RECHECK_MIN_MINUTES = 15;
+export const RECHECK_MAX_MINUTES = 480;
+const FIFTEEN_MS = 15 * 60_000;
 
 /** What the model answers. Kept to what structured outputs accept; the ranges are checked by checkDecision. */
 export const traderDecisionSchema = z.object({
@@ -276,6 +334,11 @@ export const traderDecisionSchema = z.object({
   invalidation: z.string(),
   /** One sentence for the screen */
   oneLiner: z.string(),
+  /** When to be asked again, minutes from now: 15 to 480 (480: the rest of the session) */
+  recheckMinutes: z.number(),
+  /** Prices that wake the trader before then, decimal strings; null for none */
+  wakeAbove: z.string().nullable(),
+  wakeBelow: z.string().nullable(),
 });
 export type TraderDecision = z.infer<typeof traderDecisionSchema>;
 
@@ -328,6 +391,18 @@ export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrai
     target = t.toFixed();
   }
   return { ok: true, action: d.action, entryType: d.entryType, entryPx: entry.toFixed(), stopPx: stop.toFixed(), targetPx: target };
+}
+
+/**
+ * The next look the model asked for: its recheck time kept within 15 to 480 minutes (60 when there is no decision or
+ * no usable number) and moved to the next 15-minute close, and its wake levels when they are prices.
+ */
+export function wakeOf(d: Pick<TraderDecision, 'recheckMinutes' | 'wakeAbove' | 'wakeBelow'> | null, bar: number): TraderWake {
+  const raw = d !== null && Number.isFinite(d.recheckMinutes) ? d.recheckMinutes : 60;
+  const minutes = Math.min(RECHECK_MAX_MINUTES, Math.max(RECHECK_MIN_MINUTES, Math.round(raw)));
+  const at = Math.ceil((bar + minutes * 60_000) / FIFTEEN_MS) * FIFTEEN_MS;
+  const level = (s: string | null | undefined): string | null => (s !== null && s !== undefined && isDecimal(s) ? D(s).toFixed() : null);
+  return { at, above: level(d?.wakeAbove), below: level(d?.wakeBelow), setAt: bar };
 }
 
 // ---- sizing ----
@@ -449,6 +524,12 @@ export interface TraderLastDecision {
 
 export interface TraderView {
   enabled: boolean;
+  /** model: the model sets its next look; hourly: hourly closes and level events; 15m: every 15-minute close */
+  cadence: 'model' | 'hourly' | '15m';
+  /** The next look the model asked for; null before its first decision */
+  wake: TraderWake | null;
+  /** Releases still to come in the next day, from the last calendar read */
+  upcoming: TraderMacroEvent[];
   status: TraderStatus;
   reason: TraderStatusReason | null;
   instId: string;

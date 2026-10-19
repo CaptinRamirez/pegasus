@@ -1,6 +1,6 @@
 import { copyFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { TraderControlState, TraderPosition, TraderTradeResult } from '@pegasus/shared';
+import type { TraderControlState, TraderPosition, TraderPreviousDecision, TraderTradeResult, TraderWake } from '@pegasus/shared';
 
 /**
  * What the Claude auto trader keeps across restarts (TRADER_STATE_FILE): the day's counters the guardrails read, the
@@ -53,6 +53,10 @@ export interface TraderState {
   usage: TraderUsageDay;
   /** Coin flips drawn so far: the seed of the next one */
   flips: number;
+  /** The next look the model asked for (absent in files written before it decided its own cadence) */
+  wake?: TraderWake | null;
+  /** Its last decision, shown to it at the next call */
+  previous?: TraderPreviousDecision | null;
 }
 
 export const RECENT_KEPT = 50;
@@ -77,6 +81,8 @@ export function emptyTraderState(now: number): TraderState {
     recent: [],
     usage: { date, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 },
     flips: 0,
+    wake: null,
+    previous: null,
   };
 }
 

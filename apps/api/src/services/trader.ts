@@ -19,6 +19,7 @@ import {
   type TraderDossier,
   type TraderLastDecision,
   type TraderLogRecord,
+  type TraderMacro,
   type TraderPosition,
   type TraderStatus,
   type TraderStatusReason,
@@ -26,6 +27,7 @@ import {
   type TraderUsage,
   type TraderVerdict,
   type TraderView,
+  wakeOf,
 } from '@pegasus/shared';
 import type { TraderConfig } from '../config.js';
 import type { Logger } from '../logger.js';
@@ -35,6 +37,7 @@ import type { MarketDataService } from './market-data.js';
 import { generateClOrdId, type OrderService } from './order-service.js';
 import type { RiskEngine } from './risk-engine.js';
 import { buildTraderDossier, detectTriggers, exchangeDossierSources, FIFTEEN_MINUTES_MS, fifteenCloseAtOrBefore, type TraderDossierSources } from './trader-dossier.js';
+import { FeedMacroSource, NO_MACRO, type TraderMacroSource } from './trader-macro.js';
 import { ClaudeTraderModel, hasAnthropicCredentials, type TraderModel, type TraderModelAnswer } from './trader-model.js';
 import { emptyTraderState, loadTraderState, RECENT_KEPT, rolledToDay, saveTraderState, utcDate, type PendingLimit, type TraderState } from './trader-state.js';
 
@@ -47,8 +50,12 @@ import { emptyTraderState, loadTraderState, RECENT_KEPT, rolledToDay, saveTrader
  * At every 15-minute close (the clock is looked at every checkEveryMs; a close missed while the API was down is not
  * made up): the position is reconciled with the exchange (a position gone is a result, measured from the equity), a
  * resting limit order of the close before is cancelled, the coin-flip control is settled on the bar, and, in the
- * session, the dossier is built. The model is called at the hourly close, at a 15-minute close that triggered an event
- * (detectTriggers), or at every close with TRADER_CADENCE=15m. Its decision goes through checkDecision, then the
+ * session, the dossier is built with the economic calendar and the latest headlines (trader-macro.ts, TRADER_NEWS).
+ * When the model is asked depends on TRADER_CADENCE. model (the default): the model names at every decision when it
+ * wants to look again and the prices that wake it earlier (wakeOf); it is also asked at the first close of each session
+ * day, when the position nears its stop or reaches its target, and at the first close after a high-impact US release
+ * (and the close before one while a position is open) — wakeReasons. hourly: at the hourly close and at a 15-minute
+ * close that crossed a level of the day (detectTriggers). 15m: at every close. Its decision goes through checkDecision, then the
  * guardrails of the day (trade cap, daily loss, cooldown, kill switch, a resting limit), then the exchange: an isolated
  * order sized by traderSize with the stop attached (and the target as a take-profit), a close, or a tighter stop.
  * Outside the session an open position is left to its stop: no call is made (the board's choice).
@@ -79,6 +86,8 @@ export interface TraderServiceOptions {
   model?: TraderModel;
   /** The exchange's by default */
   sources?: TraderDossierSources;
+  /** The calendar and the news feeds over HTTP by default (none with TRADER_NEWS=0) */
+  macro?: TraderMacroSource;
   /** How often the clock is looked at; 0: never by itself (tick() is called). Default 15 s */
   checkEveryMs?: number;
   /** Interval and count of the polls for the bar that just closed to be confirmed. Default 5 s, 12 polls */
@@ -98,6 +107,9 @@ export function disabledTraderView(config: TraderConfig, now = Date.now()): Trad
     status: 'disabled',
     reason: { code: 'TRADER_DISABLED', message: 'the trader is not enabled (TRADER_ENABLED=1, paper trading only, on a stack of its own)' },
     instId: config.instId,
+    cadence: config.cadence,
+    wake: null,
+    upcoming: [],
     session: { startHour: config.guardrails.sessionStartHour, endHour: config.guardrails.sessionEndHour, inSession: false },
     guardrails: config.guardrails,
     model: config.model,
@@ -126,6 +138,9 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
   private foreignWarned = false;
   private readonly model: TraderModel | null;
   private readonly sources: TraderDossierSources;
+  private readonly macroSource: TraderMacroSource;
+  /** The last macro block read, for the view's upcoming releases */
+  private lastMacro: TraderMacro | null = null;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly checkEveryMs: number;
@@ -143,6 +158,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     this.now = opts.now ?? Date.now;
     this.sleep = opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms).unref()));
     this.sources = opts.sources ?? exchangeDossierSources(deps.market, deps.clients);
+    this.macroSource = opts.macro ?? (config.news ? new FeedMacroSource() : NO_MACRO);
     this.checkEveryMs = opts.checkEveryMs ?? 15_000;
     this.pollMs = opts.pollMs ?? 5_000;
     this.pollAttempts = opts.pollAttempts ?? 12;
@@ -161,6 +177,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       return;
     }
     this.state = loaded.state;
+    this.restoreLastDecision();
     this.log.info({ file: this.config.stateFile, instId: this.config.instId, model: this.model?.name ?? null, position: this.state.position?.side ?? null, tradesToday: this.state.tradesToday }, 'trader state loaded');
     if (this.model === null) this.log.error('the trader has no model credentials (ANTHROPIC_API_KEY): it is blocked until the API is restarted with them');
     if (this.checkEveryMs > 0) {
@@ -230,12 +247,17 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     }
     this.foreignWarned = false;
     const position = this.state.position;
-    const dossier = await buildTraderDossier({ instId: this.config.instId, now: bar, sources: this.sources, account: this.accountInfo(equity, position), guardrails: g, calendar: this.calendarFor(bar), triggers: [] });
+    const macro = await this.readMacro(bar);
+    const dossier = await buildTraderDossier({ instId: this.config.instId, now: bar, sources: this.sources, account: this.accountInfo(equity, position), guardrails: g, calendar: this.calendarFor(bar), triggers: [], macro, previous: this.state.previous ?? null });
     const triggers = detectTriggers(this.lastDossier, dossier, position);
     const hourly = bar % HOUR_MS === 0;
     this.lastDossier = dossier;
-    if (!(this.config.cadence === '15m' || hourly || triggers.length > 0)) return done();
-    dossier.triggers = [...(hourly ? ['hourly close'] : []), ...(this.config.cadence === '15m' && !hourly ? ['15-minute close'] : []), ...triggers];
+    const reasons =
+      this.config.cadence === 'model'
+        ? this.wakeReasons(bar, dossier, fifteen, triggers)
+        : [...(hourly ? ['hourly close'] : []), ...(this.config.cadence === '15m' && !hourly ? ['15-minute close'] : []), ...triggers];
+    if (reasons.length === 0) return done();
+    dossier.triggers = reasons;
     await this.consult(dossier, bar, now, equity);
     done();
   }
@@ -269,10 +291,14 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       this.log.warn({ err: (err as Error).message }, 'trader model call failed');
       this.record({ ts: now, kind: 'error', instId: this.config.instId, triggers: dossier.triggers, dossier, error });
       this.lastDecision = { ts: bar, decision: null, verdict: error, executed: false, usage: null, triggers: dossier.triggers, error };
+      // asked again in half an hour; the wake levels are dropped so that a failing model is not called at every close
+      this.state.wake = { at: bar + 30 * 60_000, above: null, below: null, setAt: bar };
       return;
     }
     this.addUsage(answer.usage);
     const decision = answer.decision;
+    this.state.wake = wakeOf(decision, bar);
+    if (decision) this.state.previous = { ts: bar, action: decision.action, oneLiner: decision.oneLiner, invalidation: decision.invalidation, wakeAbove: this.state.wake.above, wakeBelow: this.state.wake.below };
     let verdictText = answer.problem ?? 'no decision';
     let executed = false;
     if (decision) {
@@ -296,6 +322,49 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     this.record({ ts: now, kind: 'decision', instId: this.config.instId, triggers: dossier.triggers, dossier, decision, verdict: verdictText, usage: answer.usage });
     this.lastDecision = { ts: bar, decision, verdict: verdictText, executed, usage: answer.usage, triggers: dossier.triggers, error: answer.problem };
     this.log.info({ action: decision?.action ?? null, verdict: verdictText, executed, tokens: answer.usage.inputTokens + answer.usage.outputTokens, ms: answer.usage.ms }, 'trader decision');
+  }
+
+  /**
+   * Why the model is asked at this close with TRADER_CADENCE=model; empty when it is not. The first close of the session
+   * day; its own recheck time; a wake level reached by the bar that closed or by the mark; the position near its stop or
+   * at its target; a high-impact US release that came out in the bar that closed, or (with a position) one due before the
+   * next close.
+   */
+  private wakeReasons(bar: number, dossier: TraderDossier, fifteen: readonly Candle[], levelTriggers: readonly string[]): string[] {
+    const out: string[] = [];
+    const wake = this.state.wake ?? null;
+    const lastCall = this.state.lastCallAt;
+    if (lastCall === null || utcDate(lastCall) !== utcDate(bar)) out.push('session open');
+    else if (wake === null || bar >= wake.at) out.push('scheduled recheck');
+    const last = fifteen.find((c) => c.confirm && c.ts === bar - FIFTEEN_MINUTES_MS);
+    const mark = D(dossier.mark);
+    if (wake?.above != null && (mark.gte(wake.above) || (last !== undefined && D(last.high).gte(wake.above)))) out.push(`price reached ${wake.above}`);
+    if (wake?.below != null && (mark.lte(wake.below) || (last !== undefined && D(last.low).lte(wake.below)))) out.push(`price reached ${wake.below}`);
+    out.push(...levelTriggers.filter((x) => x === 'mark near the stop' || x === 'mark at the target'));
+    for (const e of dossier.macro.calendar) {
+      if (e.country !== 'USD' || e.impact !== 'High') continue;
+      if (e.time > bar - FIFTEEN_MINUTES_MS && e.time <= bar) out.push(`high-impact release out: ${e.title}`);
+      else if (this.state.position && e.time > bar && e.time <= bar + FIFTEEN_MINUTES_MS) out.push(`high-impact release in ${Math.round((e.time - bar) / 60_000)} min with a position open: ${e.title}`);
+    }
+    return out;
+  }
+
+  private async readMacro(bar: number): Promise<TraderMacro> {
+    try {
+      this.lastMacro = await this.macroSource.read(bar);
+    } catch (err) {
+      this.lastMacro = { calendar: [], headlines: [], notes: [`news not read (${(err as Error).message})`] };
+    }
+    return this.lastMacro;
+  }
+
+  /** The view's last decision after a restart: the newest decision of the log. */
+  private restoreLastDecision(): void {
+    const rec = this.logPage(50).records.find((r) => r.kind === 'decision');
+    if (!rec) return;
+    const verdict = rec.verdict ?? '';
+    const executed = /^(long|short|limit|closed|stop tightened)/.test(verdict);
+    this.lastDecision = { ts: rec.ts, decision: rec.decision ?? null, verdict, executed, usage: rec.usage ?? null, triggers: rec.triggers ?? [], error: null };
   }
 
   /** Why no position may be opened now; null when one may. */
@@ -650,6 +719,17 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
   /** The next instant the model is called at the latest: the next hourly close (every 15 minutes with TRADER_CADENCE=15m) inside the session. */
   nextCallAt(now: number): number {
     const g = this.config.guardrails;
+    if (this.config.cadence === 'model') {
+      // the first close in session that opens a new day or reaches the wake time; a wake level may come earlier
+      const wakeAt = this.state.wake?.at ?? null;
+      const lastCall = this.state.lastCallAt;
+      let t = Math.floor(now / FIFTEEN_MINUTES_MS) * FIFTEEN_MINUTES_MS + FIFTEEN_MINUTES_MS;
+      for (let i = 0; i < 800; i++, t += FIFTEEN_MINUTES_MS) {
+        if (!inTraderSession(t, g)) continue;
+        if (lastCall === null || utcDate(lastCall) !== utcDate(t) || wakeAt === null || t >= wakeAt) return t;
+      }
+      return t;
+    }
     const step = this.config.cadence === '15m' ? FIFTEEN_MINUTES_MS : HOUR_MS;
     let t = Math.floor(now / step) * step + step;
     for (let i = 0; i < 200; i++, t += step) if (inTraderSession(t, g)) return t;
@@ -661,8 +741,12 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     const { status, reason } = this.status(now);
     const live = this.state.position ? this.livePosition() : null;
     const usage = this.state.usage;
+    const upcoming = (this.lastMacro?.calendar ?? []).filter((e) => e.time >= now).slice(0, 6);
     return {
       enabled: true,
+      cadence: this.config.cadence,
+      wake: this.config.cadence === 'model' ? (this.state.wake ?? null) : null,
+      upcoming,
       status,
       reason,
       instId: this.config.instId,

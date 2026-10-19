@@ -3,7 +3,7 @@ import type { TraderDecision, TraderDossier } from '@pegasus/shared';
 import { describe, expect, it } from 'vitest';
 import { ClaudeTraderModel, TRADER_MAX_TOKENS } from '../src/services/trader-model.js';
 
-const decision: TraderDecision = { action: 'flat', entryType: 'market', limitPrice: null, stopPx: null, targetPx: null, confidence: 0.4, reasons: ['15m 均线混乱'], invalidation: '收回日内高点', oneLiner: '不做' };
+const decision: TraderDecision = { action: 'flat', entryType: 'market', limitPrice: null, stopPx: null, targetPx: null, confidence: 0.4, reasons: ['15m 均线混乱'], invalidation: '收回日内高点', oneLiner: '不做', recheckMinutes: 120, wakeAbove: '82428', wakeBelow: '81682' };
 const dossier = { instId: 'BTC-USDT-SWAP' } as unknown as TraderDossier;
 
 /** A client whose stream returns `message`; the request it was given is kept. */

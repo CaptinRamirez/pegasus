@@ -105,8 +105,15 @@ const envSchema = z.object({
   /** The model asked (the SDK reads ANTHROPIC_API_KEY from the environment) and its effort. */
   TRADER_MODEL: z.string().min(1).default('claude-opus-5-5'),
   TRADER_EFFORT: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('high'),
-  /** hourly: at every hourly close and at 15-minute closes that trigger an event; 15m: at every 15-minute close. */
-  TRADER_CADENCE: z.enum(['hourly', '15m']).default('hourly'),
+  /**
+   * model: the model says at every decision when it wants to look again (15 minutes to the rest of the session) and at
+   * which prices it is woken early; it is also asked at the session's open, near its stop or target and right after a
+   * high-impact US release. hourly: every hourly close and the 15-minute closes that cross a level of the day. 15m: every
+   * 15-minute close.
+   */
+  TRADER_CADENCE: z.enum(['model', 'hourly', '15m']).default('model'),
+  /** '1' gives the model the economic calendar and the latest headlines of a few public feeds (services/trader-macro.ts). */
+  TRADER_NEWS: z.enum(['0', '1']).default('1'),
   /** '1' keeps the coin-flip control beside the trader. */
   TRADER_CONTROL: z.enum(['0', '1']).default('1'),
   /** Scheduled events the model is told about, 'YYYY-MM-DD name' separated by semicolons. */
@@ -166,7 +173,9 @@ export interface TraderConfig {
   guardrails: TraderGuardrails;
   model: string;
   effort: TraderEffort;
-  cadence: 'hourly' | '15m';
+  cadence: 'model' | 'hourly' | '15m';
+  /** The economic calendar and the headlines in the dossier */
+  news: boolean;
   control: boolean;
   /** Scheduled events, by UTC date */
   calendar: Array<{ date: string; name: string }>;
@@ -302,6 +311,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     model: e.TRADER_MODEL,
     effort: e.TRADER_EFFORT,
     cadence: e.TRADER_CADENCE,
+    news: e.TRADER_NEWS === '1',
     control: e.TRADER_CONTROL === '1',
     calendar,
     stateFile: resolve(REPO_ROOT, e.TRADER_STATE_FILE),
