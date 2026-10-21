@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { D } from '../src/decimal.js';
-import { checkDecision, DEFAULT_TRADER_GUARDRAILS, recentTradesOf, traderCosts, wakeOf, emaAlignment, emaLast, emaSeries, estimateUsd, inTraderSession, macd, minutesTo, roundLevels, rsi, traderSize, volumeRatio, vwap, type TraderDecision, type TraderPosition } from '../src/trader.js';
+import { checkDecision, DEFAULT_TRADER_GUARDRAILS, recentTradesOf, swingPoints, traderCosts, wakeOf, emaAlignment, emaLast, emaSeries, estimateUsd, inTraderSession, macd, minutesTo, roundLevels, rsi, traderSize, volumeRatio, vwap, type TraderDecision, type TraderPosition } from '../src/trader.js';
 import type { Candle, Instrument } from '../src/types.js';
 
 const inst: Instrument = {
@@ -177,5 +177,19 @@ describe('what the model is shown about costs and its own trades', () => {
       { side: 'short', entryPx: '84000', stopPx: null, targetPx: null, stopPct: null, minutesHeld: 30, end: 'close', pnl: '0.8', closedAt: t0 - 1_800_000 },
     ]);
     expect(recentTradesOf([stopped, old], 1)).toHaveLength(1);
+  });
+});
+
+describe('swingPoints', () => {
+  it('finds the highs above and the lows below their three neighbours either side, the newest three bars excluded', () => {
+    // closes: a hill at bar 5, a valley at bar 10, a hill at bar 14 (inside the last three: not yet a pivot)
+    const closes = [100, 101, 102, 103, 104, 110, 104, 103, 102, 101, 95, 101, 102, 103, 112, 103, 102];
+    const candles = closes.map((c, i) => bar(i, c));
+    expect(swingPoints(candles)).toEqual([
+      { ts: 5, kind: 'high', px: '111' },
+      { ts: 10, kind: 'low', px: '94' },
+    ]);
+    expect(swingPoints(candles, 3, 1)).toEqual([{ ts: 10, kind: 'low', px: '94' }]);
+    expect(swingPoints(candles.slice(0, 5))).toEqual([]);
   });
 });

@@ -133,8 +133,33 @@ export interface TraderFrame {
   atr14: string | null;
   /** Last bar's volume over the 20 before it */
   volumeRatio: string | null;
-  /** The last 12 confirmed bars, oldest first: what a chart would show */
-  bars: Array<{ ts: number; open: string; high: string; low: string; close: string }>;
+  /** The last confirmed bars (up to 96), oldest first, each [open time, open, high, low, close, volume]: what a chart would show */
+  bars: TraderBarRow[];
+  /** The last swing highs and lows of those bars (a high above the 3 bars either side, a low below), oldest first */
+  swings: TraderSwing[];
+}
+
+export type TraderBarRow = [ts: number, open: string, high: string, low: string, close: string, volume: string];
+
+export interface TraderSwing {
+  ts: number;
+  kind: 'high' | 'low';
+  px: string;
+}
+
+/**
+ * The pivot points of a series: a bar whose high is above the highs of the `k` bars on each side is a swing high, one
+ * whose low is below their lows a swing low. The last `n`, oldest first. The newest `k` bars cannot be pivots yet.
+ */
+export function swingPoints(candles: readonly Candle[], k = 3, n = 8): TraderSwing[] {
+  const out: TraderSwing[] = [];
+  for (let i = k; i < candles.length - k; i++) {
+    const c = candles[i] as Candle;
+    const around = [...candles.slice(i - k, i), ...candles.slice(i + 1, i + 1 + k)];
+    if (around.every((o) => D(o.high).lt(c.high))) out.push({ ts: c.ts, kind: 'high', px: c.high });
+    if (around.every((o) => D(o.low).gt(c.low))) out.push({ ts: c.ts, kind: 'low', px: c.low });
+  }
+  return out.slice(-n);
 }
 
 /** Price levels around the market, from the 15-minute bars and the daily ones. null when the bars do not reach. */

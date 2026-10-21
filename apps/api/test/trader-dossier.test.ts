@@ -9,13 +9,16 @@ const T0 = Date.UTC(2026, 9, 19);
 const bar = (ts: number, o: number, h: number, l: number, c: number, confirm = true): Candle => ({ ts, open: String(o), high: String(h), low: String(l), close: String(c), vol: '1', volCcy: '0', confirm });
 
 describe('frameOf', () => {
-  it('reads confirmed bars only, computes the indicators and shows the last twelve bars', () => {
+  it('reads confirmed bars only, computes the indicators and shows the bars as rows with their swing points', () => {
     const candles = Array.from({ length: 60 }, (_, i) => bar(T0 + i * M15, 100 + i, 101 + i, 99 + i, 100.5 + i));
     candles.push(bar(T0 + 60 * M15, 160, 161, 159, 160.5, false));
     const f = frameOf('15m', candles);
     expect(f).toMatchObject({ bar: '15m', asOf: T0 + 59 * M15, close: '159.5', alignment: 'bull', ema200: null, rsi14: '100' });
-    expect(f?.bars).toHaveLength(12);
-    expect(f?.bars[11]?.close).toBe('159.5');
+    // 60 confirmed bars, fewer than the 96 shown at most; the forming one is left out
+    expect(f?.bars).toHaveLength(60);
+    expect(f?.bars[59]).toEqual([T0 + 59 * M15, '159', '160', '158', '159.5', '1']);
+    // a straight climb has no pivots
+    expect(f?.swings).toEqual([]);
     expect(f?.macd?.histRising).toBeDefined();
     expect(f?.atr14).not.toBeNull();
     expect(frameOf('1H', [])).toBeNull();
@@ -44,7 +47,7 @@ describe('levelsOf', () => {
 });
 
 describe('detectTriggers', () => {
-  const frame = (close: string, alignment: TraderFrame['alignment']): TraderFrame => ({ bar: '15m', asOf: 0, close, ema5: null, ema10: null, ema21: null, ema50: null, ema200: null, alignment, macd: null, rsi14: null, atr14: null, volumeRatio: null, bars: [] });
+  const frame = (close: string, alignment: TraderFrame['alignment']): TraderFrame => ({ bar: '15m', asOf: 0, close, ema5: null, ema10: null, ema21: null, ema50: null, ema200: null, alignment, macd: null, rsi14: null, atr14: null, volumeRatio: null, bars: [], swings: [] });
   const levels: TraderLevels = { prevDayHigh: '105', prevDayLow: '95', prevDayClose: '100', dayOpen: '100', dayHigh: '104', dayLow: '98', asiaHigh: null, asiaLow: null, europeHigh: null, europeLow: null, vwap: '101', roundBelow: '100', roundAbove: '110' };
 
   it('names a close through a level, a flip of the 15-minute alignment, and the mark near the stop or at the target', () => {

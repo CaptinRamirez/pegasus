@@ -9,6 +9,7 @@ import {
   minutesTo,
   roundLevels,
   rsi,
+  swingPoints,
   utcDayStart,
   volumeRatio,
   vwap,
@@ -40,7 +41,7 @@ const HOUR_MS = 3_600_000;
 const FIFTEEN_MS = 15 * 60_000;
 /** Confirmed bars kept per frame: enough for the EMA 200 on the 4-hour frame */
 const FRAME_BARS = 260;
-const SHOWN_BARS = 12;
+const SHOWN_BARS = 96;
 const US_OPEN = { hour: 13, minute: 30 };
 
 export interface TraderDossierSources {
@@ -77,7 +78,8 @@ export function frameOf(bar: TraderBar, candles: readonly Candle[]): TraderFrame
     rsi14: fix(rsi(closes, 14), 1),
     atr14: fix(frameAtr(closed, 14), 2),
     volumeRatio: fix(volumeRatio(closed, 20), 2),
-    bars: closed.slice(-SHOWN_BARS).map((c) => ({ ts: c.ts, open: c.open, high: c.high, low: c.low, close: c.close })),
+    bars: closed.slice(-SHOWN_BARS).map((c) => [c.ts, c.open, c.high, c.low, c.close, c.vol]),
+    swings: swingPoints(closed.slice(-SHOWN_BARS)),
   };
 }
 
