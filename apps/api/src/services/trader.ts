@@ -255,7 +255,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     this.foreignWarned = false;
     const position = this.state.position;
     const macro = await this.readMacro(bar);
-    const dossier = await buildTraderDossier({ instId: this.config.instId, now: bar, sources: this.sources, account: this.accountInfo(equity, position), guardrails: g, calendar: this.calendarFor(bar), triggers: [], macro, previous: this.state.previous ?? null, recentTrades: recentTradesOf(this.state.recent) });
+    const dossier = await buildTraderDossier({ instId: this.config.instId, now: bar, sources: this.sources, account: this.accountInfo(equity, position), guardrails: g, calendar: this.calendarFor(bar), triggers: [], macro, recentDecisions: this.state.recentDecisions ?? [], recentTrades: recentTradesOf(this.state.recent) });
     const triggers = detectTriggers(this.lastDossier, dossier, position);
     const hourly = bar % HOUR_MS === 0;
     this.lastDossier = dossier;
@@ -305,7 +305,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     this.addUsage(answer.usage);
     const decision = answer.decision;
     this.state.wake = wakeOf(decision, bar);
-    if (decision) this.state.previous = { ts: bar, action: decision.action, oneLiner: decision.oneLiner, invalidation: decision.invalidation, wakeAbove: this.state.wake.above, wakeBelow: this.state.wake.below };
+    if (decision) this.state.recentDecisions = [{ ts: bar, triggers: dossier.triggers, action: decision.action, oneLiner: decision.oneLiner, invalidation: decision.invalidation, wakeAbove: this.state.wake.above, wakeBelow: this.state.wake.below }, ...(this.state.recentDecisions ?? [])].slice(0, 5);
     let verdictText = answer.problem ?? 'no decision';
     let executed = false;
     if (decision) {
@@ -350,7 +350,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     this.watchedAt = now;
     const position = this.state.position;
     const macro = await this.readMacro(now);
-    const dossier = await buildTraderDossier({ instId: this.config.instId, now, sources: this.sources, account: this.accountInfo(equity, position), guardrails: this.config.guardrails, calendar: this.calendarFor(now), triggers: reasons, macro, previous: this.state.previous ?? null, recentTrades: recentTradesOf(this.state.recent) });
+    const dossier = await buildTraderDossier({ instId: this.config.instId, now, sources: this.sources, account: this.accountInfo(equity, position), guardrails: this.config.guardrails, calendar: this.calendarFor(now), triggers: reasons, macro, recentDecisions: this.state.recentDecisions ?? [], recentTrades: recentTradesOf(this.state.recent) });
     this.lastDossier = dossier;
     await this.consult(dossier, now, now, equity);
     this.save();

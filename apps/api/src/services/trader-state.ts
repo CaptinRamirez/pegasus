@@ -55,8 +55,8 @@ export interface TraderState {
   flips: number;
   /** The next look the model asked for (absent in files written before it decided its own cadence) */
   wake?: TraderWake | null;
-  /** Its last decision, shown to it at the next call */
-  previous?: TraderPreviousDecision | null;
+  /** Its last decisions, newest first, shown to it at the next call */
+  recentDecisions?: TraderPreviousDecision[];
 }
 
 export const RECENT_KEPT = 50;
@@ -82,7 +82,7 @@ export function emptyTraderState(now: number): TraderState {
     usage: { date, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 },
     flips: 0,
     wake: null,
-    previous: null,
+    recentDecisions: [],
   };
 }
 

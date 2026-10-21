@@ -164,7 +164,7 @@ export interface BuildDossierInput {
   calendar: string[];
   triggers: string[];
   macro: TraderMacro;
-  previous: TraderPreviousDecision | null;
+  recentDecisions: TraderPreviousDecision[];
   recentTrades: TraderRecentTrade[];
 }
 
@@ -197,7 +197,7 @@ export async function buildTraderDossier(input: BuildDossierInput): Promise<Trad
     guardrails: g,
     triggers: input.triggers,
     macro: input.macro,
-    previous: input.previous,
+    recentDecisions: input.recentDecisions,
     costs: traderCosts(mark),
     recentTrades: input.recentTrades,
   };

@@ -314,9 +314,11 @@ export interface TraderMacro {
   notes: string[];
 }
 
-/** The decision before this one, so that the model stays consistent with itself. */
+/** One of the model's last decisions, shown to it again so that it answers for what it said it was waiting for. */
 export interface TraderPreviousDecision {
   ts: number;
+  /** Why it was asked then */
+  triggers: string[];
   action: TraderAction;
   oneLiner: string;
   invalidation: string;
@@ -349,7 +351,8 @@ export interface TraderDossier {
   triggers: string[];
   /** The economic calendar and the headlines of the last hours */
   macro: TraderMacro;
-  previous: TraderPreviousDecision | null;
+  /** Its last decisions, newest first, at most five */
+  recentDecisions: TraderPreviousDecision[];
   costs: TraderCosts;
   /** Its last finished trades, newest first: how wide the stop was, how long it held, how it ended */
   recentTrades: TraderRecentTrade[];

@@ -387,7 +387,7 @@ describe('the model decides when it looks again', () => {
     expect(dossier.triggers).toEqual(['session open']);
     expect(dossier.macro.calendar.map((e) => e.title)).toEqual(['CPI m/m']);
     expect(dossier.macro.headlines.map((h) => h.source)).toEqual(['Federal Reserve']);
-    expect(dossier.previous).toBeNull();
+    expect(dossier.recentDecisions).toEqual([]);
     expect(s.service.view()).toMatchObject({ cadence: 'model', wake: { at: DAY + 15 * H, above: '60100', below: null }, nextCallAt: DAY + 15 * H });
     for (const m of [15, 30, 45, 60, 75]) await closeAt(s, DAY + 13 * H + m * 60_000);
     expect(s.model.calls).toBe(1);
@@ -399,7 +399,8 @@ describe('the model decides when it looks again', () => {
     expect(s.model.calls).toBe(2);
     const dossier = s.model.dossiers[1] as TraderDossier;
     expect(dossier.triggers).toEqual(['price reached 60100']);
-    expect(dossier.previous).toMatchObject({ action: 'flat', oneLiner: '区间内，两小时后再看', wakeAbove: '60100' });
+    expect(dossier.recentDecisions).toHaveLength(1);
+    expect(dossier.recentDecisions[0]).toMatchObject({ action: 'flat', oneLiner: '区间内，两小时后再看', wakeAbove: '60100', triggers: ['session open'] });
     await moveTo(s, String(PRICE));
   });
 
