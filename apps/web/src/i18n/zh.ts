@@ -182,7 +182,7 @@ export const zh: Messages = {
     model: '模型',
     guardrails: '护栏',
     guardrailsLine: (g) =>
-      `每笔风险为权益的 ${g.risk}，每天最多 ${g.trades} 笔，当日亏损达 ${g.daily} 即停，连亏 ${g.losses} 笔后暂停，止损距开仓价 ${g.minStop} 至 ${g.maxStop}，杠杆最高 ${g.leverage} 倍。`,
+      `每笔风险为权益的 ${g.risk}，每天最多 ${g.trades} 笔，当日亏损达 ${g.daily} 即停，连亏 ${g.losses} 笔后暂停，止损位置由 Claude 决定（仓位按止损距离算），杠杆最高 ${g.leverage} 倍。`,
     lastDecision: '最近一次决定',
     noDecision: '尚无决定',
     action: { long: '做多', short: '做空', flat: '不做', close: '平仓', tighten_stop: '收紧止损' },

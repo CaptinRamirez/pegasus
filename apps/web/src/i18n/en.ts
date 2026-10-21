@@ -354,8 +354,8 @@ export const en = {
     controlLine: (side: string, entry: string, stop: string, target: string) => `coin flip: ${side} @ ${entry}, stop ${stop}, target ${target}`,
     model: 'Model',
     guardrails: 'Guardrails',
-    guardrailsLine: (g: { risk: string; trades: number; daily: string; losses: number; minStop: string; maxStop: string; leverage: string }) =>
-      `Risk ${g.risk} of the equity per trade, at most ${g.trades} trades a day, stop for the day at a ${g.daily} loss, pause after ${g.losses} losses in a row, stop ${g.minStop} to ${g.maxStop} from the entry, leverage up to ${g.leverage}x.`,
+    guardrailsLine: (g: { risk: string; trades: number; daily: string; losses: number; leverage: string }) =>
+      `Risk ${g.risk} of the equity per trade, at most ${g.trades} trades a day, stop for the day at a ${g.daily} loss, pause after ${g.losses} losses in a row, the stop where Claude puts it (the size follows from it), leverage up to ${g.leverage}x.`,
     lastDecision: 'Last decision',
     noDecision: 'No decision yet',
     action: { long: 'Long', short: 'Short', flat: 'Flat', close: 'Close', tighten_stop: 'Tighten stop' } satisfies Record<TraderAction, string>,

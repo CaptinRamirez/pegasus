@@ -215,9 +215,6 @@ export interface TraderGuardrails {
   /** UTC hours of the window in which positions are opened */
   sessionStartHour: number;
   sessionEndHour: number;
-  /** Distance of the stop from the entry, fraction of the price */
-  minStopPct: string;
-  maxStopPct: string;
   maxLeverage: string;
   /** A limit entry may not be further than this from the mark */
   maxLimitDistancePct: string;
@@ -231,8 +228,6 @@ export const DEFAULT_TRADER_GUARDRAILS: TraderGuardrails = {
   cooldownMs: 24 * 3_600_000,
   sessionStartHour: 13,
   sessionEndHour: 21,
-  minStopPct: '0.0015',
-  maxStopPct: '0.015',
   maxLeverage: '10',
   maxLimitDistancePct: '0.02',
 };
@@ -352,7 +347,7 @@ export type TraderVerdict =
   | { ok: false; action: TraderAction; reason: string };
 
 /**
- * Whether a decision may be carried out: the stop on the right side and within the distance limits, the target beyond
+ * Whether a decision may be carried out: the stop on the losing side of the entry (where is the model's call), the target beyond
  * the stop's distance, a limit price near the mark, a close or a tighter stop only with a position, an entry only
  * without one. A decision that fails is treated as `flat` and logged with the reason.
  */
@@ -380,8 +375,6 @@ export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrai
   const stop = D(d.stopPx);
   const long = d.action === 'long';
   if (long ? !stop.lt(entry) : !stop.gt(entry)) return { ok: false, action: d.action, reason: `the stop ${d.stopPx} is on the wrong side of the entry ${entry.toFixed()}` };
-  const dist = pct(stop, entry);
-  if (dist.lt(g.minStopPct) || dist.gt(g.maxStopPct)) return { ok: false, action: d.action, reason: `the stop is ${dist.mul(100).toFixed(2)}% from the entry; allowed ${D(g.minStopPct).mul(100).toFixed(2)}% to ${D(g.maxStopPct).mul(100).toFixed(2)}%` };
   let target: string | null = null;
   if (d.targetPx !== null) {
     if (!isDecimal(d.targetPx)) return { ok: false, action: d.action, reason: 'the target is not a price' };

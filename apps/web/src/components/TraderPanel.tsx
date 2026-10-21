@@ -59,8 +59,6 @@ function StatusCard({ view }: { view: TraderView }) {
           trades: g.maxTradesPerDay,
           daily: fmtPct(g.dailyLossPct, 2),
           losses: g.maxConsecutiveLosses,
-          minStop: fmtPct(g.minStopPct, 2),
-          maxStop: fmtPct(g.maxStopPct, 2),
           leverage: g.maxLeverage,
         })}
       </div>

@@ -11,8 +11,6 @@ export const guardrails: TraderGuardrails = {
   cooldownMs: 86_400_000,
   sessionStartHour: 13,
   sessionEndHour: 21,
-  minStopPct: '0.0015',
-  maxStopPct: '0.015',
   maxLeverage: '10',
   maxLimitDistancePct: '0.02',
 };

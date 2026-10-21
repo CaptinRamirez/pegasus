@@ -1084,7 +1084,7 @@ GET /api/trader -> TraderView (packages/shared/src/trader.ts)
   reason: { code: string; message: string } | null;   // blocked: STATE_UNREADABLE, NO_MODEL_CREDENTIALS, ACCOUNT_UNAVAILABLE, FOREIGN_POSITION (a position on its account it did not open: it asks and opens nothing until it is closed)
   instId: string;
   session: { startHour: number; endHour: number; inSession: boolean };   // UTC
-  guardrails: TraderGuardrails;                        // riskPct, maxTradesPerDay, dailyLossPct, maxConsecutiveLosses, cooldownMs, session hours, stop distance limits, maxLeverage
+  guardrails: TraderGuardrails;                        // riskPct, maxTradesPerDay, dailyLossPct, maxConsecutiveLosses, cooldownMs, session hours, maxLeverage, maxLimitDistancePct (the stop's distance is the model's call)
   model: string;
   nextCallAt: number | null;                           // the next hourly close in session (every 15 minutes with TRADER_CADENCE=15m)
   last: { ts; decision: TraderDecision | null; verdict: string; executed: boolean; usage; triggers: string[]; error: string | null } | null;

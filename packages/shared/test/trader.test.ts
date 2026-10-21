@@ -96,10 +96,11 @@ describe('checkDecision', () => {
     expect(checkDecision(decision({ action: 'short', stopPx: '82450', targetPx: '81700' }), '82150', g, null)).toMatchObject({ ok: true, action: 'short' });
   });
 
-  it('refuses a stop on the wrong side, too close, too far, a target under one to one, a limit far from the mark, an entry while holding', () => {
+  it('refuses a stop on the wrong side, a target under one to one, a limit far from the mark, an entry while holding', () => {
     expect(checkDecision(decision({ action: 'long', stopPx: '82100' }), '82000', g, null)).toMatchObject({ ok: false, reason: /wrong side/ });
-    expect(checkDecision(decision({ action: 'long', stopPx: '81950' }), '82000', g, null)).toMatchObject({ ok: false, reason: /allowed/ });
-    expect(checkDecision(decision({ action: 'long', stopPx: '80000' }), '82000', g, null)).toMatchObject({ ok: false, reason: /allowed/ });
+    // how far the stop goes is the model's call: very near and very far both pass
+    expect(checkDecision(decision({ action: 'long', stopPx: '81950' }), '82000', g, null)).toMatchObject({ ok: true, stopPx: '81950' });
+    expect(checkDecision(decision({ action: 'long', stopPx: '78000' }), '82000', g, null)).toMatchObject({ ok: true, stopPx: '78000' });
     expect(checkDecision(decision({ action: 'long', stopPx: '81700', targetPx: '82100' }), '82000', g, null)).toMatchObject({ ok: false, reason: /one to one/ });
     expect(checkDecision(decision({ action: 'long', entryType: 'limit', limitPrice: '70000', stopPx: '69500' }), '82000', g, null)).toMatchObject({ ok: false, reason: /from the mark/ });
     expect(checkDecision(decision({ action: 'long', entryType: 'limit', limitPrice: null, stopPx: '81700' }), '82000', g, null)).toMatchObject({ ok: false, reason: /without a price/ });
