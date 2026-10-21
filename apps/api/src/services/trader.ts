@@ -21,6 +21,7 @@ import {
   type TraderLogRecord,
   type TraderMacro,
   type TraderPosition,
+  recentTradesOf,
   type TraderStatus,
   type TraderStatusReason,
   type TraderTradeResult,
@@ -248,7 +249,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     this.foreignWarned = false;
     const position = this.state.position;
     const macro = await this.readMacro(bar);
-    const dossier = await buildTraderDossier({ instId: this.config.instId, now: bar, sources: this.sources, account: this.accountInfo(equity, position), guardrails: g, calendar: this.calendarFor(bar), triggers: [], macro, previous: this.state.previous ?? null });
+    const dossier = await buildTraderDossier({ instId: this.config.instId, now: bar, sources: this.sources, account: this.accountInfo(equity, position), guardrails: g, calendar: this.calendarFor(bar), triggers: [], macro, previous: this.state.previous ?? null, recentTrades: recentTradesOf(this.state.recent) });
     const triggers = detectTriggers(this.lastDossier, dossier, position);
     const hourly = bar % HOUR_MS === 0;
     this.lastDossier = dossier;
@@ -501,7 +502,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       const pnl = D(equity).minus(held.equityAtEntry);
       const last = fifteen.find((c) => c.ts === bar - FIFTEEN_MINUTES_MS) ?? null;
       const end = this.closing ? 'close' : this.endOf(held, last);
-      const result: TraderTradeResult = { side: held.side, openedAt: held.openedAt, closedAt: bar, entryPx: held.entryPx, exitPx: null, contracts: held.contracts, pnl: money(pnl), end };
+      const result: TraderTradeResult = { side: held.side, openedAt: held.openedAt, closedAt: bar, entryPx: held.entryPx, exitPx: null, contracts: held.contracts, pnl: money(pnl), end, stopPx: held.stopPx, targetPx: held.targetPx };
       this.settleResult(result, now);
       this.state.position = null;
       this.closing = false;

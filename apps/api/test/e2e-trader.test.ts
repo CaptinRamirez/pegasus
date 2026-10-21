@@ -203,7 +203,10 @@ describe('the Claude auto trader on the paper exchange', () => {
     expect(s.model.calls).toBe(1);
     const dossier = s.model.dossiers[0] as TraderDossier;
     expect(dossier.triggers).toEqual(['hourly close']);
-    expect(dossier.frames.map((f) => f.bar)).toEqual(['15m', '1H', '4H']);
+    expect(dossier.frames.map((f) => f.bar)).toEqual(['15m', '1H', '4H', '1D']);
+    expect(dossier.costs).toMatchObject({ takerFeePct: '0.05' });
+    expect(Number(dossier.costs.roundTripPoints)).toBeCloseTo(60, 0);
+    expect(dossier.recentTrades).toEqual([]);
     expect(dossier.session).toMatchObject({ inSession: true, minutesSinceUsOpen: 30 });
     const state = s.service.stateCopy();
     // 2% of 5600 = 112 at a stop 300 away: 0.3733 BTC = 37.3 contracts of 0.01 (the mock's lot is 0.1) at 60,000, 5x
@@ -249,6 +252,11 @@ describe('the Claude auto trader on the paper exchange', () => {
     s.model.queue.push(decide({ action: 'long', stopPx: '60300' }));
     await closeAt(s, DAY + 16 * H);
     expect(s.model.calls).toBe(3);
+    // the model now sees its finished trade: the stop's width, how long it was held, how it ended
+    const seen = (s.model.dossiers[2] as TraderDossier).recentTrades;
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ side: 'long', stopPx: '59700', end: 'close', minutesHeld: 75 });
+    expect(Number(seen[0]?.stopPct)).toBeCloseTo(0.5, 1);
     expect(s.service.view().last).toMatchObject({ executed: false, verdict: expect.stringMatching(/wrong side/) });
     expect(s.service.stateCopy().position).toBeNull();
   });

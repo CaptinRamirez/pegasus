@@ -114,7 +114,7 @@ export function emaAlignment(e5: Decimal, e10: Decimal, e21: Decimal): EmaAlignm
 
 // ---- the dossier ----
 
-export type TraderBar = '15m' | '1H' | '4H';
+export type TraderBar = '15m' | '1H' | '4H' | '1D';
 
 /** One time frame as the model sees it: the last confirmed bars and the indicators on them. */
 export interface TraderFrame {
@@ -200,6 +200,32 @@ export interface TraderAccountInfo {
   consecutiveLosses: number;
   cooldownUntil: number | null;
   killSwitch: boolean;
+}
+
+/** Taker and maker fees of the paper exchange (OKX's regular tier on USDT swaps), fraction of the notional. */
+export const TRADER_TAKER_FEE = '0.0005';
+export const TRADER_MAKER_FEE = '0.0002';
+
+/** What a round trip costs at the mark, so that the model weighs its stop and target against it. */
+export interface TraderCosts {
+  takerFeePct: string;
+  makerFeePct: string;
+  /** Entry and exit at the taker fee, in price points at the mark */
+  roundTripPoints: string;
+}
+
+/** A finished trade as the model sees it among its recent ones. */
+export interface TraderRecentTrade {
+  side: 'long' | 'short';
+  entryPx: string;
+  stopPx: string | null;
+  targetPx: string | null;
+  /** Distance of the stop from the entry, percent of the entry */
+  stopPct: string | null;
+  minutesHeld: number;
+  end: 'stop' | 'target' | 'close' | 'external';
+  pnl: string;
+  closedAt: number;
 }
 
 /** The guardrails the code enforces; the model is told them and cannot change them. */
@@ -299,6 +325,9 @@ export interface TraderDossier {
   /** The economic calendar and the headlines of the last hours */
   macro: TraderMacro;
   previous: TraderPreviousDecision | null;
+  costs: TraderCosts;
+  /** Its last finished trades, newest first: how wide the stop was, how long it held, how it ended */
+  recentTrades: TraderRecentTrade[];
 }
 
 // ---- the decision ----
@@ -494,6 +523,33 @@ export interface TraderTradeResult {
   pnl: string;
   /** How it ended: the stop, the target, the model's close, the session's end, or an outside event */
   end: 'stop' | 'target' | 'close' | 'external';
+  /** The stop and the target it held when it ended (absent in results booked before they were kept) */
+  stopPx?: string;
+  targetPx?: string | null;
+}
+
+/** The trades the model is shown, newest first, at most `n`. */
+export function recentTradesOf(results: readonly TraderTradeResult[], n = 5): TraderRecentTrade[] {
+  return results.slice(0, n).map((r) => ({
+    side: r.side,
+    entryPx: r.entryPx,
+    stopPx: r.stopPx ?? null,
+    targetPx: r.targetPx ?? null,
+    stopPct: r.stopPx === undefined ? null : D(r.entryPx).minus(r.stopPx).abs().div(r.entryPx).mul(100).toDecimalPlaces(3).toFixed(),
+    minutesHeld: Math.round((r.closedAt - r.openedAt) / 60_000),
+    end: r.end,
+    pnl: r.pnl,
+    closedAt: r.closedAt,
+  }));
+}
+
+/** The cost of a round trip at the mark. */
+export function traderCosts(mark: DecimalInput): TraderCosts {
+  return {
+    takerFeePct: D(TRADER_TAKER_FEE).mul(100).toFixed(),
+    makerFeePct: D(TRADER_MAKER_FEE).mul(100).toFixed(),
+    roundTripPoints: D(mark).mul(TRADER_TAKER_FEE).mul(2).toDecimalPlaces(1).toFixed(),
+  };
 }
 
 /** The coin-flip control: the same opportunities with a random direction, filled at the mark and settled on the bars. */

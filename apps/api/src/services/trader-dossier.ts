@@ -23,6 +23,8 @@ import {
   type TraderMacro,
   type TraderPosition,
   type TraderPreviousDecision,
+  type TraderRecentTrade,
+  traderCosts,
 } from '@pegasus/shared';
 import type { OkxClients } from '../okx/clients.js';
 import type { MarketDataService } from './market-data.js';
@@ -161,14 +163,15 @@ export interface BuildDossierInput {
   triggers: string[];
   macro: TraderMacro;
   previous: TraderPreviousDecision | null;
+  recentTrades: TraderRecentTrade[];
 }
 
 export async function buildTraderDossier(input: BuildDossierInput): Promise<TraderDossier> {
   const { instId, now, sources } = input;
-  const [fifteen, hourly, fourHour, daily] = await Promise.all([sources.candles(instId, '15m', 300), sources.candles(instId, '1H', 300), sources.candles(instId, '4H', 300), sources.candles(instId, '1D', 5)]);
+  const [fifteen, hourly, fourHour, daily] = await Promise.all([sources.candles(instId, '15m', 300), sources.candles(instId, '1H', 300), sources.candles(instId, '4H', 300), sources.candles(instId, '1D', 300)]);
   const mark = sources.mark(instId) ?? fifteen.filter((c) => c.confirm).at(-1)?.close ?? null;
   if (mark === null) throw new Error(`${instId}: no mark price and no candles`);
-  const frames = [frameOf('15m', fifteen), frameOf('1H', hourly), frameOf('4H', fourHour)].filter((f): f is TraderFrame => f !== null);
+  const frames = [frameOf('15m', fifteen), frameOf('1H', hourly), frameOf('4H', fourHour), frameOf('1D', daily)].filter((f): f is TraderFrame => f !== null);
   const [funding, oi] = await Promise.all([sources.funding(instId).catch(() => ({ rate: null, mean72h: null })), sources.openInterest(instId).catch(() => ({ oi: null, change24hPct: null }))]);
   const derivatives: TraderDerivatives = { fundingRate: funding.rate, fundingMean72h: funding.mean72h, openInterest: oi.oi, oiChange24hPct: oi.change24hPct };
   const g = input.guardrails;
@@ -193,6 +196,8 @@ export async function buildTraderDossier(input: BuildDossierInput): Promise<Trad
     triggers: input.triggers,
     macro: input.macro,
     previous: input.previous,
+    costs: traderCosts(mark),
+    recentTrades: input.recentTrades,
   };
 }
 

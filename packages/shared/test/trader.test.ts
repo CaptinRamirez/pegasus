@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { D } from '../src/decimal.js';
-import { checkDecision, DEFAULT_TRADER_GUARDRAILS, wakeOf, emaAlignment, emaLast, emaSeries, estimateUsd, inTraderSession, macd, minutesTo, roundLevels, rsi, traderSize, volumeRatio, vwap, type TraderDecision, type TraderPosition } from '../src/trader.js';
+import { checkDecision, DEFAULT_TRADER_GUARDRAILS, recentTradesOf, traderCosts, wakeOf, emaAlignment, emaLast, emaSeries, estimateUsd, inTraderSession, macd, minutesTo, roundLevels, rsi, traderSize, volumeRatio, vwap, type TraderDecision, type TraderPosition } from '../src/trader.js';
 import type { Candle, Instrument } from '../src/types.js';
 
 const inst: Instrument = {
@@ -160,5 +160,22 @@ describe('wakeOf', () => {
     expect(wakeOf(decision({ recheckMinutes: 50 }), bar).at).toBe(bar + 60 * M);
     expect(wakeOf(decision({ recheckMinutes: Number.NaN, wakeAbove: 'soon', wakeBelow: '-3' }), bar)).toEqual({ at: bar + 60 * M, above: null, below: null, setAt: bar });
     expect(wakeOf(null, bar).at).toBe(bar + 60 * M);
+  });
+});
+
+describe('what the model is shown about costs and its own trades', () => {
+  it('prices a round trip in points at the mark', () => {
+    expect(traderCosts('83700')).toEqual({ takerFeePct: '0.05', makerFeePct: '0.02', roundTripPoints: '83.7' });
+  });
+
+  it('lists its last trades with the stop as a percent of the entry and the minutes held', () => {
+    const t0 = Date.UTC(2026, 9, 21, 13, 30);
+    const stopped = { side: 'long' as const, openedAt: t0, closedAt: t0 + 15 * 60_000, entryPx: '83700', exitPx: null, contracts: '0.62', pnl: '-1.55', end: 'stop' as const, stopPx: '83520', targetPx: '84050' };
+    const old = { side: 'short' as const, openedAt: t0 - 3_600_000, closedAt: t0 - 1_800_000, entryPx: '84000', exitPx: null, contracts: '0.5', pnl: '0.8', end: 'close' as const };
+    expect(recentTradesOf([stopped, old])).toEqual([
+      { side: 'long', entryPx: '83700', stopPx: '83520', targetPx: '84050', stopPct: '0.215', minutesHeld: 15, end: 'stop', pnl: '-1.55', closedAt: t0 + 15 * 60_000 },
+      { side: 'short', entryPx: '84000', stopPx: null, targetPx: null, stopPct: null, minutesHeld: 30, end: 'close', pnl: '0.8', closedAt: t0 - 1_800_000 },
+    ]);
+    expect(recentTradesOf([stopped, old], 1)).toHaveLength(1);
   });
 });
