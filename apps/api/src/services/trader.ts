@@ -55,7 +55,9 @@ import { emptyTraderState, loadTraderState, RECENT_KEPT, rolledToDay, saveTrader
  * When the model is asked depends on TRADER_CADENCE. model (the default): the model names at every decision when it
  * wants to look again and the prices that wake it earlier (wakeOf); it is also asked at the first close of each session
  * day, when the position nears its stop or reaches its target, and at the first close after a high-impact US release
- * (and the close before one while a position is open) — wakeReasons. hourly: at the hourly close and at a 15-minute
+ * (and the close before one while a position is open) — wakeReasons; and between closes, at every tick, as soon as
+ * the mark reaches a wake level, comes within a third of the stop's distance of the stop or reaches the target (watch,
+ * at most once per WATCH_COOLDOWN_MS). hourly: at the hourly close and at a 15-minute
  * close that crossed a level of the day (detectTriggers). 15m: at every close. Its decision goes through checkDecision, then the
  * guardrails of the day (trade cap, daily loss, cooldown, kill switch, a resting limit), then the exchange: an isolated
  * order sized by traderSize with the stop attached (and the target as a take-profit), a close, or a tighter stop.
@@ -99,6 +101,8 @@ export interface TraderServiceOptions {
 const HOUR_MS = 3_600_000;
 export const CONTROL_SLIPPAGE = '0.0005';
 export const CONTROL_FEE = '0.0005';
+/** Between two closes the mark is watched at every tick; a hit asks the model at most this often. */
+export const WATCH_COOLDOWN_MS = 5 * 60_000;
 const iso = (t: number): string => new Date(t).toISOString();
 const money = (v: Decimal): string => v.toDecimalPlaces(8).toFixed();
 
@@ -137,6 +141,8 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
   private closing = false;
   /** A position the trader did not open was logged already */
   private foreignWarned = false;
+  /** When the mark last woke the model between two closes */
+  private watchedAt: number | null = null;
   private readonly model: TraderModel | null;
   private readonly sources: TraderDossierSources;
   private readonly macroSource: TraderMacroSource;
@@ -223,12 +229,12 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       this.save();
     }
     const bar = fifteenCloseAtOrBefore(now);
-    if (this.state.lastBarTs !== null && bar <= this.state.lastBarTs) return;
     if (!this.deps.account.ready || equity === null) return;
+    if (this.state.lastBarTs !== null && bar <= this.state.lastBarTs) return this.watch(now, equity);
     const g = this.config.guardrails;
     const inSession = inTraderSession(bar, g);
     const fifteen = inSession || this.state.position !== null || this.state.control.position !== null ? await this.confirmedBars(bar) : [];
-    await this.reconcilePosition(bar, now, equity, fifteen);
+    await this.reconcilePosition(bar, now, equity, fifteen, null);
     await this.expirePendingLimit(bar);
     await this.guardStop(bar);
     this.settleControl(fifteen, bar);
@@ -323,6 +329,48 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     this.record({ ts: now, kind: 'decision', instId: this.config.instId, triggers: dossier.triggers, dossier, decision, verdict: verdictText, usage: answer.usage });
     this.lastDecision = { ts: bar, decision, verdict: verdictText, executed, usage: answer.usage, triggers: dossier.triggers, error: answer.problem };
     this.log.info({ action: decision?.action ?? null, verdict: verdictText, executed, tokens: answer.usage.inputTokens + answer.usage.outputTokens, ms: answer.usage.ms }, 'trader decision');
+  }
+
+  /**
+   * Between two closes, at every tick: a position gone from the exchange is booked at once, and in the session the mark
+   * is held against the wake levels, the stop and the target; a hit asks the model now, not at the close, at most once
+   * per WATCH_COOLDOWN_MS (TRADER_CADENCE=model).
+   */
+  private async watch(now: number, equity: string): Promise<void> {
+    const mark = this.deps.market.liveMarkPrice(this.config.instId);
+    if (mark === undefined) return;
+    if (await this.reconcilePosition(now, now, equity, [], mark)) {
+      this.save();
+      this.emitChange();
+    }
+    if (this.config.cadence !== 'model' || this.model === null || !inTraderSession(now, this.config.guardrails) || this.foreignPosition()) return;
+    if (this.watchedAt !== null && now - this.watchedAt < WATCH_COOLDOWN_MS) return;
+    const reasons = this.priceReasons(mark);
+    if (reasons.length === 0) return;
+    this.watchedAt = now;
+    const position = this.state.position;
+    const macro = await this.readMacro(now);
+    const dossier = await buildTraderDossier({ instId: this.config.instId, now, sources: this.sources, account: this.accountInfo(equity, position), guardrails: this.config.guardrails, calendar: this.calendarFor(now), triggers: reasons, macro, previous: this.state.previous ?? null, recentTrades: recentTradesOf(this.state.recent) });
+    this.lastDossier = dossier;
+    await this.consult(dossier, now, now, equity);
+    this.save();
+    this.emitChange();
+  }
+
+  /** The mark against the wake levels and, with a position, its stop (within a third of its distance) and its target. */
+  private priceReasons(mark: string): string[] {
+    const out: string[] = [];
+    const m = D(mark);
+    const wake = this.state.wake ?? null;
+    if (wake?.above != null && m.gte(wake.above)) out.push(`price reached ${wake.above}`);
+    if (wake?.below != null && m.lte(wake.below)) out.push(`price reached ${wake.below}`);
+    const held = this.state.position;
+    if (held) {
+      const dist = D(held.entryPx).minus(held.stopPx).abs();
+      if (m.minus(held.stopPx).abs().lte(dist.div(3))) out.push('mark near the stop');
+      if (held.targetPx !== null && (held.side === 'long' ? m.gte(held.targetPx) : m.lte(held.targetPx))) out.push('mark at the target');
+    }
+    return out;
   }
 
   /**
@@ -494,20 +542,24 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     }
   }
 
-  /** A position gone from the exchange is a result; a limit order that filled is a position. */
-  private async reconcilePosition(bar: number, now: number, equity: string, fifteen: readonly Candle[]): Promise<void> {
+  /**
+   * A position gone from the exchange is a result; a limit order that filled is a position. At a close the bar that
+   * closed says how the position ended; between closes the mark does. True when something changed.
+   */
+  private async reconcilePosition(bar: number, now: number, equity: string, fifteen: readonly Candle[], mark: string | null): Promise<boolean> {
     const live = this.livePosition();
     const held = this.state.position;
     if (held && !live) {
       const pnl = D(equity).minus(held.equityAtEntry);
       const last = fifteen.find((c) => c.ts === bar - FIFTEEN_MINUTES_MS) ?? null;
-      const end = this.closing ? 'close' : this.endOf(held, last);
+      const end = this.closing ? 'close' : this.endOf(held, last, mark);
       const result: TraderTradeResult = { side: held.side, openedAt: held.openedAt, closedAt: bar, entryPx: held.entryPx, exitPx: null, contracts: held.contracts, pnl: money(pnl), end, stopPx: held.stopPx, targetPx: held.targetPx };
       this.settleResult(result, now);
       this.state.position = null;
       this.closing = false;
       this.record({ ts: now, kind: 'result', instId: this.config.instId, result });
       this.log.info({ side: held.side, pnl: result.pnl, end }, 'trader position ended');
+      return true;
     } else if (!held && live && this.state.pendingLimit) {
       const p = this.state.pendingLimit;
       this.state.pendingLimit = null;
@@ -523,14 +575,18 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       const entryPx = live.avgPx !== '' ? live.avgPx : p.px;
       this.openPosition({ side: p.side, contracts: D(live.pos).abs().toFixed(), entryPx, stopPx: p.stopPx, targetPx: p.targetPx, openedAt: now, clOrdId: p.clOrdId, equityAtEntry: p.equityAtEntry }, entryPx, bar);
       this.record({ ts: now, kind: 'execution', instId: this.config.instId, order: { clOrdId: p.clOrdId, side: p.side === 'long' ? 'buy' : 'sell', entryType: 'limit', contracts: p.contracts, entryPx, stopPx: p.stopPx, targetPx: p.targetPx, leverage: p.leverage } });
+      return true;
     }
+    return false;
   }
 
-  private endOf(held: TraderPosition, bar: Candle | null): TraderTradeResult['end'] {
-    if (!bar) return 'external';
+  private endOf(held: TraderPosition, bar: Candle | null, mark: string | null): TraderTradeResult['end'] {
     const long = held.side === 'long';
-    const stopHit = long ? D(bar.low).lte(held.stopPx) : D(bar.high).gte(held.stopPx);
-    const targetHit = held.targetPx !== null && (long ? D(bar.high).gte(held.targetPx) : D(bar.low).lte(held.targetPx));
+    const low = bar?.low ?? mark;
+    const high = bar?.high ?? mark;
+    if (low === null || high === null) return 'external';
+    const stopHit = long ? D(low).lte(held.stopPx) : D(high).gte(held.stopPx);
+    const targetHit = held.targetPx !== null && (long ? D(high).gte(held.targetPx) : D(low).lte(held.targetPx));
     return stopHit ? 'stop' : targetHit ? 'target' : 'external';
   }
 

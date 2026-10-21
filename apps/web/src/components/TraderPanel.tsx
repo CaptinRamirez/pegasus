@@ -37,7 +37,7 @@ function StatusCard({ view }: { view: TraderView }) {
       </div>
       <Field k={t.trader.session}>
         {t.trader.sessionLine(hour(view.session.startHour), hour(view.session.endHour))}
-        <span className="sub">{t.trader.sessionLine(local(view.session.startHour), local(view.session.endHour))}</span>
+        <span className="sub">{t.trader.sessionLocalLine(local(view.session.startHour), local(view.session.endHour))}</span>
       </Field>
       <Field k={t.trader.nextCall}>
         {view.nextCallAt === null ? (

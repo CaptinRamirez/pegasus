@@ -339,6 +339,7 @@ export const en = {
     statusLabel: { disabled: 'Disabled', blocked: 'Blocked', idle: 'Idle', 'in-session': 'In session', holding: 'Holding' } satisfies Record<TraderStatus, string>,
     session: 'Session',
     sessionLine: (start: string, end: string) => `${start} to ${end} UTC`,
+    sessionLocalLine: (start: string, end: string) => `${start} to ${end} local time`,
     nextCall: 'Next call',
     noNextCall: 'none scheduled',
     cadence: 'Cadence',

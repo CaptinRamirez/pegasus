@@ -166,6 +166,7 @@ export const zh: Messages = {
     statusLabel: { disabled: '已停用', blocked: '已阻止', idle: '空闲', 'in-session': '交易时段内', holding: '持仓中' },
     session: '交易时段',
     sessionLine: (start, end) => `UTC ${start} 至 ${end}`,
+    sessionLocalLine: (start, end) => `本地时间 ${start} 至 ${end}`,
     nextCall: '下次调用',
     noNextCall: '无安排',
     cadence: '节奏',

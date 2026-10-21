@@ -430,3 +430,67 @@ describe('the model decides when it looks again', () => {
     again.stop();
   });
 });
+
+describe('the trader watches the mark between closes', () => {
+  let s: Stack;
+  beforeAll(async () => {
+    s = await startStack('5', DAY + 12 * H + 50 * 60_000, 'model');
+  }, 30_000);
+  afterAll(async () => {
+    await stopStack(s);
+  });
+
+  it('asks the model as soon as the mark reaches a wake level, once, and books a stop-out at once', async () => {
+    s.model.queue.push(decide({ action: 'flat', recheckMinutes: 240, wakeAbove: '60100', wakeBelow: null }));
+    await closeAt(s, DAY + 13 * H);
+    expect(s.model.calls).toBe(1);
+    // seven minutes into the bar the mark crosses the level: asked now, not at the close
+    s.clock.now = DAY + 13 * H + 7 * 60_000;
+    s.model.queue.push(decide({ action: 'long', stopPx: '59900', targetPx: '60800', recheckMinutes: 240, wakeAbove: '60500', wakeBelow: null }));
+    await moveTo(s, '60200');
+    await s.service.tick();
+    expect(s.model.calls).toBe(2);
+    expect((s.model.dossiers[1] as TraderDossier).triggers).toEqual(['price reached 60100']);
+    await waitFor(() => position(s), 5000, 'the long');
+    expect(s.service.view()).toMatchObject({ status: 'holding', wake: { above: '60500', below: null } });
+    // a minute later nothing is new: the level was consumed by that decision and the stop is far
+    s.clock.now += 60_000;
+    await s.service.tick();
+    expect(s.model.calls).toBe(2);
+    // the stop fires on the exchange in the middle of the bar: booked at the next tick, not at the close
+    await moveTo(s, '59800');
+    await waitFor(() => !position(s), 5000, 'the long stopped out');
+    s.clock.now += 60_000;
+    await s.service.tick();
+    const st = s.service.stateCopy();
+    expect(st.position).toBeNull();
+    expect(st.recent[0]).toMatchObject({ side: 'long', end: 'stop', closedAt: s.clock.now });
+    expect(st.tradesToday).toBe(1);
+    expect(s.service.view().status).toBe('in-session');
+    expect(s.model.calls).toBe(2);
+    await moveTo(s, String(PRICE));
+  });
+
+  it('wakes the model when the mark comes near the stop, and not again within five minutes', async () => {
+    // 13:50: the mark reaches the wake level the last decision set (60500); the model answers with a short, stop 300 away
+    s.clock.now = DAY + 13 * H + 50 * 60_000;
+    s.model.queue.push(decide({ action: 'short', stopPx: '60800', targetPx: '59600', recheckMinutes: 240 }));
+    await moveTo(s, '60500');
+    await s.service.tick();
+    expect(s.model.calls).toBe(3);
+    expect((s.model.dossiers[2] as TraderDossier).triggers).toEqual(['price reached 60500']);
+    await waitFor(() => position(s), 5000, 'the short');
+    // 13:56: the mark within a third of the stop's distance of the stop: asked now
+    s.clock.now = DAY + 13 * H + 56 * 60_000;
+    s.model.queue.push(decide({ action: 'flat', recheckMinutes: 240 }));
+    await moveTo(s, '60720');
+    await s.service.tick();
+    expect(s.model.calls).toBe(4);
+    expect((s.model.dossiers[3] as TraderDossier).triggers).toEqual(['mark near the stop']);
+    // still near the stop a minute later: within the cooldown, not asked again
+    s.clock.now += 60_000;
+    await s.service.tick();
+    expect(s.model.calls).toBe(4);
+    await moveTo(s, String(PRICE));
+  });
+});
