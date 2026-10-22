@@ -1,4 +1,4 @@
-import type { Candle, TraderFrame, TraderLevels, TraderPosition } from '@pegasus/shared';
+import type { Candle, TraderFrame, TraderLevels } from '@pegasus/shared';
 import { describe, expect, it } from 'vitest';
 import { detectTriggers, frameOf, levelsOf } from '../src/services/trader-dossier.js';
 
@@ -50,15 +50,12 @@ describe('detectTriggers', () => {
   const frame = (close: string, alignment: TraderFrame['alignment']): TraderFrame => ({ bar: '15m', asOf: 0, close, ema5: null, ema10: null, ema21: null, ema50: null, ema200: null, alignment, macd: null, rsi14: null, atr14: null, volumeRatio: null, bars: [], swings: [] });
   const levels: TraderLevels = { prevDayHigh: '105', prevDayLow: '95', prevDayClose: '100', dayOpen: '100', dayHigh: '104', dayLow: '98', asiaHigh: null, asiaLow: null, europeHigh: null, europeLow: null, vwap: '101', roundBelow: '100', roundAbove: '110' };
 
-  it('names a close through a level, a flip of the 15-minute alignment, and the mark near the stop or at the target', () => {
+  it('names a close through a level and a flip of the 15-minute alignment', () => {
     const prev = { frames: [frame('104', 'mixed')], levels };
-    const next = { frames: [frame('106', 'bull')], levels, mark: '106' };
-    expect(detectTriggers(prev, next, null)).toEqual(['closed above prevDayHigh 105', 'closed above dayHigh 104', '15m EMA alignment mixed -> bull']);
-    expect(detectTriggers(null, next, null)).toEqual([]);
+    const next = { frames: [frame('106', 'bull')], levels };
+    expect(detectTriggers(prev, next)).toEqual(['closed above prevDayHigh 105', 'closed above dayHigh 104', '15m EMA alignment mixed -> bull']);
+    expect(detectTriggers(null, next)).toEqual([]);
     // a move that crosses nothing (from 103 to 103.5: no level in between) and keeps the alignment is no event
-    expect(detectTriggers({ frames: [frame('103', 'mixed')], levels }, { frames: [frame('103.5', 'mixed')], levels, mark: '103.5' }, null)).toEqual([]);
-    const held: TraderPosition = { side: 'long', contracts: '1', entryPx: '106', stopPx: '105', targetPx: '108', openedAt: 0, clOrdId: 'pt1', equityAtEntry: '0' };
-    expect(detectTriggers(prev, { ...next, mark: '105.2' }, held)).toContain('mark near the stop');
-    expect(detectTriggers(prev, { ...next, mark: '108.5' }, held)).toContain('mark at the target');
+    expect(detectTriggers({ frames: [frame('103', 'mixed')], levels }, { frames: [frame('103.5', 'mixed')], levels })).toEqual([]);
   });
 });

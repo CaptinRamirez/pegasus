@@ -44,7 +44,10 @@ const toVolume = (c: Candle): HistogramData => ({
 /**
  * Owns a lightweight-charts instance: history is loaded with setData, live
  * candles (keyed by ts) are applied with update, never going back in time.
- * `key` identifies the (instId, bar) pair the data belongs to.
+ * `key` identifies the (instId, bar) pair the data belongs to. `onNearStart`
+ * is called whenever the view comes within ten bars of the oldest one loaded,
+ * so that the caller can load older history (the view stays anchored to the
+ * right edge when bars are prepended).
  */
 export function useCandleChart(
   container: RefObject<HTMLDivElement | null>,
@@ -52,10 +55,13 @@ export function useCandleChart(
   history: Candle[] | undefined,
   live: Record<number, Candle> | undefined,
   key: string,
+  onNearStart?: () => void,
 ): void {
   const refs = useRef<ChartRefs | null>(null);
   const lastTs = useRef<number | null>(null);
   const loadedKey = useRef<string | null>(null);
+  const nearStart = useRef(onNearStart);
+  nearStart.current = onNearStart;
 
   useEffect(() => {
     const el = container.current;
@@ -92,6 +98,9 @@ export function useCandleChart(
     });
     volume.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
     refs.current = { chart, candles, volume };
+    chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+      if (range !== null && range.from < 10) nearStart.current?.();
+    });
 
     const ro = new ResizeObserver((entries) => {
       const entry = entries[0];

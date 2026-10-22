@@ -117,11 +117,11 @@ export function levelsOf(fifteen: readonly Candle[], daily: readonly Candle[], n
 }
 
 /**
- * What the last 15-minute bar changed, for the event-triggered calls: a close through a level of the day, a flip of
- * the 15-minute EMA alignment, and, with a position, the price within a third of the stop's distance of the stop or
- * past the target. Empty when nothing happened.
+ * What the last 15-minute bar changed, for the event-triggered calls: a close through a level of the day and a flip of
+ * the 15-minute EMA alignment. Never the stop or the target: both are the exchange's to execute. Empty when nothing
+ * happened.
  */
-export function detectTriggers(prev: Pick<TraderDossier, 'frames' | 'levels'> | null, next: Pick<TraderDossier, 'frames' | 'levels' | 'mark'>, position: TraderPosition | null): string[] {
+export function detectTriggers(prev: Pick<TraderDossier, 'frames' | 'levels'> | null, next: Pick<TraderDossier, 'frames' | 'levels'>): string[] {
   const out: string[] = [];
   const frame = next.frames.find((f) => f.bar === '15m');
   const before = prev?.frames.find((f) => f.bar === '15m');
@@ -143,12 +143,6 @@ export function detectTriggers(prev: Pick<TraderDossier, 'frames' | 'levels'> | 
     crossed('round', next.levels.roundBelow);
     crossed('round', next.levels.roundAbove);
     if (before && before.alignment !== null && frame.alignment !== null && before.alignment !== frame.alignment) out.push(`15m EMA alignment ${before.alignment} -> ${frame.alignment}`);
-  }
-  if (position) {
-    const mark = D(next.mark);
-    const dist = D(position.entryPx).minus(position.stopPx).abs();
-    if (mark.minus(position.stopPx).abs().lte(dist.div(3))) out.push('mark near the stop');
-    if (position.targetPx !== null && (position.side === 'long' ? mark.gte(position.targetPx) : mark.lte(position.targetPx))) out.push('mark at the target');
   }
   return out;
 }

@@ -130,16 +130,19 @@ export function campaignEnv(port = CAMPAIGN_PORTS.paper, potStart = CAMPAIGN_POT
   };
 }
 
-/** What the trader's paper account starts with unless .env says otherwise (TRADER_BALANCE): the ticket. */
-export const TRADER_BALANCE = '56';
+/** What the trader's paper account starts with unless .env says otherwise (TRADER_BALANCE): the ticket, 1,000 EUR at 1.124 USD (2026-10-21). */
+export const TRADER_BALANCE = '1124';
 
 /**
  * What --trader adds to the environment of the API and of the paper exchange (docs/proposals/claude-auto-trader.md):
  * paper trading on the trader's own paper account, data/paper-trader.json, opened with `balance` USDT, BTC only, the
  * trader enabled and the campaign off, its own state, journal, log directory and ports, so that it runs beside the
- * other stacks. It wins over .env; ANTHROPIC_API_KEY stays .env's.
+ * other stacks, and the risk engine's limits in the account's own scale: one order or position at most the account at
+ * 10x, the loss limit the account itself (the trader's own guardrails are the binding ones). It wins over .env;
+ * ANTHROPIC_API_KEY stays .env's.
  */
 export function traderEnv(port = TRADER_PORTS.paper, balance = TRADER_BALANCE, ports = TRADER_PORTS, instId = 'BTC-USDT-SWAP') {
+  const maxNotional = String(Math.ceil(Number(balance)) * 10);
   return {
     ...paperEnv(port),
     STATE_FILE: 'data/pegasus-state.trader.json',
@@ -156,6 +159,11 @@ export function traderEnv(port = TRADER_PORTS.paper, balance = TRADER_BALANCE, p
     PAPER_STATE_FILE: 'data/paper-trader.json',
     PAPER_INSTRUMENTS: instId,
     PAPER_BALANCE: balance,
+    RISK_MAX_LEVERAGE: '10',
+    RISK_MAX_ORDER_NOTIONAL: maxNotional,
+    RISK_MAX_POSITION_NOTIONAL_PER_INSTRUMENT: maxNotional,
+    RISK_MAX_TOTAL_POSITION_NOTIONAL: maxNotional,
+    RISK_DAILY_LOSS_LIMIT: balance,
   };
 }
 

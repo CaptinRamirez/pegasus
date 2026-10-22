@@ -11,7 +11,7 @@ const chart = vi.hoisted(() => {
     const scale = { applyOptions: vi.fn() };
     return { setData: vi.fn(), update: vi.fn(), applyOptions: vi.fn(), priceScale: () => scale, scale };
   };
-  return { scrollToRealTime: vi.fn(), candles: series(), volume: series() };
+  return { scrollToRealTime: vi.fn(), candles: series(), volume: series(), onRange: null as ((range: { from: number; to: number } | null) => void) | null };
 });
 
 vi.mock('lightweight-charts', () => ({
@@ -21,7 +21,12 @@ vi.mock('lightweight-charts', () => ({
   CrosshairMode: { Normal: 0 },
   createChart: () => ({
     addSeries: (kind: string) => (kind === 'Candlestick' ? chart.candles : chart.volume),
-    timeScale: () => ({ scrollToRealTime: chart.scrollToRealTime }),
+    timeScale: () => ({
+      scrollToRealTime: chart.scrollToRealTime,
+      subscribeVisibleLogicalRangeChange: (handler: (range: { from: number; to: number } | null) => void) => {
+        chart.onRange = handler;
+      },
+    }),
     applyOptions: vi.fn(),
     remove: vi.fn(),
   }),
@@ -29,9 +34,9 @@ vi.mock('lightweight-charts', () => ({
 
 const candle = (ts: number, close: string): Candle => ({ ts, open: '100', high: '110', low: '90', close, vol: '5', volCcy: '500', confirm: true });
 
-function Harness({ history, chartKey }: { history: Candle[] | undefined; chartKey: string }) {
+function Harness({ history, chartKey, onNearStart }: { history: Candle[] | undefined; chartKey: string; onNearStart?: () => void }) {
   const container = useRef<HTMLDivElement | null>(null);
-  useCandleChart(container, null, history, undefined, chartKey);
+  useCandleChart(container, null, history, undefined, chartKey, onNearStart);
   return <div ref={container} />;
 }
 
@@ -93,5 +98,15 @@ describe('useCandleChart', () => {
     // another coin: its candles must be in view, whatever range the axis was dragged to
     await render([candle(60_000, '2499')], 'ETH-USDT-SWAP|1D');
     expect(autoScaleOn()).toBe(before + 2);
+  });
+  it('asks for older history when the view comes within ten bars of the oldest one, not otherwise', async () => {
+    const onNearStart = vi.fn();
+    await act(async () => root.render(<Harness history={[candle(1000, '100')]} chartKey="a" onNearStart={onNearStart} />));
+    chart.onRange?.({ from: 20, to: 80 });
+    expect(onNearStart).not.toHaveBeenCalled();
+    chart.onRange?.({ from: 3, to: 60 });
+    expect(onNearStart).toHaveBeenCalledTimes(1);
+    chart.onRange?.(null);
+    expect(onNearStart).toHaveBeenCalledTimes(1);
   });
 });

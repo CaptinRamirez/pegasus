@@ -472,7 +472,7 @@ describe('the trader watches the mark between closes', () => {
     await moveTo(s, String(PRICE));
   });
 
-  it('wakes the model when the mark comes near the stop, and not again within five minutes', async () => {
+  it('asks the model neither at the stop nor at the target: the exchange executes both', async () => {
     // 13:50: the mark reaches the wake level the last decision set (60500); the model answers with a short, stop 300 away
     s.clock.now = DAY + 13 * H + 50 * 60_000;
     s.model.queue.push(decide({ action: 'short', stopPx: '60800', targetPx: '59600', recheckMinutes: 240 }));
@@ -481,17 +481,18 @@ describe('the trader watches the mark between closes', () => {
     expect(s.model.calls).toBe(3);
     expect((s.model.dossiers[2] as TraderDossier).triggers).toEqual(['price reached 60500']);
     await waitFor(() => position(s), 5000, 'the short');
-    // 13:56: the mark within a third of the stop's distance of the stop: asked now
+    // 13:56: the mark a few points from the stop (60800): the stop is the exchange's, the model is not asked
     s.clock.now = DAY + 13 * H + 56 * 60_000;
-    s.model.queue.push(decide({ action: 'flat', recheckMinutes: 240 }));
     await moveTo(s, '60720');
     await s.service.tick();
-    expect(s.model.calls).toBe(4);
-    expect((s.model.dossiers[3] as TraderDossier).triggers).toEqual(['mark near the stop']);
-    // still near the stop a minute later: within the cooldown, not asked again
-    s.clock.now += 60_000;
+    expect(s.model.calls).toBe(3);
+    // 13:58: the mark at the target (59600): the take-profit fills on the exchange, booked at the next tick, not asked
+    s.clock.now += 2 * 60_000;
+    await moveTo(s, '59600');
+    await waitFor(() => !position(s), 5000, 'the short at its target');
     await s.service.tick();
-    expect(s.model.calls).toBe(4);
+    expect(s.model.calls).toBe(3);
+    expect(s.service.stateCopy().recent[0]).toMatchObject({ side: 'short', end: 'target' });
     await moveTo(s, String(PRICE));
   });
 });

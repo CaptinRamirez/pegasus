@@ -63,9 +63,10 @@ describe('launcher options', () => {
     // the trader's stack: its own ports, account, files and instrument; the campaign off
     expect(options.stackPorts({ trader: true }, {})).toEqual({ api: 8789, paper: 9202, web: 5176 });
     expect(options.webOutDir({ trader: true })).toBe('dist-trader');
-    expect(options.traderEnv()).toMatchObject({ PAPER_EXCHANGE_URL: 'http://127.0.0.1:9202', TRADER_ENABLED: '1', CAMPAIGN_ENABLED: '0', INSTRUMENTS: 'BTC-USDT-SWAP', PAPER_INSTRUMENTS: 'BTC-USDT-SWAP', PAPER_STATE_FILE: 'data/paper-trader.json', PAPER_BALANCE: '56', API_PORT: '8789', STATE_FILE: 'data/pegasus-state.trader.json', JOURNAL_FILE: 'data/journal.trader.json' });
+    expect(options.traderEnv()).toMatchObject({ PAPER_EXCHANGE_URL: 'http://127.0.0.1:9202', TRADER_ENABLED: '1', CAMPAIGN_ENABLED: '0', INSTRUMENTS: 'BTC-USDT-SWAP', PAPER_INSTRUMENTS: 'BTC-USDT-SWAP', PAPER_STATE_FILE: 'data/paper-trader.json', PAPER_BALANCE: '1124', API_PORT: '8789', STATE_FILE: 'data/pegasus-state.trader.json', JOURNAL_FILE: 'data/journal.trader.json', RISK_MAX_LEVERAGE: '10', RISK_MAX_ORDER_NOTIONAL: '11240', RISK_MAX_POSITION_NOTIONAL_PER_INSTRUMENT: '11240', RISK_MAX_TOTAL_POSITION_NOTIONAL: '11240', RISK_DAILY_LOSS_LIMIT: '1124' });
+    expect(options.traderEnv(9202, '56')).toMatchObject({ PAPER_BALANCE: '56', RISK_MAX_ORDER_NOTIONAL: '560', RISK_DAILY_LOSS_LIMIT: '56' });
     expect(options.traderBalanceOf({ TRADER_BALANCE: '100' })).toBe('100');
-    expect(options.traderBalanceOf({})).toBe('56');
+    expect(options.traderBalanceOf({})).toBe('1124');
   });
 
   it('--paper keeps the market data on OKX live, sends the account side to the paper exchange and never uses the key in .env', () => {

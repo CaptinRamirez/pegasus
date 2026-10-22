@@ -619,15 +619,15 @@ describe('App', () => {
     const label = (): string => [...container.querySelectorAll('.kv-list .k')].map((el) => el.textContent ?? '').find((t) => t.startsWith('Daily PnL')) ?? '';
     // the first balance of the day, seconds after 00:00 UTC: the plain label
     const ws = await connect({ ...hello, risk: { ...hello.risk, dayStartTs: day, baselineTs: day + 20_000 } });
-    expect(label()).toBe('Daily PnL');
-    expect(container.textContent).toContain('Day start equity');
+    expect(label()).toBe('Daily PnL / stop line');
+    expect(container.textContent).toContain('Equity at 00:00 UTC (stop-line baseline)');
     // the terminal was started at 09:12 UTC (or the baseline was rebased then)
     await act(async () => {
       ws.push({ type: 'risk', data: { ...hello.risk, dayStartTs: day, baselineTs: day + (9 * 60 + 12) * 60_000 } });
     });
-    expect(label()).toBe('Daily PnL since 09:12 UTC');
-    expect(container.textContent).toContain('Baseline equity');
-    expect(container.textContent).not.toContain('Day start equity');
+    expect(label()).toBe('Daily PnL / stop line (since 09:12 UTC)');
+    expect(container.textContent).toContain('Stop-line baseline equity (first read today)');
+    expect(container.textContent).not.toContain('Equity at 00:00 UTC');
   });
 
   it('a halt from an unreadable state file is explained under the kill-switch notice', async () => {

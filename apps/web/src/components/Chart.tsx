@@ -1,6 +1,6 @@
-import { useEffect, useRef } from 'react';
-import { skipToken, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { CandleBar, ConnState } from '@pegasus/shared';
+import { useEffect, useMemo, useRef } from 'react';
+import { skipToken, useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
+import type { Candle, CandleBar, ConnState } from '@pegasus/shared';
 import { useT } from '../i18n';
 import { api } from '../lib/api';
 import { fmtCoin, fmtPct, fmtPx, signOf } from '../lib/format';
@@ -28,11 +28,19 @@ export function Chart() {
   const container = useRef<HTMLDivElement | null>(null);
 
   const key = `${instId ?? ''}|${bar}`;
-  const history = useQuery({
+  // The first page is the newest 300 bars; each next page is the 100 before the oldest one loaded, fetched when the
+  // view reaches the left edge, until the exchange has no older bars.
+  const history = useInfiniteQuery({
     queryKey: ['candles', instId, bar],
-    queryFn: instId === null ? skipToken : () => api.candles({ instId, bar, limit: 300 }),
+    queryFn: instId === null ? skipToken : ({ pageParam }) => api.candles(pageParam === undefined ? { instId, bar, limit: 300 } : { instId, bar, limit: 100, before: pageParam }),
+    initialPageParam: undefined as number | undefined,
+    getNextPageParam: (last: Candle[]) => (last.length === 0 ? undefined : last[0]?.ts),
     staleTime: 15_000,
   });
+  const candles = useMemo(() => history.data?.pages.flat(), [history.data]);
+  const loadOlder = (): void => {
+    if (history.hasNextPage && !history.isFetchingNextPage) void history.fetchNextPage();
+  };
 
   // Live candles resume after the last bar the page saw: without a refetch the bars of a gap are missing for good
   // and the bar that was forming when it began keeps its partial values.
@@ -51,7 +59,7 @@ export function Chart() {
     if (business === 'connected' && before !== null && before !== 'connected') void queryClient.invalidateQueries({ queryKey: ['candles'] });
   }, [business, queryClient]);
 
-  useCandleChart(container, inst, history.data, live, key);
+  useCandleChart(container, inst, candles, live, key, loadOlder);
 
   const title = (
     <span className="row">

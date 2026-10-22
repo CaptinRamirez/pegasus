@@ -56,8 +56,8 @@ import { emptyTraderState, loadTraderState, RECENT_KEPT, rolledToDay, saveTrader
  * wants to look again and the prices that wake it earlier (wakeOf); it is also asked at the first close of each session
  * day, when the position nears its stop or reaches its target, and at the first close after a high-impact US release
  * (and the close before one while a position is open) — wakeReasons; and between closes, at every tick, as soon as
- * the mark reaches a wake level, comes within a third of the stop's distance of the stop or reaches the target (watch,
- * at most once per WATCH_COOLDOWN_MS). hourly: at the hourly close and at a 15-minute
+ * the mark reaches a wake level (watch, at most once per WATCH_COOLDOWN_MS). Never at the stop or the target: both are
+ * pre-commitments the exchange executes. hourly: at the hourly close and at a 15-minute
  * close that crossed a level of the day (detectTriggers). 15m: at every close. Its decision goes through checkDecision, then the
  * guardrails of the day (trade cap, daily loss, cooldown, kill switch, a resting limit), then the exchange: an isolated
  * order sized by traderSize with the stop attached (and the target as a take-profit), a close, or a tighter stop.
@@ -256,12 +256,12 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     const position = this.state.position;
     const macro = await this.readMacro(bar);
     const dossier = await buildTraderDossier({ instId: this.config.instId, now: bar, sources: this.sources, account: this.accountInfo(equity, position), guardrails: g, calendar: this.calendarFor(bar), triggers: [], macro, recentDecisions: this.state.recentDecisions ?? [], recentTrades: recentTradesOf(this.state.recent) });
-    const triggers = detectTriggers(this.lastDossier, dossier, position);
+    const triggers = detectTriggers(this.lastDossier, dossier);
     const hourly = bar % HOUR_MS === 0;
     this.lastDossier = dossier;
     const reasons =
       this.config.cadence === 'model'
-        ? this.wakeReasons(bar, dossier, fifteen, triggers)
+        ? this.wakeReasons(bar, dossier, fifteen)
         : [...(hourly ? ['hourly close'] : []), ...(this.config.cadence === '15m' && !hourly ? ['15-minute close'] : []), ...triggers];
     if (reasons.length === 0) return done();
     dossier.triggers = reasons;
@@ -333,8 +333,8 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
 
   /**
    * Between two closes, at every tick: a position gone from the exchange is booked at once, and in the session the mark
-   * is held against the wake levels, the stop and the target; a hit asks the model now, not at the close, at most once
-   * per WATCH_COOLDOWN_MS (TRADER_CADENCE=model).
+   * is held against the wake levels; a hit asks the model now, not at the close, at most once per WATCH_COOLDOWN_MS
+   * (TRADER_CADENCE=model).
    */
   private async watch(now: number, equity: string): Promise<void> {
     const mark = this.deps.market.liveMarkPrice(this.config.instId);
@@ -357,29 +357,23 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     this.emitChange();
   }
 
-  /** The mark against the wake levels and, with a position, its stop (within a third of its distance) and its target. */
+  /** The mark against the wake levels. */
   private priceReasons(mark: string): string[] {
     const out: string[] = [];
     const m = D(mark);
     const wake = this.state.wake ?? null;
     if (wake?.above != null && m.gte(wake.above)) out.push(`price reached ${wake.above}`);
     if (wake?.below != null && m.lte(wake.below)) out.push(`price reached ${wake.below}`);
-    const held = this.state.position;
-    if (held) {
-      const dist = D(held.entryPx).minus(held.stopPx).abs();
-      if (m.minus(held.stopPx).abs().lte(dist.div(3))) out.push('mark near the stop');
-      if (held.targetPx !== null && (held.side === 'long' ? m.gte(held.targetPx) : m.lte(held.targetPx))) out.push('mark at the target');
-    }
+    // Never at the stop or the target: both are the exchange's to execute; asking the model at the stop invites a panic close.
     return out;
   }
 
   /**
    * Why the model is asked at this close with TRADER_CADENCE=model; empty when it is not. The first close of the session
-   * day; its own recheck time; a wake level reached by the bar that closed or by the mark; the position near its stop or
-   * at its target; a high-impact US release that came out in the bar that closed, or (with a position) one due before the
-   * next close.
+   * day; its own recheck time; a wake level reached by the bar that closed or by the mark; a high-impact US release that
+   * came out in the bar that closed, or (with a position) one due before the next close.
    */
-  private wakeReasons(bar: number, dossier: TraderDossier, fifteen: readonly Candle[], levelTriggers: readonly string[]): string[] {
+  private wakeReasons(bar: number, dossier: TraderDossier, fifteen: readonly Candle[]): string[] {
     const out: string[] = [];
     const wake = this.state.wake ?? null;
     const lastCall = this.state.lastCallAt;
@@ -389,7 +383,6 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     const mark = D(dossier.mark);
     if (wake?.above != null && (mark.gte(wake.above) || (last !== undefined && D(last.high).gte(wake.above)))) out.push(`price reached ${wake.above}`);
     if (wake?.below != null && (mark.lte(wake.below) || (last !== undefined && D(last.low).lte(wake.below)))) out.push(`price reached ${wake.below}`);
-    out.push(...levelTriggers.filter((x) => x === 'mark near the stop' || x === 'mark at the target'));
     for (const e of dossier.macro.calendar) {
       if (e.country !== 'USD' || e.impact !== 'High') continue;
       if (e.time > bar - FIFTEEN_MINUTES_MS && e.time <= bar) out.push(`high-impact release out: ${e.title}`);
@@ -437,6 +430,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     const posSideOf = (side: 'long' | 'short'): PosSide | undefined => (this.deps.account.config?.posMode === 'long_short_mode' ? side : undefined);
     if (verdict.action === 'flat') return { executed: false, note: 'flat' };
     const held = this.state.position;
+    if ((verdict.action === 'close' || verdict.action === 'tighten_stop') && held && !this.livePosition()) return { executed: false, note: 'the position is already gone: the stop took it before the decision arrived' };
     if (verdict.action === 'close') {
       if (!held) return { executed: false, note: 'close without a position' };
       const posSide = posSideOf(held.side);
