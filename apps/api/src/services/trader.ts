@@ -184,6 +184,12 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       return;
     }
     this.state = loaded.state;
+    if (this.config.guardrails.maxConsecutiveLosses === 0 && this.state.cooldownUntil !== null) {
+      // a pause set under an earlier rule: the rule now has none, and the last decision's next look was chosen around it
+      this.log.info({ cooldownUntil: this.state.cooldownUntil }, 'pause after losses dropped: the guardrails have none; asked again at the next close');
+      this.state.cooldownUntil = null;
+      this.state.wake = null;
+    }
     this.restoreLastDecision();
     this.log.info({ file: this.config.stateFile, instId: this.config.instId, model: this.model?.name ?? null, position: this.state.position?.side ?? null, tradesToday: this.state.tradesToday }, 'trader state loaded');
     if (this.model === null) this.log.error('the trader has no model credentials (ANTHROPIC_API_KEY): it is blocked until the API is restarted with them');
@@ -590,7 +596,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     s.pnlToday = money(D(s.pnlToday).plus(result.pnl));
     if (D(result.pnl).lt(0)) {
       s.consecutiveLosses += 1;
-      if (s.consecutiveLosses >= g.maxConsecutiveLosses) {
+      if (g.maxConsecutiveLosses > 0 && s.consecutiveLosses >= g.maxConsecutiveLosses) {
         s.cooldownUntil = now + g.cooldownMs;
         s.consecutiveLosses = 0;
       }
@@ -767,7 +773,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     return { status: inTraderSession(now, this.config.guardrails) ? 'in-session' : 'idle', reason: null };
   }
 
-  /** The next instant the model is called at the latest: the next hourly close (every 15 minutes with TRADER_CADENCE=15m) inside the session. */
+  /** The next instant the model is called at the latest: the next hourly close (every 15 minutes with TRADER_CADENCE=15m) inside the session, Monday's open after Friday's close. */
   nextCallAt(now: number): number {
     const g = this.config.guardrails;
     if (this.config.cadence === 'model') {
@@ -783,7 +789,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     }
     const step = this.config.cadence === '15m' ? FIFTEEN_MINUTES_MS : HOUR_MS;
     let t = Math.floor(now / step) * step + step;
-    for (let i = 0; i < 200; i++, t += step) if (inTraderSession(t, g)) return t;
+    for (let i = 0; i < 800; i++, t += step) if (inTraderSession(t, g)) return t;
     return t;
   }
 

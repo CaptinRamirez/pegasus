@@ -92,12 +92,17 @@ const rangeOf = (bars: readonly Candle[]): { high: string | null; low: string | 
 export function levelsOf(fifteen: readonly Candle[], daily: readonly Candle[], now: number, mark: string): TraderLevels {
   const dayStart = utcDayStart(now);
   const today = fifteen.filter((c) => c.ts >= dayStart && c.ts < now);
-  const inHours = (from: number, to: number): Candle[] => today.filter((c) => c.ts >= dayStart + from * HOUR_MS && c.ts < dayStart + to * HOUR_MS);
+  // a session's latest stretch: today's once it has begun, yesterday's before
+  const session = (from: number, to: number): Candle[] => {
+    const start = (now >= dayStart + from * HOUR_MS ? dayStart : dayStart - 24 * HOUR_MS) + from * HOUR_MS;
+    return fifteen.filter((c) => c.ts >= start && c.ts < start + (to - from) * HOUR_MS && c.ts < now);
+  };
   const prev = daily.filter((c) => c.confirm && c.ts < dayStart).at(-1) ?? null;
   const todayBar = daily.find((c) => c.ts === dayStart) ?? null;
   const dayRange = rangeOf(today);
-  const asia = rangeOf(inHours(0, 8));
-  const europe = rangeOf(inHours(8, 13));
+  const asia = rangeOf(session(0, 8));
+  const europe = rangeOf(session(8, 13));
+  const us = rangeOf(session(13, 21));
   const round = roundLevels(mark);
   return {
     prevDayHigh: prev?.high ?? null,
@@ -110,6 +115,8 @@ export function levelsOf(fifteen: readonly Candle[], daily: readonly Candle[], n
     asiaLow: asia.low,
     europeHigh: europe.high,
     europeLow: europe.low,
+    usHigh: us.high,
+    usLow: us.low,
     vwap: fix(vwap(today), 2),
     roundBelow: round.below,
     roundAbove: round.above,
@@ -164,10 +171,10 @@ export interface BuildDossierInput {
 
 export async function buildTraderDossier(input: BuildDossierInput): Promise<TraderDossier> {
   const { instId, now, sources } = input;
-  const [fifteen, hourly, fourHour, daily] = await Promise.all([sources.candles(instId, '15m', 300), sources.candles(instId, '1H', 300), sources.candles(instId, '4H', 300), sources.candles(instId, '1D', 300)]);
+  const [fifteen, hourly, fourHour, daily, weekly] = await Promise.all([sources.candles(instId, '15m', 300), sources.candles(instId, '1H', 300), sources.candles(instId, '4H', 300), sources.candles(instId, '1D', 300), sources.candles(instId, '1W', 300)]);
   const mark = sources.mark(instId) ?? fifteen.filter((c) => c.confirm).at(-1)?.close ?? null;
   if (mark === null) throw new Error(`${instId}: no mark price and no candles`);
-  const frames = [frameOf('15m', fifteen), frameOf('1H', hourly), frameOf('4H', fourHour), frameOf('1D', daily)].filter((f): f is TraderFrame => f !== null);
+  const frames = [frameOf('15m', fifteen), frameOf('1H', hourly), frameOf('4H', fourHour), frameOf('1D', daily), frameOf('1W', weekly)].filter((f): f is TraderFrame => f !== null);
   const [funding, oi] = await Promise.all([sources.funding(instId).catch(() => ({ rate: null, mean72h: null })), sources.openInterest(instId).catch(() => ({ oi: null, change24hPct: null }))]);
   const derivatives: TraderDerivatives = { fundingRate: funding.rate, fundingMean72h: funding.mean72h, openInterest: oi.oi, oiChange24hPct: oi.change24hPct };
   const g = input.guardrails;

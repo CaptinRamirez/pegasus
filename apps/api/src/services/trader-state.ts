@@ -40,6 +40,7 @@ export interface TraderState {
   equityAtStart: string | null;
   tradesToday: number;
   pnlToday: string;
+  /** Losses in a row within the UTC day, like the other counters */
   consecutiveLosses: number;
   cooldownUntil: number | null;
   /** Open time of the last 15-minute bar the trader processed */
@@ -140,5 +141,5 @@ export function saveTraderState(file: string, state: TraderState): void {
 export function rolledToDay(state: TraderState, now: number, equity: string | null): TraderState {
   const date = utcDate(now);
   if (state.date === date) return state;
-  return { ...state, date, equityAtStart: equity, tradesToday: 0, pnlToday: '0', usage: { date, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 } };
+  return { ...state, date, equityAtStart: equity, tradesToday: 0, pnlToday: '0', consecutiveLosses: 0, usage: { date, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 } };
 }

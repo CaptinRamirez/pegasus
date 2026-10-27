@@ -72,3 +72,12 @@ export function stopCoverage(p: Position, algoOrders: readonly AlgoOrder[]): Sto
   const state: StopCoverageState = stops.length === 0 || covered.lte(0) ? 'none' : covered.lt(size) ? 'partial' : covered.eq(size) ? 'full' : 'over';
   return { state, stops, covered: covered.toFixed(), size: size.toFixed() };
 }
+
+/**
+ * The daily loss limit in force: RISK_DAILY_LOSS_LIMIT, but never more than the day's baseline equity. A day cannot
+ * lose more than the account held at its start, so what is left to lose is the live equity; a configured limit above
+ * that (the trader stack's is its starting balance) would show a line the account can no longer reach.
+ */
+export function dailyLossLimitOf(limit: string, dayStartEquity: string): string {
+  return dayStartEquity !== '' && D(dayStartEquity).gt(0) && D(dayStartEquity).lt(limit) ? dayStartEquity : limit;
+}

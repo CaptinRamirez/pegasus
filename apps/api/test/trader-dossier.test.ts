@@ -38,8 +38,10 @@ describe('levelsOf', () => {
     }
     const daily = [bar(T0 - 24 * H, 100, 105, 95, 100), bar(T0, 110, 133, 109, 130, false)];
     const lv: TraderLevels = levelsOf(fifteen, daily, now, '131');
-    expect(lv).toMatchObject({ prevDayHigh: '105', prevDayLow: '95', prevDayClose: '100', dayOpen: '110', dayHigh: '133', dayLow: '109', asiaHigh: '111', asiaLow: '109', europeHigh: '122', europeLow: '118', roundBelow: '130', roundAbove: '140' });
+    expect(lv).toMatchObject({ prevDayHigh: '105', prevDayLow: '95', prevDayClose: '100', dayOpen: '110', dayHigh: '133', dayLow: '109', asiaHigh: '111', asiaLow: '109', europeHigh: '122', europeLow: '118', usHigh: '133', usLow: '127', roundBelow: '130', roundAbove: '140' });
     expect(lv.vwap).not.toBeNull();
+    // at 02:00 Asia is today's, Europe and America are yesterday's
+    expect(levelsOf(fifteen, daily, T0 + 2 * H, '110')).toMatchObject({ asiaHigh: '111', asiaLow: '109', europeHigh: '101', europeLow: '99', usHigh: '101', usLow: '99' });
     // without the forming daily bar the day's range comes from the 15-minute bars
     const without = levelsOf(fifteen, daily.slice(0, 1), now, '131');
     expect(without).toMatchObject({ dayOpen: '110', dayHigh: '133', dayLow: '109' });
@@ -48,7 +50,7 @@ describe('levelsOf', () => {
 
 describe('detectTriggers', () => {
   const frame = (close: string, alignment: TraderFrame['alignment']): TraderFrame => ({ bar: '15m', asOf: 0, close, ema5: null, ema10: null, ema21: null, ema50: null, ema200: null, alignment, macd: null, rsi14: null, atr14: null, volumeRatio: null, bars: [], swings: [] });
-  const levels: TraderLevels = { prevDayHigh: '105', prevDayLow: '95', prevDayClose: '100', dayOpen: '100', dayHigh: '104', dayLow: '98', asiaHigh: null, asiaLow: null, europeHigh: null, europeLow: null, vwap: '101', roundBelow: '100', roundAbove: '110' };
+  const levels: TraderLevels = { prevDayHigh: '105', prevDayLow: '95', prevDayClose: '100', dayOpen: '100', dayHigh: '104', dayLow: '98', asiaHigh: null, asiaLow: null, europeHigh: null, europeLow: null, usHigh: null, usLow: null, vwap: '101', roundBelow: '100', roundAbove: '110' };
 
   it('names a close through a level and a flip of the 15-minute alignment', () => {
     const prev = { frames: [frame('104', 'mixed')], levels };

@@ -114,7 +114,7 @@ export function emaAlignment(e5: Decimal, e10: Decimal, e21: Decimal): EmaAlignm
 
 // ---- the dossier ----
 
-export type TraderBar = '15m' | '1H' | '4H' | '1D';
+export type TraderBar = '15m' | '1H' | '4H' | '1D' | '1W';
 
 /** One time frame as the model sees it: the last confirmed bars and the indicators on them. */
 export interface TraderFrame {
@@ -170,12 +170,15 @@ export interface TraderLevels {
   dayOpen: string | null;
   dayHigh: string | null;
   dayLow: string | null;
-  /** 00:00 to 08:00 UTC of the current UTC day */
+  /** Asia, 00:00 to 08:00 UTC: today's once it has begun, yesterday's before (so are the other two) */
   asiaHigh: string | null;
   asiaLow: string | null;
-  /** 08:00 to 13:00 UTC of the current UTC day */
+  /** Europe, 08:00 to 13:00 UTC */
   europeHigh: string | null;
   europeLow: string | null;
+  /** America, 13:00 to 21:00 UTC */
+  usHigh: string | null;
+  usLow: string | null;
   /** VWAP of the current UTC day's 15-minute bars */
   vwap: string | null;
   roundBelow: string;
@@ -260,10 +263,11 @@ export interface TraderGuardrails {
   maxTradesPerDay: number;
   /** Loss of the day, fraction of the day's starting equity, at which the trader stops for the day */
   dailyLossPct: string;
+  /** Losses in a row within the UTC day; 0: no pause however many */
   maxConsecutiveLosses: number;
   /** Pause after maxConsecutiveLosses */
   cooldownMs: number;
-  /** UTC hours of the window in which positions are opened */
+  /** UTC hours of the window in which positions are opened, Monday to Friday */
   sessionStartHour: number;
   sessionEndHour: number;
   maxLeverage: string;
@@ -271,14 +275,17 @@ export interface TraderGuardrails {
   maxLimitDistancePct: string;
 }
 
+// The owner on 2026-10-27, paper money: trade it all out. A tenth of the equity per trade, which a stop closer than 1%
+// cannot use in full at 10x; no pause after losses; a day stops at half the equity.
 export const DEFAULT_TRADER_GUARDRAILS: TraderGuardrails = {
-  riskPct: '0.02',
+  riskPct: '0.10',
   maxTradesPerDay: 3,
-  dailyLossPct: '0.06',
-  maxConsecutiveLosses: 3,
+  dailyLossPct: '0.5',
+  maxConsecutiveLosses: 0,
   cooldownMs: 24 * 3_600_000,
-  sessionStartHour: 13,
-  sessionEndHour: 21,
+  // the owner on 2026-10-27: daily-level trades, the Asian, European and American sessions all watched
+  sessionStartHour: 0,
+  sessionEndHour: 24,
   maxLeverage: '10',
   maxLimitDistancePct: '0.02',
 };
@@ -493,9 +500,11 @@ export function traderSize(input: { equity: DecimalInput; entryPx: DecimalInput;
 
 const HOUR_MS = 3_600_000;
 
-/** Whether `ts` falls in the trading window: [startHour, endHour) UTC. */
+/** Whether `ts` falls in the trading window: [startHour, endHour) UTC on a weekday; the US session has no Saturday or Sunday. */
 export function inTraderSession(ts: number, g: Pick<TraderGuardrails, 'sessionStartHour' | 'sessionEndHour'>): boolean {
-  const hour = new Date(ts).getUTCHours() + new Date(ts).getUTCMinutes() / 60;
+  const d = new Date(ts);
+  if (d.getUTCDay() === 0 || d.getUTCDay() === 6) return false;
+  const hour = d.getUTCHours() + d.getUTCMinutes() / 60;
   return hour >= g.sessionStartHour && hour < g.sessionEndHour;
 }
 

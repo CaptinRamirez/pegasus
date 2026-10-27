@@ -237,7 +237,7 @@ pnpm db:migrate
 | `RISK_MAX_POSITION_NOTIONAL_PER_INSTRUMENT` | 单品种最大持仓名义 |
 | `RISK_MAX_TOTAL_POSITION_NOTIONAL` | 总持仓名义上限 |
 | `RISK_MAX_LEVERAGE` | 允许的最大杠杆 |
-| `RISK_DAILY_LOSS_LIMIT` | 日内亏损熔断（权益相对当日基准的回撤；基准是当日 UTC 0 点后第一次读到的权益，当天第一次启动得晚就从那时算起，风控面板会标出 “since HH:MM UTC”） |
+| `RISK_DAILY_LOSS_LIMIT` | 日内亏损熔断（权益相对当日基准的回撤；基准是当日 UTC 0 点后第一次读到的权益，当天第一次启动得晚就从那时算起，风控面板会标出 “since HH:MM UTC”；生效的熔断线不超过当日基准权益，所以还能亏的不超过实时权益） |
 | `RISK_MAX_OPEN_ORDERS` | 最大挂单数 |
 | `RISK_PRICE_BAND_PCT` | 限价相对标记价允许的偏离，小数（`0.05` 即 5%），必须小于 1 |
 | `RISK_MAX_SLIPPAGE_PCT` | 市价单按盘口预估的最大滑点，小数（`0.005` 即 0.5%），必须小于 1 |

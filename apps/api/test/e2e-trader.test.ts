@@ -4,7 +4,7 @@
  * 15-minute closes in between (no call), a close by the model and its result, a decision the guardrails refuse, the
  * day's trade cap, the coin-flip control, the routes, and the session window.
  */
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -54,7 +54,7 @@ const decide = (over: Partial<TraderDecision>): TraderDecision => ({ action: 'fl
 
 /** Flat synthetic candles around PRICE, confirmed up to the clock; the forming bar last. */
 function sources(clock: { now: number }, mark: () => string | null): TraderDossierSources {
-  const durations: Record<TraderBar | '1D', number> = { '15m': M15, '1H': H, '4H': 4 * H, '1D': 24 * H };
+  const durations: Record<TraderBar, number> = { '15m': M15, '1H': H, '4H': 4 * H, '1D': 24 * H, '1W': 7 * 24 * H };
   return {
     async candles(_instId, bar, limit) {
       const d = durations[bar];
@@ -113,6 +113,9 @@ async function startStack(maxTradesPerDay: string, start: number, cadence: 'hour
     RISK_MAX_TOTAL_POSITION_NOTIONAL: '200000',
     TRADER_ENABLED: '1',
     TRADER_MAX_TRADES_PER_DAY: maxTradesPerDay,
+    // the sizes below are worked out at 2%, the clocks in the US session
+    TRADER_RISK_PCT: '0.02',
+    TRADER_SESSION: '13-21',
     TRADER_CADENCE: cadence,
     TRADER_STATE_FILE: join(dir, 'trader-state.json'),
     TRADER_LOG_FILE: join(dir, 'trader-log.jsonl'),
@@ -203,7 +206,7 @@ describe('the Claude auto trader on the paper exchange', () => {
     expect(s.model.calls).toBe(1);
     const dossier = s.model.dossiers[0] as TraderDossier;
     expect(dossier.triggers).toEqual(['hourly close']);
-    expect(dossier.frames.map((f) => f.bar)).toEqual(['15m', '1H', '4H', '1D']);
+    expect(dossier.frames.map((f) => f.bar)).toEqual(['15m', '1H', '4H', '1D', '1W']);
     expect(dossier.costs).toMatchObject({ takerFeePct: '0.05' });
     expect(Number(dossier.costs.roundTripPoints)).toBeCloseTo(60, 0);
     expect(dossier.recentTrades).toEqual([]);
@@ -423,11 +426,26 @@ describe('the model decides when it looks again', () => {
     expect((s.model.dossiers[3] as TraderDossier).triggers).toEqual(['session open']);
   });
 
+  it('skips the weekend: after Friday s session the next call is Monday s open', () => {
+    expect(s.service.nextCallAt(DAY + 4 * 24 * H + 21 * H)).toBe(DAY + 7 * 24 * H + 13 * H);
+  });
+
   it('shows the last decision again after a restart, from the log', async () => {
     const again = new TraderService(s.config.trader, { clients: s.deps.clients, market: s.deps.market, account: s.deps.account, risk: s.deps.risk, orders: s.deps.orders, log }, { now: () => s.clock.now, model: s.model, macro: { read: async () => s.macro }, checkEveryMs: 0 });
     await again.start();
     // the log's time of the decision: a few seconds after the close it was taken at
     expect(again.view().last).toMatchObject({ ts: DAY + 24 * H + 13 * H + 5_000, decision: { action: 'flat' } });
+    again.stop();
+  });
+
+  it('drops a pause saved under an earlier rule when the guardrails have none, and asks again at the next close', async () => {
+    const file = s.config.trader.stateFile;
+    const saved = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+    writeFileSync(file, JSON.stringify({ ...saved, cooldownUntil: s.clock.now + 20 * H, wake: { at: s.clock.now + 10 * H, above: null, below: null, setAt: s.clock.now } }));
+    const again = new TraderService(s.config.trader, { clients: s.deps.clients, market: s.deps.market, account: s.deps.account, risk: s.deps.risk, orders: s.deps.orders, log }, { now: () => s.clock.now, model: s.model, macro: { read: async () => s.macro }, checkEveryMs: 0 });
+    await again.start();
+    expect(again.view().today.cooldownUntil).toBeNull();
+    expect(again.view().nextCallAt).toBe(Math.floor(s.clock.now / (15 * 60_000)) * 15 * 60_000 + 15 * 60_000);
     again.stop();
   });
 });

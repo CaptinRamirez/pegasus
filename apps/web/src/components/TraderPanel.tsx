@@ -36,8 +36,14 @@ function StatusCard({ view }: { view: TraderView }) {
         {view.reason !== null && <span className="campaign-reason" title={view.reason.code}>{view.reason.message}</span>}
       </div>
       <Field k={t.trader.session}>
-        {t.trader.sessionLine(hour(view.session.startHour), hour(view.session.endHour))}
-        <span className="sub">{t.trader.sessionLocalLine(local(view.session.startHour), local(view.session.endHour))}</span>
+        {view.session.startHour === 0 && view.session.endHour === 24 ? (
+          t.trader.sessionAllDay
+        ) : (
+          <>
+            {t.trader.sessionLine(hour(view.session.startHour), hour(view.session.endHour))}
+            <span className="sub">{t.trader.sessionLocalLine(local(view.session.startHour), local(view.session.endHour))}</span>
+          </>
+        )}
       </Field>
       <Field k={t.trader.nextCall}>
         {view.nextCallAt === null ? (

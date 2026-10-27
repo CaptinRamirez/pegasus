@@ -79,7 +79,9 @@ closed: the server starts with the kill switch on and `killSwitchReason` `"STATE
 file, which stays on like a manual halt until it is released; a copy of an unparseable file is kept as
 `<STATE_FILE>.corrupt`, and the file itself stays in place (so every start fails closed) until the halt is saved over it.
 
-Releasing (`enabled: false`) while the daily loss limit is still breached (`dailyPnl <= -RISK_DAILY_LOSS_LIMIT`) is
+The limit in force is `RISK_DAILY_LOSS_LIMIT` capped at `dayStartEquity` (`dailyLossLimitOf` in `@pegasus/shared`): a
+day cannot lose more than the account held at its start, so the risk panel's line never exceeds the account.
+Releasing (`enabled: false`) while the daily loss limit is still breached (`dailyPnl <= -limit`) is
 refused with `409 DAILY_LOSS_ACTIVE` (`details`: `{ dailyPnl, limit, equity }`) and the switch stays on. With
 `rebase: true` the release goes through and the baseline restarts at the current equity (`dayStartEquity` =
 `currentEquity`, `baselineTs` = now, `dailyPnl` = `"0"`; a `DAILY_BASELINE_REBASED` risk event is recorded), so the
@@ -637,11 +639,11 @@ at 10x on a hard-capped pot. Settings (`.env`):
 | `CAMPAIGN_CUT_HOUR` | `0` | UTC hour the campaign's daily bars close at: `0` (OKX's own `1Dutc` / `12Hutc` bars) or `4`, `8`, `12`, `16`, `20` (bars built from its `4H` candles; the 12-hour closes are at it and 12 hours later). Followed by the campaign, `GET /api/campaign/signals`, channel trailing and the replay beside the pot; a pot keeps the cut it was started with (another setting blocks it with `LEDGER_UNREADABLE`). `20` adopted on 2026-10-18 |
 | `TRADER_ENABLED` | `0` | `1` runs the Claude auto trader (`docs/proposals/claude-auto-trader.md`); paper only, refused with `CAMPAIGN_ENABLED=1` on the same stack (`pnpm start --trader` sets everything) |
 | `TRADER_INSTRUMENT` | `BTC-USDT-SWAP` | the one USDT swap it trades; tracked while the trader is enabled |
-| `TRADER_SESSION` | `13-21` | UTC hours in which it opens positions (the US cash session is 13:30 to 20:00 UTC); a position is left to its stop after the end |
-| `TRADER_RISK_PCT` | `0.02` | loss accepted per trade, fraction of the equity |
+| `TRADER_SESSION` | `0-24` | UTC hours in which it is asked and opens positions, Monday to Friday (by default the whole weekday, Asia to America, for the owner's daily-level trades; `13-21` is the US session); there is none on the weekend, and a position is left to its stop outside it |
+| `TRADER_RISK_PCT` | `0.10` | loss accepted per trade, fraction of the equity (the owner's "all out" of 2026-10-27; at 10x a stop closer than 1% cannot use all of it) |
 | `TRADER_MAX_TRADES_PER_DAY` | `3` | |
-| `TRADER_DAILY_LOSS_PCT` | `0.06` | loss of the day, fraction of the day's starting equity, at which it stops for the day |
-| `TRADER_MAX_CONSECUTIVE_LOSSES` | `3` | after this many losses in a row it pauses 24 hours |
+| `TRADER_DAILY_LOSS_PCT` | `0.5` | loss of the day, fraction of the day's starting equity, at which it stops for the day |
+| `TRADER_MAX_CONSECUTIVE_LOSSES` | `0` | after this many losses in a row within the UTC day it pauses 24 hours; `0` never pauses |
 | `TRADER_MODEL` / `TRADER_EFFORT` | `claude-opus-5-5` / `high` | the model (the SDK reads `ANTHROPIC_API_KEY` from the environment; without it the trader is `blocked`) and its effort |
 | `TRADER_CADENCE` | `model` | `model`: the model names at every decision when it looks again (15 to 480 minutes) and the prices that wake it earlier; it is also asked at the session's first close of the day, right after a high-impact US release, and, between closes, as soon as the mark reaches a wake level (the mark is watched every 15 s, a hit asks at most once per 5 minutes); never at its stop or target, which the exchange executes. `hourly`: the hourly closes and the 15-minute closes that cross a level of the day; `15m`: every 15-minute close |
 | `TRADER_NEWS` | `1` | the economic calendar (ForexFactory's weekly feed: time, impact, forecast, previous) and the last six hours of headlines from the Federal Reserve, CNBC Economy, MarketWatch and Cointelegraph in the dossier (`services/trader-macro.ts`) |
@@ -1086,7 +1088,7 @@ GET /api/trader -> TraderView (packages/shared/src/trader.ts)
   session: { startHour: number; endHour: number; inSession: boolean };   // UTC
   guardrails: TraderGuardrails;                        // riskPct, maxTradesPerDay, dailyLossPct, maxConsecutiveLosses, cooldownMs, session hours, maxLeverage, maxLimitDistancePct (the stop's distance is the model's call)
   model: string;
-  nextCallAt: number | null;                           // the next hourly close in session (every 15 minutes with TRADER_CADENCE=15m)
+  nextCallAt: number | null;                           // the next hourly close in session (every 15 minutes with TRADER_CADENCE=15m); Monday's open over the weekend
   last: { ts; decision: TraderDecision | null; verdict: string; executed: boolean; usage; triggers: string[]; error: string | null } | null;
   position: TraderPosition & { unrealizedPnl: string | null } | null;
   today: { date; trades; pnl; consecutiveLosses; cooldownUntil; equityAtStart };

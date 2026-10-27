@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { CALLBACK_RATIO_MAX, CALLBACK_RATIO_MIN, D, Decimal, ZERO, contractsToCoin, notionalQuote, positionDirection, utcDayStart, type CancelSweepState, type Instrument, type Order, type OrdType, type PosSide, type Position, type PositionOverLimit, type RiskCheckResult, type RiskConfig, type RiskState, type Side } from '@pegasus/shared';
+import { CALLBACK_RATIO_MAX, CALLBACK_RATIO_MIN, D, Decimal, ZERO, contractsToCoin, dailyLossLimitOf, notionalQuote, positionDirection, utcDayStart, type CancelSweepState, type Instrument, type Order, type OrdType, type PosSide, type Position, type PositionOverLimit, type RiskCheckResult, type RiskConfig, type RiskState, type Side } from '@pegasus/shared';
 import type { Store } from '../db/store.js';
 import { AppError } from '../errors.js';
 import type { Logger } from '../logger.js';
@@ -230,11 +230,11 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
     this.state.updatedAt = t;
     if (!this.state.killSwitch && this.dailyLossBreached()) {
       this.state.killSwitch = true;
-      this.state.killSwitchReason = `${DAILY_LOSS_REASON}: daily PnL ${this.state.dailyPnl} breached -${this.config.dailyLossLimit}`;
+      this.state.killSwitchReason = `${DAILY_LOSS_REASON}: daily PnL ${this.state.dailyPnl} breached -${this.lossLimit()}`;
       this.sweepDone = false;
       persist = true;
-      this.log.error({ dailyPnl: this.state.dailyPnl, limit: this.config.dailyLossLimit }, 'DAILY LOSS LIMIT HIT - kill switch engaged');
-      void this.store.addRiskEvent('DAILY_LOSS_LIMIT', { dailyPnl: this.state.dailyPnl, limit: this.config.dailyLossLimit, equity: totalEq });
+      this.log.error({ dailyPnl: this.state.dailyPnl, limit: this.lossLimit() }, 'DAILY LOSS LIMIT HIT - kill switch engaged');
+      void this.store.addRiskEvent('DAILY_LOSS_LIMIT', { dailyPnl: this.state.dailyPnl, limit: this.lossLimit(), equity: totalEq });
     }
     if (persist) this.persist();
     this.emit('state', this.state);
@@ -255,8 +255,12 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
     this.emit('state', this.state);
   }
 
+  private lossLimit(): string {
+    return dailyLossLimitOf(this.config.dailyLossLimit, this.state.dayStartEquity);
+  }
+
   private dailyLossBreached(): boolean {
-    return D(this.config.dailyLossLimit).gt(0) && D(this.state.dailyPnl).lte(D(this.config.dailyLossLimit).neg());
+    return D(this.lossLimit()).gt(0) && D(this.state.dailyPnl).lte(D(this.lossLimit()).neg());
   }
 
   /**
@@ -270,16 +274,16 @@ export class RiskEngine extends EventEmitter<{ state: [RiskState] }> {
       if (!rebase) {
         throw new AppError(
           'DAILY_LOSS_ACTIVE',
-          `the daily loss limit is still breached (daily PnL ${dailyPnl}, limit -${this.config.dailyLossLimit}): releasing needs rebase, which restarts the day's baseline at the current equity`,
+          `the daily loss limit is still breached (daily PnL ${dailyPnl}, limit -${this.lossLimit()}): releasing needs rebase, which restarts the day's baseline at the current equity`,
           409,
-          { dailyPnl, limit: this.config.dailyLossLimit, equity: currentEquity },
+          { dailyPnl, limit: this.lossLimit(), equity: currentEquity },
         );
       }
       this.state.dayStartEquity = currentEquity;
       this.state.baselineTs = this.now();
       this.state.dailyPnl = '0';
       this.log.warn({ from: dayStartEquity, to: currentEquity, dailyPnl }, 'daily baseline rebased to the current equity');
-      void this.store.addRiskEvent('DAILY_BASELINE_REBASED', { from: dayStartEquity, to: currentEquity, dailyPnl, limit: this.config.dailyLossLimit });
+      void this.store.addRiskEvent('DAILY_BASELINE_REBASED', { from: dayStartEquity, to: currentEquity, dailyPnl, limit: this.lossLimit() });
     }
     // A new engagement gets its own sweep; engaging a switch that is already on starts none, so its record stays.
     if (enabled !== this.state.killSwitch) this.sweepDone = false;

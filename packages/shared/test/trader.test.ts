@@ -77,10 +77,18 @@ describe('indicators', () => {
     expect(roundLevels('82345')).toEqual({ below: '82000', above: '83000' });
     expect(roundLevels('3456.7')).toEqual({ below: '3400', above: '3500' });
     const noon = Date.UTC(2026, 9, 19, 12, 0);
-    expect(inTraderSession(noon, DEFAULT_TRADER_GUARDRAILS)).toBe(false);
-    expect(inTraderSession(Date.UTC(2026, 9, 19, 13, 0), DEFAULT_TRADER_GUARDRAILS)).toBe(true);
-    expect(inTraderSession(Date.UTC(2026, 9, 19, 20, 59), DEFAULT_TRADER_GUARDRAILS)).toBe(true);
-    expect(inTraderSession(Date.UTC(2026, 9, 19, 21, 0), DEFAULT_TRADER_GUARDRAILS)).toBe(false);
+    const us = { sessionStartHour: 13, sessionEndHour: 21 };
+    expect(inTraderSession(noon, us)).toBe(false);
+    expect(inTraderSession(Date.UTC(2026, 9, 19, 13, 0), us)).toBe(true);
+    expect(inTraderSession(Date.UTC(2026, 9, 19, 20, 59), us)).toBe(true);
+    expect(inTraderSession(Date.UTC(2026, 9, 19, 21, 0), us)).toBe(false);
+    expect(inTraderSession(Date.UTC(2026, 9, 24, 15, 0), us)).toBe(false); // Saturday
+    expect(inTraderSession(Date.UTC(2026, 9, 25, 15, 0), us)).toBe(false); // Sunday
+    expect(inTraderSession(Date.UTC(2026, 9, 26, 13, 0), us)).toBe(true); // Monday
+    // the default: the whole weekday, Asia to America
+    expect(inTraderSession(Date.UTC(2026, 9, 26, 0, 0), DEFAULT_TRADER_GUARDRAILS)).toBe(true); // Monday 00:00
+    expect(inTraderSession(Date.UTC(2026, 9, 23, 23, 59), DEFAULT_TRADER_GUARDRAILS)).toBe(true); // Friday 23:59
+    expect(inTraderSession(Date.UTC(2026, 9, 24, 0, 0), DEFAULT_TRADER_GUARDRAILS)).toBe(false); // Saturday 00:00
     expect(minutesTo(noon, 13, 30)).toBe(90);
     expect(minutesTo(Date.UTC(2026, 9, 19, 14, 0), 13, 30)).toBe(-30);
   });
@@ -125,10 +133,11 @@ describe('checkDecision', () => {
 
 describe('traderSize', () => {
   it('risks riskPct of the equity at the stop, in whole lots, with the smallest leverage that posts the notional', () => {
+    const g = { ...DEFAULT_TRADER_GUARDRAILS, riskPct: '0.02' };
     // equity 56, risk 1.12 USDT, stop 300 away: 0.003733 BTC = 0.37 contracts of 0.01 -> 0 lots
-    expect(traderSize({ equity: '56', entryPx: '82000', stopPx: '81700', inst, guardrails: DEFAULT_TRADER_GUARDRAILS })).toBeNull();
+    expect(traderSize({ equity: '56', entryPx: '82000', stopPx: '81700', inst, guardrails: g })).toBeNull();
     // equity 5600: 112 USDT risk / 300 = 0.3733 BTC = 37 contracts; notional 30,340; leverage ceil(30340/5600*1.1) = 6
-    const s = traderSize({ equity: '5600', entryPx: '82000', stopPx: '81700', inst, guardrails: DEFAULT_TRADER_GUARDRAILS });
+    const s = traderSize({ equity: '5600', entryPx: '82000', stopPx: '81700', inst, guardrails: g });
     expect(s).toEqual({ contracts: '37', notional: '30340', leverage: '6', riskQuote: '111' });
   });
 

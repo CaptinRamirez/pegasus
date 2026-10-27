@@ -1,4 +1,4 @@
-import { D, type CancelSweepState, type DecimalInput } from '@pegasus/shared';
+import { D, dailyLossLimitOf, type CancelSweepState, type DecimalInput } from '@pegasus/shared';
 import { Panel } from './Panel';
 import { useLang, useT } from '../i18n';
 import { fmtNum, fmtPct, fmtSigned, fmtUtcMinute, safeDecimal, signOf } from '../lib/format';
@@ -52,7 +52,8 @@ export function RiskPanel() {
   // terminal, or a rebase, the PnL counts from that moment and the label says so ("09:12 UTC").
   const since = state !== null && state.baselineTs - state.dayStartTs > DAY_START_TOLERANCE_MS ? fmtUtcMinute(state.baselineTs).slice(-9) : null;
   const lossUsed = dailyPnl !== null && D(dailyPnl).lt(0) ? D(dailyPnl).abs() : D(0);
-  const lossPct = usagePct(lossUsed, config.dailyLossLimit);
+  const lossLimit = dailyLossLimitOf(config.dailyLossLimit, state?.dayStartEquity ?? '');
+  const lossPct = usagePct(lossUsed, lossLimit);
   const notionalPct = usagePct(state?.totalPositionNotional, config.maxTotalPositionNotional);
   const openOrders = state?.openOrders ?? openOrdersLocal;
   const ordersPct = config.maxOpenOrders > 0 ? Math.min(100, (openOrders / config.maxOpenOrders) * 100) : 0;
@@ -81,7 +82,7 @@ export function RiskPanel() {
       <div className="kv-list">
         <span className="k">{t.risk.dailyPnl(since)}</span>
         <span className={`v num ${signOf(dailyPnl)}`}>
-          {fmtSigned(dailyPnl)} / -{fmtNum(config.dailyLossLimit, 0)} USD
+          {fmtSigned(dailyPnl)} / -{fmtNum(lossLimit, 0)} USD
         </span>
       </div>
       <Meter pct={lossPct} tone={lossPct >= 80 ? 'neg' : lossPct >= 50 ? 'warn' : 'pos'} />

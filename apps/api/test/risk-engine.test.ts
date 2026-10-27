@@ -324,6 +324,16 @@ describe('RiskEngine.updateExposure: positions that have outgrown the limits', (
 });
 
 describe('RiskEngine daily loss', () => {
+  it('never puts the limit above the equity the day started with', () => {
+    const e = new RiskEngine({ ...config, dailyLossLimit: '1124' }, new MemoryStore(), log, () => Date.UTC(2026, 0, 1, 12));
+    e.updateEquity('1091.13');
+    e.updateEquity('0.01');
+    expect(e.state.killSwitch).toBe(false);
+    e.updateEquity('0');
+    expect(e.state.killSwitch).toBe(true);
+    expect(e.state.killSwitchReason).toMatch(/breached -1091\.13$/);
+  });
+
   it('trips the kill switch when equity drops by the limit and resets on a new day', async () => {
     let now = Date.UTC(2026, 0, 1, 12);
     const store = new MemoryStore();

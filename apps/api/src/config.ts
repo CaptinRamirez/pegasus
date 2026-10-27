@@ -95,13 +95,14 @@ const envSchema = z.object({
   /** The one USDT swap it trades; tracked like INSTRUMENTS while the trader is enabled. */
   TRADER_INSTRUMENT: z.string().default('BTC-USDT-SWAP'),
   /** The window in which it opens positions, UTC hours start-end (the US cash session is 13:30 to 20:00 UTC). */
-  TRADER_SESSION: z.string().regex(/^\d{1,2}-\d{1,2}$/, 'must be two UTC hours, start-end').default('13-21'),
+  TRADER_SESSION: z.string().regex(/^\d{1,2}-\d{1,2}$/, 'must be two UTC hours, start-end').default('0-24'),
   /** Loss accepted per trade, fraction of the equity. */
   TRADER_RISK_PCT: fraction.default(DEFAULT_TRADER_GUARDRAILS.riskPct),
   TRADER_MAX_TRADES_PER_DAY: z.coerce.number().int().min(1).default(DEFAULT_TRADER_GUARDRAILS.maxTradesPerDay),
   /** Loss of the day, fraction of the day's starting equity, at which it stops for the day. */
   TRADER_DAILY_LOSS_PCT: fraction.default(DEFAULT_TRADER_GUARDRAILS.dailyLossPct),
-  TRADER_MAX_CONSECUTIVE_LOSSES: z.coerce.number().int().min(1).default(DEFAULT_TRADER_GUARDRAILS.maxConsecutiveLosses),
+  /** Losses in a row after which it pauses 24 hours; 0 never pauses. */
+  TRADER_MAX_CONSECUTIVE_LOSSES: z.coerce.number().int().min(0).default(DEFAULT_TRADER_GUARDRAILS.maxConsecutiveLosses),
   /** The model asked (the SDK reads ANTHROPIC_API_KEY from the environment) and its effort. */
   TRADER_MODEL: z.string().min(1).default('claude-opus-5-5'),
   TRADER_EFFORT: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('high'),
