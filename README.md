@@ -56,7 +56,7 @@ cp .env.example .env        # 填 OKX_API_KEY / SECRET / PASSPHRASE，API_TOKEN 
 pnpm start        # Windows 上也可以直接双击 start.bat
 ```
 
-先构建前端页面，再按 `.env` 的配置依次启动后端和前端，就绪后自动打开浏览器（http://localhost:5174）。关闭窗口或 Ctrl+C 停止全部服务。打开页面后输入 `.env` 里的 `API_TOKEN`。
+先构建前端页面，再按 `.env` 的配置依次启动后端和前端，就绪后自动打开浏览器（http://localhost:5174）。关闭窗口或 Ctrl+C 停止全部服务。某个服务意外退出、后端连续 3 分钟不回应、或交易员的状态文件 25 分钟没有更新时，窗口里会提示，Windows 上还会弹出对话框。打开页面后输入 `.env` 里的 `API_TOKEN`。
 
 启动时窗口里会打印这次启动所用的代码版本（git 提交号），`GET /api/health` 的 `version` 也是它。页面和后端都是启动那一刻的代码：运行中 `git pull` 不会改变正在运行的任何一半，**更新代码后要关掉窗口重新启动**才生效。前端构建失败时启动器会直接说明并退出，不会启动任何服务。
 

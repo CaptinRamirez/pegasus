@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import {
   checkDecision,
   CL_ORD_PREFIXES,
+  contractsToCoin,
   D,
   Decimal,
   estimateUsd,
@@ -30,6 +31,7 @@ import {
   type TraderView,
   wakeOf,
 } from '@pegasus/shared';
+import type { OkxPosition } from '@pegasus/okx';
 import type { TraderConfig } from '../config.js';
 import type { Logger } from '../logger.js';
 import type { OkxClients } from '../okx/clients.js';
@@ -105,6 +107,8 @@ export const CONTROL_FEE = '0.0005';
 export const WATCH_COOLDOWN_MS = 5 * 60_000;
 const iso = (t: number): string => new Date(t).toISOString();
 const money = (v: Decimal): string => v.toDecimalPlaces(8).toFixed();
+/** The verdict on a close or a stop move that finds the position already gone */
+const POSITION_GONE = 'the position is already gone: the stop or the target took it before the decision arrived';
 
 export function disabledTraderView(config: TraderConfig, now = Date.now()): TraderView {
   return {
@@ -311,18 +315,23 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     this.addUsage(answer.usage);
     const decision = answer.decision;
     this.state.wake = wakeOf(decision, bar);
-    if (decision) this.state.recentDecisions = [{ ts: bar, triggers: dossier.triggers, action: decision.action, oneLiner: decision.oneLiner, invalidation: decision.invalidation, wakeAbove: this.state.wake.above, wakeBelow: this.state.wake.below }, ...(this.state.recentDecisions ?? [])].slice(0, 5);
     let verdictText = answer.problem ?? 'no decision';
     let executed = false;
     if (decision) {
-      const verdict = checkDecision(decision, dossier.mark, this.config.guardrails, this.state.position);
+      // judged on the mark of this moment: the dossier's is as old as the model's thinking
+      const mark = this.deps.market.liveMarkPrice(this.config.instId) ?? dossier.mark;
+      const held = this.state.position;
+      // the stop or the target took the position while the model was thinking: said as such, not as a refusal on the mark
+      const gone = held !== null && (decision.action === 'close' || decision.action === 'tighten_stop') && !this.livePosition();
+      const fundingPoints = !gone && decision.action === 'tighten_stop' && held ? await this.fundingPoints(held) : '0';
+      const verdict: TraderVerdict = gone ? { ok: false, action: decision.action, reason: POSITION_GONE } : checkDecision(decision, mark, this.config.guardrails, held, { tickSz: this.deps.market.requireInstrument(this.config.instId).tickSz, fundingPoints });
       if (!verdict.ok) verdictText = `not carried out: ${verdict.reason}`;
       else {
         const blocked = verdict.action === 'long' || verdict.action === 'short' ? this.entryBlocked(bar, equity) : null;
         if (blocked !== null) verdictText = `not carried out: ${blocked}`;
         else {
           try {
-            const outcome = await this.execute(verdict, dossier, equity, bar, now);
+            const outcome = await this.execute(verdict, mark, equity, bar, now);
             executed = outcome.executed;
             verdictText = outcome.note;
           } catch (err) {
@@ -332,6 +341,8 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
         }
       }
     }
+    // shown to the model at its next call, with what the code did with it (a refused stop move is learnt from, not repeated)
+    if (decision) this.state.recentDecisions = [{ ts: bar, triggers: dossier.triggers, action: decision.action, oneLiner: decision.oneLiner, invalidation: decision.invalidation, wakeAbove: this.state.wake.above, wakeBelow: this.state.wake.below, verdict: verdictText }, ...(this.state.recentDecisions ?? [])].slice(0, 5);
     this.record({ ts: now, kind: 'decision', instId: this.config.instId, triggers: dossier.triggers, dossier, decision, verdict: verdictText, usage: answer.usage });
     this.lastDecision = { ts: bar, decision, verdict: verdictText, executed, usage: answer.usage, triggers: dossier.triggers, error: answer.problem };
     this.log.info({ action: decision?.action ?? null, verdict: verdictText, executed, tokens: answer.usage.inputTokens + answer.usage.outputTokens, ms: answer.usage.ms }, 'trader decision');
@@ -431,18 +442,18 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     return null;
   }
 
-  private async execute(verdict: TraderVerdict & { ok: true }, dossier: TraderDossier, equity: string, bar: number, now: number): Promise<{ executed: boolean; note: string }> {
+  private async execute(verdict: TraderVerdict & { ok: true }, mark: string, equity: string, bar: number, now: number): Promise<{ executed: boolean; note: string }> {
     const { instId } = this.config;
     const posSideOf = (side: 'long' | 'short'): PosSide | undefined => (this.deps.account.config?.posMode === 'long_short_mode' ? side : undefined);
     if (verdict.action === 'flat') return { executed: false, note: 'flat' };
     const held = this.state.position;
-    if ((verdict.action === 'close' || verdict.action === 'tighten_stop') && held && !this.livePosition()) return { executed: false, note: 'the position is already gone: the stop took it before the decision arrived' };
+    if ((verdict.action === 'close' || verdict.action === 'tighten_stop') && held && !this.livePosition()) return { executed: false, note: POSITION_GONE };
     if (verdict.action === 'close') {
       if (!held) return { executed: false, note: 'close without a position' };
       const posSide = posSideOf(held.side);
       await this.deps.orders.closePosition({ instId, mgnMode: 'isolated', ...(posSide ? { posSide } : {}) });
       this.closing = true;
-      this.closeControlAtMark(dossier.mark, bar);
+      this.closeControlAtMark(mark, bar);
       return { executed: true, note: 'closed at the market' };
     }
     if (verdict.action === 'tighten_stop') {
@@ -451,8 +462,14 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       if (!algo) throw new Error('no stop order found on the exchange to tighten');
       await this.deps.orders.amendStop({ instId, algoId: algo.algoId, slTriggerPx: verdict.stopPx });
       held.stopPx = verdict.stopPx;
-      if (this.state.control.position) this.state.control.position.stopPx = this.mirrorStop(verdict.stopPx, held, this.state.control.position);
-      return { executed: true, note: `stop tightened to ${verdict.stopPx}` };
+      const control = this.state.control.position;
+      if (control) {
+        const stop = this.mirrorStop(verdict.stopPx, held, control);
+        // a control under water on the other side can find its moved stop past the market: it is stopped now, at the mark
+        if (control.side === 'long' ? D(stop).gte(mark) : D(stop).lte(mark)) this.endControl(control, mark, 'stop', bar);
+        else control.stopPx = stop;
+      }
+      return { executed: true, note: `stop tightened to ${verdict.stopPx}${verdict.note ? ` (${verdict.note})` : ''}` };
     }
     // long or short
     const inst = this.deps.market.requireInstrument(instId);
@@ -475,14 +492,29 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       clOrdId,
     };
     const { order } = await this.deps.orders.place(req);
-    this.record({ ts: now, kind: 'execution', instId, order: { clOrdId, side: req.side, entryType: verdict.entryType, contracts: size.contracts, entryPx: verdict.entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, leverage: size.leverage } });
     if (verdict.entryType === 'limit') {
+      this.record({ ts: now, kind: 'execution', instId, order: { clOrdId, side: req.side, entryType: 'limit', contracts: size.contracts, entryPx: verdict.entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, leverage: size.leverage } });
       this.state.pendingLimit = { clOrdId, side, contracts: size.contracts, px: verdict.entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, leverage: size.leverage, placedAt: now, barTs: bar, equityAtEntry: equity };
       return { executed: true, note: `limit ${side} resting at ${verdict.entryPx}, stop ${verdict.stopPx}` };
     }
-    const entryPx = order.avgPx !== '' ? order.avgPx : verdict.entryPx;
-    this.openPosition({ side, contracts: size.contracts, entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, openedAt: now, clOrdId, equityAtEntry: equity }, dossier.mark, bar);
-    return { executed: true, note: `${side} ${size.contracts} contracts at ${entryPx}, stop ${verdict.stopPx}${verdict.targetPx ? `, target ${verdict.targetPx}` : ''}, ${size.leverage}x` };
+    // Booked at the fill (the 2026-10-28 audit: the mark the model saw is not the price it got): the exchange reports the
+    // position a moment after a market order fills; the mark stands in when it has not within two seconds.
+    let entryPx = order.avgPx;
+    for (let i = 0; entryPx === '' && i < 20; i++) {
+      await this.sleep(100);
+      entryPx = this.livePosition()?.avgPx ?? '';
+    }
+    const live = this.livePosition();
+    // what the exchange holds (a market order may fill short of the planned size); the plan when nothing is reported yet
+    const contracts = live ? D(live.pos).abs().toFixed() : size.contracts;
+    const filled = entryPx !== '';
+    if (!filled) entryPx = verdict.entryPx;
+    // shortcut: a market order the exchange cancelled unfilled (an empty book during a feed reconnect, about 1e-4 of the
+    // entries) is booked too and ends at the next look as a 0 result; look the order up (rest.getOrder) if the log shows it
+    if (!live) this.log.warn({ clOrdId, contracts, mark }, 'no position reported within two seconds of the market order: booked at the planned size and the mark');
+    this.record({ ts: now, kind: 'execution', instId, order: { clOrdId, side: req.side, entryType: 'market', contracts, entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, leverage: size.leverage } });
+    this.openPosition({ side, contracts, entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, openedAt: now, clOrdId, equityAtEntry: equity }, mark, bar);
+    return { executed: true, note: `${side} ${contracts} contracts at ${entryPx}${filled ? '' : ' (the mark: no fill reported within 2 s)'}, stop ${verdict.stopPx}${verdict.targetPx ? `, target ${verdict.targetPx}` : ''}, ${size.leverage}x` };
   }
 
   private openPosition(position: TraderPosition, mark: string, bar: number): void {
@@ -493,6 +525,21 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
   }
 
   // ---- the position on the exchange ----
+
+  /** The funding the exchange reports on the held position (its fundingFee: received positive, paid negative) per coin, in price points; 0 when it reports none or cannot be read. */
+  private async fundingPoints(held: TraderPosition): Promise<string> {
+    const { instId } = this.config;
+    try {
+      const rows: Array<OkxPosition & { fundingFee?: string }> = await this.deps.clients.rest.getPositions('SWAP', instId);
+      const fee = rows.find((r) => r.instId === instId)?.fundingFee;
+      if (fee === undefined || fee === '') return '0';
+      const coin = contractsToCoin(held.contracts, this.deps.market.requireInstrument(instId));
+      return coin.gt(0) ? D(fee).div(coin).toFixed() : '0';
+    } catch (err) {
+      this.log.warn({ err: (err as Error).message }, 'the funding of the position could not be read: the break-even counts the fees only');
+      return '0';
+    }
+  }
 
   private livePosition(): Position | null {
     return this.deps.account.positionList().find((p) => p.instId === this.config.instId && !D(p.pos || '0').isZero()) ?? null;
@@ -576,6 +623,13 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       this.openPosition({ side: p.side, contracts: D(live.pos).abs().toFixed(), entryPx, stopPx: p.stopPx, targetPx: p.targetPx, openedAt: now, clOrdId: p.clOrdId, equityAtEntry: p.equityAtEntry }, entryPx, bar);
       this.record({ ts: now, kind: 'execution', instId: this.config.instId, order: { clOrdId: p.clOrdId, side: p.side === 'long' ? 'buy' : 'sell', entryType: 'limit', contracts: p.contracts, entryPx, stopPx: p.stopPx, targetPx: p.targetPx, leverage: p.leverage } });
       return true;
+    } else if (held && live && live.avgPx !== '' && (!D(live.avgPx).eq(held.entryPx) || !D(live.pos).abs().eq(held.contracts))) {
+      // the exchange's fill over the booked one: a position booked at the mark (a fill reported late, or one opened before
+      // 2026-10-29, when every market entry was) is corrected as soon as it is seen; the break-even is measured from it
+      this.log.info({ booked: held.entryPx, fill: live.avgPx, contracts: live.pos }, 'trader position: the fill the exchange reports replaces the booked entry');
+      held.entryPx = live.avgPx;
+      held.contracts = D(live.pos).abs().toFixed();
+      return true;
     }
     return false;
   }
@@ -649,9 +703,11 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
   }
 
   private mirrorStop(newStop: string, held: TraderPosition, control: TraderPosition): string {
-    // the same distance from the entry as the model's new stop
-    const dist = D(held.entryPx).minus(newStop).abs();
-    return money(control.side === 'long' ? D(control.entryPx).minus(dist) : D(control.entryPx).plus(dist));
+    // the model's new stop as an offset from its entry, signed (positive: profit locked), put on the control's entry: a
+    // stop that locks profit for the model locks as much for the control (the 2026-10-29 review: the distance alone put
+    // every profit-side stop on the control's losing side)
+    const locked = D(newStop).minus(held.entryPx).mul(held.side === 'long' ? 1 : -1);
+    return money(control.side === 'long' ? D(control.entryPx).plus(locked) : D(control.entryPx).minus(locked));
   }
 
   private closeControlAtMark(mark: string, bar: number): void {

@@ -566,6 +566,7 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
         open.map((c) => ({ id: c.id, instId: c.instId, addRef: c.addRef, exiting: c.pendingExit !== null })),
         bars,
         this.rule(),
+        this.config.cutHour,
       );
       step.inputs.push(...walk.inputs);
       for (const m of walk.missed) this.act(step, { kind: m.kind, closeTs: m.closeTs, instId: m.instId, campaignId: m.campaignId, plan: m.plan, outcome: 'missed', reason: 'missed-close' });
@@ -640,7 +641,7 @@ export class CampaignService extends EventEmitter<{ change: [CampaignView] }> {
     // Less available than banked (a position the ledger does not know holds margin): the pot has no free cash.
     const freeCash = snap.available.minus(pot.banked);
     if (freeCash.lt(0)) step.notes.push(`the account's available ${money(snap.available)} USDT is less than the ${pot.banked} banked: the pot's free cash counts as 0`);
-    const decision = decideClose({ closeTs, params: this.rule(), pot: this.potParams(), rungs: pot.rungs, freeCash: Decimal.max(ZERO, freeCash), campaigns, instruments, foreign, unresolved });
+    const decision = decideClose({ closeTs, params: this.rule(), pot: this.potParams(), rungs: pot.rungs, freeCash: Decimal.max(ZERO, freeCash), campaigns, instruments, foreign, unresolved, cutHour: this.config.cutHour });
     step.before = { freeCash: money(decision.freeCash), openEquity: money(decision.openEquity), value: money(decision.value), banked: pot.banked, rungs: pot.rungs };
     // The highest value the pot was marked at, before the harvest of the close; each campaign's highest equity over its basis.
     if (pot.peak === null || decision.value.gt(pot.peak.value)) pot.peak = { ts: closeTs, value: money(decision.value) };

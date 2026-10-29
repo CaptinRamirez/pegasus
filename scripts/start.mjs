@@ -10,8 +10,10 @@
 // through the proxy of scripts/vite.stack.config.mjs, which points it at the API of its own stack.
 // --paper --campaign starts both stacks from this one window (start-all.bat): the paper stack first, then the
 // campaign's, with every line of a service's output tagged [纸面] or [滚仓].
+// Every minute each stack is checked (watchStack): its API must answer /api/health and the trader's state file must be
+// fresh; a failing check, like a service that exits, is reported in the console and, on Windows, in a dialog.
 import { exec, execFileSync, spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { connect } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -78,7 +80,7 @@ function start(name, dir, args, opts = {}) {
       if (children.size === 0) process.exit(exitCode);
       return;
     }
-    say(`${name}意外退出（${signal ?? `退出码 ${code}`}），正在停止其余服务`);
+    alert(`${name}意外退出（${signal ?? `退出码 ${code}`}），其余服务随之停止：请看窗口里的日志，然后重新启动`);
     stop(1);
   });
   return child;
@@ -167,6 +169,45 @@ function startWeb(tag, dev, ports, outDir, onUrl) {
 function openBrowser(url) {
   const cmd = process.platform === 'win32' ? `start "" "${url}"` : process.platform === 'darwin' ? `open "${url}"` : `xdg-open "${url}"`;
   exec(cmd, () => {}); // best effort: a missing opener must not take the stack down
+}
+
+/** Tells the user something is wrong: the console with the bell and, on Windows, a dialog on top of every window that stays until it is closed. */
+function alert(text) {
+  say(`\x07${text}`);
+  if (process.platform !== 'win32') return;
+  const script = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('${text.replace(/'/g, "''")}', 'Pegasus', 'OK', 'Warning', 'Button1', 'ServiceNotification') | Out-Null`;
+  spawn('powershell', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', script], { detached: true, stdio: 'ignore' }).on('error', () => {}).unref();
+}
+
+/**
+ * The dead-man check of a stack, asked for after the 2026-10-28 audit: every minute its API must answer /api/health
+ * and, with the trader, its state file (rewritten at every 15-minute close) must be newer than 25 minutes, a close
+ * plus the model's two 3-minute attempts, counted from the stack's start when the file is older (a restart after an
+ * outage). The user is told at the third failure in a row and once more at the recovery.
+ */
+function watchStack(tag, apiPort, traderStateFile) {
+  const name = tag ? `${tag}栈` : 'Pegasus';
+  const startedAt = Date.now();
+  const misses = new Map();
+  const check = (what, ok, text) => {
+    const before = misses.get(what) ?? 0;
+    misses.set(what, ok ? 0 : before + 1);
+    if (ok && before >= 3) say(`${name}：${what}恢复了`);
+    else if (!ok && before === 2) alert(text());
+  };
+  setInterval(async () => {
+    if (stopping) return;
+    check('后端', await apiHealthy(apiPort), () => `${name}的后端连续 3 分钟没有回应 /api/health（端口 ${apiPort}）：请看窗口里的日志，必要时重新启动`);
+    if (traderStateFile === null) return;
+    let stat;
+    try {
+      stat = statSync(traderStateFile, { throwIfNoEntry: false });
+    } catch {
+      stat = undefined; // a file being replaced or held: one miss
+    }
+    const age = Date.now() - Math.max(stat?.mtimeMs ?? 0, startedAt);
+    check('交易员', age < 25 * 60_000, () => `交易员的状态文件${stat ? `已经 ${Math.round(age / 60_000)} 分钟没有更新` : '不存在'}（它每 15 分钟写一次）：交易员可能卡住了，请看窗口里的日志，必要时重新启动`);
+  }, 60_000).unref();
 }
 
 async function main() {
@@ -258,6 +299,7 @@ async function runStack(flags, base, version, tag) {
   log(`Pegasus 已启动：${webUrl}`);
   say('关闭这个窗口（或按 Ctrl+C）会停止全部服务');
   if (flags.open) openBrowser(webUrl);
+  watchStack(tag, apiPort, flags.trader ? join(root, env.TRADER_STATE_FILE) : null);
 }
 
 process.on('SIGINT', () => stop(0, true));

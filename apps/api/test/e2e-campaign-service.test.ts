@@ -4,7 +4,7 @@
  * test's; the orders, the positions and the balance are the exchange's. Covers a whole campaign (entry, add, harvest,
  * an add held by the kill switch, exit) with the ledger checked against the exchange's balance, a liquidation, a
  * restart that catches up a missed exit, the guard that wants a paper account of its own, an unreadable ledger, the
- * routes and the WebSocket push.
+ * routes and the WebSocket push; and an entry at the 20:00 cut (CAMPAIGN_CUT_HOUR 20), the one the live pot runs.
  */
 import { once } from 'node:events';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -65,6 +65,11 @@ type Row = readonly [open: number, high: number, low: number, close: number];
 /** The test's candles: confirmed 12-hour bars as the test adds them, the bar running after the last one opening at its close. */
 class Bars implements CampaignCandleSource {
   private readonly rows = new Map<string, Candle[]>();
+  private readonly cutHour: number;
+
+  constructor(cutHour = 0) {
+    this.cutHour = cutHour;
+  }
 
   /** Confirmed 12-hour bars of `instId` from `from` on. */
   add(instId: string, from: number, rows: readonly Row[]): void {
@@ -81,7 +86,17 @@ class Bars implements CampaignCandleSource {
   }
 
   async daily(instId: string): Promise<Candle[]> {
-    return dailyBarsFromHalfDays(this.rows.get(instId) ?? [], 0);
+    const rows = this.rows.get(instId) ?? [];
+    if (this.cutHour === 0) return dailyBarsFromHalfDays(rows, 0);
+    // at another cut, a daily bar is the pair of 12-hour bars that opens at the cut's hour
+    const out: Candle[] = [];
+    for (let i = 0; i + 1 < rows.length; i++) {
+      const a = rows[i] as Candle;
+      const b = rows[i + 1] as Candle;
+      if (new Date(a.ts).getUTCHours() !== this.cutHour) continue;
+      out.push({ ...a, high: Decimal.max(a.high, b.high).toFixed(), low: Decimal.min(a.low, b.low).toFixed(), close: b.close, confirm: a.confirm && b.confirm });
+    }
+    return out;
   }
 }
 
@@ -153,8 +168,8 @@ function wire(s: Stack, service: CampaignService): void {
   s.service = service;
 }
 
-/** The API in paper mode on a mock exchange that stands still, with the campaign on BTC and ETH, the service started at `start`; with `replay`, the replay beside the pot on the test's bars. */
-async function startStack(balance: string, pot: PotParams, start: number, replay = false): Promise<Stack> {
+/** The API in paper mode on a mock exchange that stands still, with the campaign on BTC and ETH, the service started at `start`; with `replay`, the replay beside the pot on the test's bars; `cutHour` is CAMPAIGN_CUT_HOUR. */
+async function startStack(balance: string, pot: PotParams, start: number, replay = false, cutHour = 0): Promise<Stack> {
   const ledgerFile = join(mkdtempSync(join(tmpdir(), 'pegasus-campaign-')), 'ledger.json');
   const mock = await startMockOkx({ port: 0, seed: 7, tickIntervalMs: 50, volatility: 0, posMode: 'net_mode', initialPrices: { [BTC]: '60000', [ETH]: '3000' }, initialBalanceUsdt: balance });
   const config = loadConfig({
@@ -168,6 +183,7 @@ async function startStack(balance: string, pot: PotParams, start: number, replay
     CAMPAIGN_ENABLED: '1',
     CAMPAIGN_INSTRUMENTS: `${BTC},${ETH}`,
     CAMPAIGN_STATE_FILE: ledgerFile,
+    ...(cutHour === 0 ? {} : { CAMPAIGN_CUT_HOUR: String(cutHour) }),
   });
   const store = new MemoryStore();
   const clients = createOkxClients(config, log);
@@ -189,7 +205,7 @@ async function startStack(balance: string, pot: PotParams, start: number, replay
   await account.start();
   await app.listen({ host: '127.0.0.1', port: 0 });
   await waitFor(() => market.book(BTC) && market.book(ETH) && market.liveMarkPrice(ETH) && account.ready && account.balance, 10_000, 'market data + paper account stream');
-  const bars = new Bars();
+  const bars = new Bars(cutHour);
   const partial = { mock, deps, config, orders, app, bars, clock: { now: start }, ledgerFile };
   const stack: Stack = { ...partial, service: newService(partial, pot, replay) };
   wire(stack, stack.service);
@@ -751,4 +767,67 @@ describe('the guard and the ledger file', () => {
       await app.close();
     }
   });
+});
+
+describe('at the 20:00 cut (CAMPAIGN_CUT_HOUR 20)', () => {
+  // Everything 20 hours later than at cut 0: the 12-hour bars close at 08:00 and 20:00 UTC, the daily ones at 20:00.
+  const CUT = 20 * 3_600_000;
+  const POT: PotParams = { ...DEFAULT_POT_PARAMS, stakeFraction: '0.9', rungFactor: '1.8' };
+  let s: Stack;
+
+  beforeAll(async () => {
+    s = await startStack('56', POT, day(4) + CUT + 3_600_000, false, 20);
+    s.bars.add(BTC, day(0) + CUT, flat(60000, 8));
+    s.bars.add(ETH, day(0) + CUT, flat(3000, 14));
+    await s.service.start();
+  }, 30_000);
+  afterAll(async () => {
+    await stopStack(s);
+  });
+
+  it('decides nothing at the 08:00 close and enters at the 20:00 close above the 3-day high (no entry was ever planned at this cut from 2026-10-18 to 10-28)', async () => {
+    expect(ledger(s).pot?.cutHour).toBe(20);
+    s.bars.add(BTC, day(4) + CUT, [[60000, 60300, 59800, 60100]]);
+    await moveTo(s, BTC, '60100');
+    await closeAt(s, day(4) + CUT + HALF_DAY_MS);
+    expect(ledger(s).campaigns).toEqual([]);
+    expect(ledger(s).steps.at(-1)).toMatchObject({ kind: 'close', closeTs: day(4) + CUT + HALF_DAY_MS, actions: [], errors: 0 });
+    s.bars.add(BTC, day(4) + CUT + HALF_DAY_MS, [[60100, 61500, 60000, 61000]]);
+    await moveTo(s, BTC, '61000');
+    await closeAt(s, day(5) + CUT);
+    const c = only(s, BTC);
+    expect(c).toMatchObject({ id: `${BTC}@${day(5) + CUT}`, signalTs: day(4) + CUT, addRef: '61000', end: null, pendingExit: null });
+    expect(c.entry).toMatchObject({ closeTs: day(5) + CUT, price: '61000', contracts: '0.8' });
+    const step = ledger(s).steps.at(-1);
+    expect(step?.inputs.find((i) => i.instId === BTC)).toMatchObject({ daily: { close: '61000', entryHigh: '60300', entry: true } });
+    expect(step?.actions).toMatchObject([{ kind: 'enter', instId: BTC, outcome: 'done', error: false }]);
+    expect(s.service.view().nextStep).toEqual({ closeTs: day(5) + CUT + HALF_DAY_MS, daily: false });
+  });
+
+  it('after a restart the closes missed at this cut are walked at it: the add is recorded, the exit of the 20:00 close is carried out late', async () => {
+    const pot = ledger(s).pot;
+    await s.service.stop();
+    // while the API was down: BTC rose 5% by the 08:00 close (an add was due), then closed the day at 20:00 below the 2-day low (an exit)
+    s.bars.add(BTC, day(5) + CUT, [[61000, 64500, 60900, 64100], [64100, 64200, 59000, 59500]]);
+    await moveTo(s, BTC, '59600');
+    s.clock.now = day(6) + CUT + 3 * 3_600_000;
+    const restarted = newService(s, POT);
+    wire(s, restarted);
+    await restarted.start();
+    const l = restarted.ledgerCopy();
+    expect(l.pot).toEqual(pot);
+    expect(l.missedCloses).toBe(2);
+    expect(l.lastClose).toBe(day(6) + CUT);
+    const step = l.steps.at(-1);
+    expect(step).toMatchObject({ kind: 'catch-up', closes: [day(5) + CUT + HALF_DAY_MS, day(6) + CUT], closeTs: day(6) + CUT, errors: 0 });
+    expect(step?.actions.map((a) => [a.kind, a.instId, a.outcome])).toEqual([
+      ['add', BTC, 'missed'],
+      ['exit', BTC, 'done'],
+    ]);
+    const btc = only(s, BTC);
+    expect(btc.addRef).toBe('64100');
+    expect(btc.end).toMatchObject({ kind: 'exit', closeTs: day(6) + CUT, delayMs: 3 * 3_600_000 });
+    expect(s.mock.getState().positions).toEqual([]);
+    expect(l.errorCount).toBe(0);
+  }, 20_000);
 });

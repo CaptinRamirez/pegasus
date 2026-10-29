@@ -1,6 +1,6 @@
 /**
  * The campaign service's decisions at a close (services/campaign-step.ts), case by case, without any I/O: entries and
- * exits at 00:00 UTC only, adds and the ladder at every 12-hour close, the order of the same close, the stake and its
+ * exits at the daily close of the cut only (00:00 UTC at cut 0, 20:00 at cut 20), adds and the ladder at every 12-hour close, the order of the same close, the stake and its
  * minimum, the adds' caps and reference, the ladder from the free cash and by sales, a finished pot, missed closes.
  */
 import { describe, expect, it } from 'vitest';
@@ -388,5 +388,37 @@ describe('missed closes', () => {
     const walk = walkMissedCloses(closes, [{ id: 'A', instId: AAA.instId, addRef: '100', exiting: false }], [{ instId: AAA.instId, halfDay: [], daily: [] }], P);
     expect(walk).toMatchObject({ exits: [], missed: [] });
     expect(walk.inputs.every((i) => i.halfDay === null && i.note !== undefined)).toBe(true);
+  });
+});
+
+describe('at the 20:00 cut (CAMPAIGN_CUT_HOUR 20)', () => {
+  // The same bars as at cut 0, 20 hours later: the daily bars open and close at 20:00 UTC, the 12-hour ones at 08:00 and 20:00.
+  const CUT = 20 * 3_600_000;
+  const shift = (cs: Candle[]): Candle[] => cs.map((c) => ({ ...c, ts: c.ts + CUT }));
+  const close = day(21) + CUT;
+  const at20 = (rows: ReadonlyArray<readonly [number, number, number]>, next: number): { inst: Instrument; bars: CloseBars } => ({ inst: AAA, bars: barsAt(AAA.instId, halves(close, rows[rows.length - 1]?.[2] ?? 100, next), shift(days(rows)), close, P, 20) });
+  const breakout = [...flat(20), [103, 100, 102] as const];
+  const under = [...flat(20), [100, 97, 98] as const];
+
+  it('reads the entry and the exit at the 20:00 UTC close, where the daily bars of that cut close', () => {
+    expect(decideClose(input({ closeTs: close, cutHour: 20, instruments: [at20(breakout, 102.5)] })).actions).toEqual([{ kind: 'enter', instId: AAA.instId, signalTs: day(20) + CUT, price: D('102.5'), close: D('102'), entryHigh: '101' }]);
+    expect(kinds(decideClose(input({ closeTs: close, cutHour: 20, instruments: [at20(under, 98)], campaigns: [campaign(AAA)] })).actions)).toEqual([`exit:${AAA.instId}`]);
+    // decided without the cut (the defect of 2026-10-18 to 10-28): a 20:00 close is no daily close, so the entry is never planned
+    expect(decideClose(input({ closeTs: close, instruments: [at20(breakout, 102.5)] })).actions).toEqual([]);
+  });
+
+  it('walks the missed closes of that cut: the exit at its daily close is carried out, the adds and the entries recorded', () => {
+    const daily = shift(days([...flat(20), [107, 100, 106], [113, 94, 95]]));
+    const halfDay = shift([candle(day(20), 100, 104, 100, 103), candle(day(20) + HALF_DAY_MS, 103, 107, 102, 106), candle(day(21), 106.5, 112.5, 106, 112), candle(day(21) + HALF_DAY_MS, 112, 113, 94, 95), candle(day(22), 95.5, 96, 95, 95.5, false)]);
+    const closes = [day(21), day(21) + HALF_DAY_MS, day(22)].map((c) => c + CUT);
+    const open = [{ id: 'A', instId: AAA.instId, addRef: '100', exiting: false }];
+    const both = [{ instId: AAA.instId, halfDay, daily }, { instId: BBB.instId, halfDay, daily }];
+    const walk = walkMissedCloses(closes, open, both, P, 20);
+    expect(walk.exits).toEqual([{ campaignId: 'A', instId: AAA.instId, closeTs: day(22) + CUT, signalTs: day(21) + CUT }]);
+    expect(walk.missed.map((m) => `${m.kind}:${m.instId}`)).toEqual([`add:${AAA.instId}`, `enter:${BBB.instId}`, `add:${AAA.instId}`]);
+    // walked without the cut: the 12-hour bars are found, the daily signals are not
+    const blind = walkMissedCloses(closes, open, both, P);
+    expect(blind.exits).toEqual([]);
+    expect(blind.missed.map((m) => m.kind)).toEqual(['add', 'add']);
   });
 });

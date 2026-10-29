@@ -331,6 +331,8 @@ export interface TraderPreviousDecision {
   invalidation: string;
   wakeAbove: string | null;
   wakeBelow: string | null;
+  /** What the code did with it: carried out (how), or not and why (absent in states written before it was kept) */
+  verdict?: string;
 }
 
 /** When the model is asked next: at `at` (a 15-minute close), or earlier when the price reaches a level. */
@@ -406,16 +408,19 @@ const isDecimal = (s: string | null): s is string => s !== null && /^\d+(\.\d+)?
 export type TraderVerdict =
   | { ok: true; action: 'flat' }
   | { ok: true; action: 'close' }
-  | { ok: true; action: 'tighten_stop'; stopPx: string }
+  | { ok: true; action: 'tighten_stop'; stopPx: string; note?: string }
   | { ok: true; action: 'long' | 'short'; entryType: 'market' | 'limit'; entryPx: string; stopPx: string; targetPx: string | null }
   | { ok: false; action: TraderAction; reason: string };
 
 /**
  * Whether a decision may be carried out: the stop on the losing side of the entry (where is the model's call), the target beyond
  * the stop's distance, a limit price near the mark, a close or a tighter stop only with a position, an entry only
- * without one. A decision that fails is treated as `flat` and logged with the reason.
+ * without one. A decision that fails is treated as `flat` and logged with the reason. A stop moved while the position
+ * is in profit is kept beyond the break-even: the entry fill plus the round trip's fees, less the funding received on the
+ * position per coin (`opts.fundingPoints`, in price points), rounded to `opts.tickSz` away from the entry; one asked for
+ * on the losing side of it is placed at the break-even, with a note.
  */
-export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrails, held: TraderPosition | null): TraderVerdict {
+export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrails, held: TraderPosition | null, opts: { tickSz?: string; fundingPoints?: DecimalInput } = {}): TraderVerdict {
   const m = D(mark);
   const pct = (a: DecimalInput, b: DecimalInput): Decimal => D(a).minus(b).abs().div(b);
   if (d.action === 'flat') return { ok: true, action: 'flat' };
@@ -425,7 +430,22 @@ export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrai
     if (!isDecimal(d.stopPx)) return { ok: false, action: d.action, reason: 'tighten_stop without a stop price' };
     const stop = D(d.stopPx);
     const tighter = held.side === 'long' ? stop.gt(held.stopPx) && stop.lt(m) : stop.lt(held.stopPx) && stop.gt(m);
-    return tighter ? { ok: true, action: 'tighten_stop', stopPx: stop.toFixed() } : { ok: false, action: d.action, reason: `the stop ${d.stopPx} is not tighter than ${held.stopPx} on the right side of the mark ${mark}` };
+    if (!tighter) return { ok: false, action: d.action, reason: `the stop ${d.stopPx} is not tighter than ${held.stopPx} on the right side of the mark ${mark}` };
+    // the owner, 2026-10-28, after a stop moved to below the entry of a +142 position turned it into a loss: a stop moved
+    // while the position is in profit locks profit, so it stays beyond the break-even: the entry fill plus the round
+    // trip's fees (the owner's 「成交价加费用」; both legs at the taker fee), less the funding received on the position per
+    // coin (paid: negative, so it raises a long's break-even). A stop asked for on the losing side of it is placed at the
+    // break-even, rounded to the tick away from the entry (2026-10-29: the owner took the reviewers' clamp over a refusal).
+    const long = held.side === 'long';
+    const fees = D(TRADER_TAKER_FEE).mul(2);
+    const funding = D(opts.fundingPoints ?? 0);
+    let even = D(held.entryPx).mul(long ? D(1).plus(fees) : D(1).minus(fees)).plus(long ? funding.neg() : funding);
+    const tick = D(opts.tickSz ?? 0);
+    if (tick.gt(0)) even = (long ? even.div(tick).ceil() : even.div(tick).floor()).mul(tick);
+    const inProfit = long ? m.gt(even) : m.lt(even);
+    const locksLoss = long ? stop.lt(even) : stop.gt(even);
+    if (inProfit && locksLoss) return { ok: true, action: 'tighten_stop', stopPx: even.toFixed(), note: `placed at the break-even ${even.toFixed()} instead of ${d.stopPx}: the position is in profit (entry ${held.entryPx}, mark ${mark}) and a stop moved now may not be on the losing side of the break-even` };
+    return { ok: true, action: 'tighten_stop', stopPx: stop.toFixed() };
   }
   // long or short
   if (held) return { ok: false, action: d.action, reason: `${d.action} while a ${held.side} is held` };

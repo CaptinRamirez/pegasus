@@ -42,9 +42,14 @@ class ScriptedModel implements TraderModel {
   queue: TraderDecision[] = [];
   calls = 0;
   dossiers: TraderDossier[] = [];
+  /** Runs once, before the next answer: what the market does while the model thinks */
+  onDecide: (() => Promise<void>) | null = null;
   async decide(dossier: TraderDossier): Promise<TraderModelAnswer> {
     this.calls += 1;
     this.dossiers.push(dossier);
+    const meanwhile = this.onDecide;
+    this.onDecide = null;
+    if (meanwhile) await meanwhile();
     const decision = this.queue.shift() ?? decide({ action: 'flat' });
     return { decision, usage: { inputTokens: 5000, outputTokens: 800, cacheReadTokens: 2500, ms: 1200, model: this.name }, problem: null };
   }
@@ -145,8 +150,9 @@ async function startStack(maxTradesPerDay: string, start: number, cadence: 'hour
   const macro: TraderMacro = { calendar: [], headlines: [], notes: [] };
   const service = new TraderService(config.trader, { clients, market, account, risk, orders, log }, {
     now: () => clock.now,
-    sleep: async () => {
-      await new Promise((r) => setImmediate(r));
+    // short but real: the wait for a market order's fill must let the exchange's position report arrive
+    sleep: async (ms) => {
+      await new Promise((r) => setTimeout(r, Math.min(ms, 5)));
     },
     model,
     sources: sources(clock, () => market.liveMarkPrice(BTC) ?? null),
@@ -218,6 +224,10 @@ describe('the Claude auto trader on the paper exchange', () => {
     const live = await waitFor(() => position(s), 5000, 'the position on the exchange');
     expect(D(live.pos).toFixed()).toBe('37.3');
     expect(live.mgnMode).toBe('isolated');
+    // booked at the fill the exchange reports, not at the mark the model saw
+    expect(live.avgPx).not.toBe(dossier.mark);
+    expect(state.position?.entryPx).toBe(live.avgPx);
+    expect(records(s).find((r) => r.kind === 'execution')?.order?.entryPx).toBe(live.avgPx);
     expect(state.control.position).toMatchObject({ contracts: '37.3' });
     expect(state.control.trades).toBe(1);
     const kinds = records(s).map((r) => r.kind);
@@ -365,6 +375,53 @@ describe('the trader keeps its position covered and its books straight', () => {
     await closeAt(s, DAY + 18 * H);
     expect(s.model.calls).toBe(calls + 1);
     expect(s.service.view().status).toBe('holding');
+  });
+
+  it('judges a stop move on the mark of the moment the answer arrives, and places one asked for under the break-even at the break-even', async () => {
+    // the price rises to 60200 while the model thinks; the break-even is the long's fill x 1.001, up to the tick
+    const entry = D((await waitFor(() => position(s), 5000, 'the long')).avgPx);
+    const even = entry.mul('1.001').div('0.1').ceil().mul('0.1').toFixed();
+    const control = s.service.stateCopy().control.position;
+    expect(control).not.toBeNull();
+    s.model.onDecide = () => moveTo(s, '60200');
+    s.model.queue.push(decide({ action: 'tighten_stop', stopPx: '60050' }));
+    await closeAt(s, DAY + 19 * H);
+    expect(s.service.view().last?.verdict).toMatch(`stop tightened to ${even} (placed at the break-even ${even} instead of 60050: the position is in profit (entry ${entry.toFixed()}, mark 60200)`);
+    expect((await stops(s)).map((o) => o.slTriggerPx)).toEqual([even]);
+    expect(s.service.stateCopy().recentDecisions?.[0]?.verdict).toMatch(`stop tightened to ${even} (`);
+    // the control locks as much profit from its own entry; a short control under water finds that stop past the market: stopped at the mark
+    const locked = D(even).minus(entry);
+    if (control?.side === 'long') expect(s.service.stateCopy().control.position?.stopPx).toBe(D(control.entryPx).plus(locked).toFixed());
+    else expect(records(s).filter((r) => r.kind === 'control').at(-1)?.control).toMatchObject({ side: 'short', exitPx: '60200', end: 'stop' });
+    // the price falls back to 60080 while the model thinks: 60100 is under the dossier's 60200, not under the live mark
+    s.model.onDecide = () => moveTo(s, '60080');
+    s.model.queue.push(decide({ action: 'tighten_stop', stopPx: '60100' }));
+    await closeAt(s, DAY + 20 * H);
+    expect(s.service.view().last?.verdict).toBe(`not carried out: the stop 60100 is not tighter than ${even} on the right side of the mark 60080`);
+    expect((await stops(s)).map((o) => o.slTriggerPx)).toEqual([even]);
+  });
+
+  it('takes the fill the exchange reports over the entry booked for a position carried over a restart', async () => {
+    const live = await waitFor(() => position(s), 5000, 'the long');
+    const file = s.config.trader.stateFile;
+    const saved = JSON.parse(readFileSync(file, 'utf8')) as { position: Record<string, unknown> };
+    // booked at the mark, as every market entry was before 2026-10-29
+    writeFileSync(file, JSON.stringify({ ...saved, position: { ...saved.position, entryPx: '60000' } }));
+    const again = new TraderService(s.config.trader, { clients: s.deps.clients, market: s.deps.market, account: s.deps.account, risk: s.deps.risk, orders: s.deps.orders, log }, { now: () => s.clock.now, model: s.model, macro: { read: async () => s.macro }, checkEveryMs: 0 });
+    await again.start();
+    expect(again.stateCopy().position?.entryPx).toBe(live.avgPx);
+    again.stop();
+  });
+
+  it('says the position is gone when its stop took it while the model was thinking', async () => {
+    s.model.onDecide = async () => {
+      await moveTo(s, '60000');
+      await waitFor(() => !position(s), 5000, 'the stop-out');
+    };
+    s.model.queue.push(decide({ action: 'tighten_stop', stopPx: '60070' }));
+    // the next day's 14:00 close, in the session
+    await closeAt(s, DAY + 24 * H + 14 * H);
+    expect(s.service.view().last?.verdict).toBe('not carried out: the position is already gone: the stop or the target took it before the decision arrived');
   });
 });
 

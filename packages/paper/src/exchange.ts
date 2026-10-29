@@ -37,6 +37,8 @@ export const REPLAY_GAP_MS = 60_000;
 /** After a failed replay the next attempt waits this long. */
 const RESUME_RETRY_MS = 10_000;
 const HOUR_MS = 3_600_000;
+/** Saves failing for this long stop the exchange, as any failed save did before 2026-10-28, so that the launcher reports it. */
+const SAVE_FAILING_MAX_MS = 5 * 60_000;
 
 /** Instruments the saved account still has a position, an order or a stop in. */
 export function instrumentsOf(state: PaperState | null): string[] {
@@ -62,6 +64,8 @@ export class PaperExchange {
   private readonly now: () => number;
   private fundingSlot = -1;
   private closed = false;
+  /** Since when saves have been failing; null while they succeed */
+  private saveFailingSince: number | null = null;
 
   constructor(
     private readonly config: PaperConfig,
@@ -127,9 +131,23 @@ export class PaperExchange {
     };
   }
 
-  save(): void {
+  save(final = false): void {
     if (this.closed) return;
-    saveState(this.config.stateFile, this.snapshot());
+    try {
+      saveState(this.config.stateFile, this.snapshot());
+      this.saveFailingSince = null;
+    } catch (err) {
+      const why = (err as Error).message;
+      if (final) {
+        this.deps.log(`the account could not be saved to ${this.config.stateFile} at shutdown (${why}): what changed since the last save is lost`);
+        return;
+      }
+      // a write that fails for a moment (a scanner holding the file) must not take the exchange and the stack down (the
+      // 2026-10-28 audit); one that keeps failing (a full disk, a read-only folder) does, as before, so the launcher says so
+      this.saveFailingSince ??= this.now();
+      if (this.now() - this.saveFailingSince >= SAVE_FAILING_MAX_MS) throw new Error(`the account could not be saved to ${this.config.stateFile} for ${SAVE_FAILING_MAX_MS / 60_000} minutes (${why})`);
+      this.deps.log(`the account could not be saved to ${this.config.stateFile} (${why}); the next change writes it again`);
+    }
   }
 
   /**
@@ -250,7 +268,7 @@ export class PaperExchange {
   }
 
   close(): void {
-    this.save();
+    this.save(true);
     this.closed = true;
   }
 }

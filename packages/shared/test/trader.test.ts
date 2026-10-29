@@ -124,7 +124,28 @@ describe('checkDecision', () => {
   it('close and tighten_stop need a position; the new stop must be tighter and on the right side of the mark', () => {
     expect(checkDecision(decision({ action: 'close' }), '82000', g, null)).toMatchObject({ ok: false });
     expect(checkDecision(decision({ action: 'close' }), '82000', g, held)).toEqual({ ok: true, action: 'close' });
-    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '81900' }), '82300', g, held)).toEqual({ ok: true, action: 'tighten_stop', stopPx: '81900' });
+    // in profit (mark 82300 over the break-even 82082: the entry 82000 plus the round trip's fees): a moved stop locks profit,
+    // never a loss; one asked for below the break-even is placed at the break-even
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '82100' }), '82300', g, held)).toEqual({ ok: true, action: 'tighten_stop', stopPx: '82100' });
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '82050' }), '82300', g, held)).toMatchObject({ ok: true, action: 'tighten_stop', stopPx: '82082', note: /break-even 82082 instead of 82050/ });
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '81900' }), '82300', g, held)).toMatchObject({ ok: true, stopPx: '82082' });
+    // not in profit net of the fees (mark 82050), or under water (81900): tightening below the break-even is still allowed
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '82020' }), '82050', g, held)).toEqual({ ok: true, action: 'tighten_stop', stopPx: '82020' });
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '81800' }), '81900', g, held)).toEqual({ ok: true, action: 'tighten_stop', stopPx: '81800' });
+    // the funding of the position moves the break-even: 10 per coin paid raises it to 82092, 10 received lowers it to 82072
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '82085' }), '82300', g, held, { fundingPoints: '-10' })).toMatchObject({ ok: true, stopPx: '82092' });
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '82075' }), '82300', g, held, { fundingPoints: '10' })).toEqual({ ok: true, action: 'tighten_stop', stopPx: '82075' });
+    // rounded to the tick away from the entry: the 2026-10-28 case, 80,578.9 x 1.001 = 80,659.4789
+    const oct28: TraderPosition = { ...held, entryPx: '80578.9', stopPx: '79740' };
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '80450' }), '81765', g, oct28, { tickSz: '0.1' })).toMatchObject({ ok: true, stopPx: '80659.5' });
+    // the short side: break-even 81918 (82000 x 0.999), in profit below it; funding paid lowers it to 81908
+    const short: TraderPosition = { ...held, side: 'short', stopPx: '82300' };
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '82100' }), '81700', g, short)).toMatchObject({ ok: true, stopPx: '81918', note: /break-even 81918/ });
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '81900' }), '81700', g, short)).toEqual({ ok: true, action: 'tighten_stop', stopPx: '81900' });
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '82000' }), '81950', g, short)).toEqual({ ok: true, action: 'tighten_stop', stopPx: '82000' });
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '82100' }), '81700', g, short, { fundingPoints: '-10', tickSz: '0.1' })).toMatchObject({ ok: true, stopPx: '81908' });
+    // down to the tick for a short: 82000.15 x 0.999 = 81918.14985, 81918.1
+    expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '82100' }), '81700', g, { ...short, entryPx: '82000.15' }, { tickSz: '0.1' })).toMatchObject({ ok: true, stopPx: '81918.1' });
     expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '81600' }), '82300', g, held)).toMatchObject({ ok: false, reason: /not tighter/ });
     expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '82400' }), '82300', g, held)).toMatchObject({ ok: false, reason: /not tighter/ });
     expect(checkDecision(decision({ action: 'flat' }), '82000', g, held)).toEqual({ ok: true, action: 'flat' });

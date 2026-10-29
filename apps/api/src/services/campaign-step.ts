@@ -149,6 +149,8 @@ export interface DecideInput {
   foreign: ReadonlySet<string>;
   /** Instruments whose open campaign's position the exchange no longer shows, not explained yet: no entry there either */
   unresolved?: ReadonlySet<string>;
+  /** Hour of the daily cut (CAMPAIGN_CUT_HOUR): the entry and exit signals are read at its close; 0 unless given */
+  cutHour?: number;
 }
 
 /** What the rule does at this close, in the order it is carried out. */
@@ -191,7 +193,7 @@ export interface CloseDecision {
 
 /** The rule at one close (see the header). */
 export function decideClose(input: DecideInput): CloseDecision {
-  const daily = isDailyClose(input.closeTs);
+  const daily = isDailyClose(input.closeTs, input.cutHour ?? 0);
   const byInst = new Map(input.instruments.map((i) => [i.inst.instId, i]));
   const spec = (instId: string): Instrument => {
     const found = byInst.get(instId);
@@ -367,12 +369,13 @@ export function walkMissedCloses(
   campaigns: readonly MissedCampaign[],
   instruments: ReadonlyArray<{ instId: string; halfDay: readonly Candle[]; daily: readonly Candle[] }>,
   params: CampaignParams,
+  cutHour = 0,
 ): MissedWalk {
   const state = new Map(campaigns.map((c) => [c.instId, { ...c }]));
   const walk: MissedWalk = { inputs: [], exits: [], missed: [], addRefs: new Map() };
   for (const closeTs of closes) {
     for (const i of instruments) {
-      const bars = barsAt(i.instId, i.halfDay, i.daily, closeTs, params);
+      const bars = barsAt(i.instId, i.halfDay, i.daily, closeTs, params, cutHour);
       walk.inputs.push(bars.input);
       const c = state.get(i.instId);
       if (c) {

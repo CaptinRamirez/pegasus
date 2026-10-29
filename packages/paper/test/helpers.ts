@@ -70,7 +70,7 @@ export interface Opened {
  * Opens (or re-opens, with the same `stateFile` and `history`) a paper account on BTC and ETH. Without `mmr` the
  * engine's fallback applies: 0.5% for these instruments of 100x.
  */
-export function open(opts: Partial<PaperConfig> & { history?: FakeHistory; instruments?: OkxInstrument[]; mmr?: Record<string, string> } = {}): Opened {
+export function open(opts: Partial<PaperConfig> & { history?: FakeHistory; instruments?: OkxInstrument[]; mmr?: Record<string, string>; now?: () => number } = {}): Opened {
   const history = opts.history ?? new FakeHistory();
   const logs: string[] = [];
   const stateFile = opts.stateFile ?? tempStateFile();
@@ -82,7 +82,7 @@ export function open(opts: Partial<PaperConfig> & { history?: FakeHistory; instr
     makerFeeRate: opts.makerFeeRate ?? '0.0002',
     defaultLever: opts.defaultLever ?? '3',
   };
-  const paper = new PaperExchange(config, { instruments: opts.instruments ?? [spec(BTC), spec(ETH)], bars: history, funding: history, log: (msg) => logs.push(msg), ...(opts.mmr ? { mmr: opts.mmr } : {}) });
+  const paper = new PaperExchange(config, { instruments: opts.instruments ?? [spec(BTC), spec(ETH)], bars: history, funding: history, log: (msg) => logs.push(msg), ...(opts.mmr ? { mmr: opts.mmr } : {}), ...(opts.now ? { now: opts.now } : {}) });
   return { paper, history, logs, stateFile };
 }
 
