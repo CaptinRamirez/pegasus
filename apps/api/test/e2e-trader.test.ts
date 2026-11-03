@@ -283,7 +283,7 @@ describe('the Claude auto trader on the paper exchange', () => {
     await waitFor(() => !position(s), 5000, 'the short closed');
     await closeAt(s, DAY + 18 * H + M15);
     expect(s.service.stateCopy().tradesToday).toBe(2);
-    s.model.queue.push(decide({ action: 'long', stopPx: '59700' }));
+    s.model.queue.push(decide({ action: 'long', stopPx: '59700', targetPx: '60600' }));
     await closeAt(s, DAY + 19 * H);
     expect(s.service.view().last?.verdict).toMatch(/2 trades are done/);
     expect(s.service.stateCopy().position).toBeNull();
@@ -325,7 +325,7 @@ describe('the trader keeps its position covered and its books straight', () => {
   });
 
   it('puts the stop back when the exchange has none for the position', async () => {
-    s.model.queue.push(decide({ action: 'long', stopPx: '59700' }));
+    s.model.queue.push(decide({ action: 'long', stopPx: '59700', targetPx: '60600' }));
     await closeAt(s, DAY + 14 * H);
     await waitFor(() => position(s), 5000, 'the long');
     const before = await stops(s);
@@ -364,7 +364,8 @@ describe('the trader keeps its position covered and its books straight', () => {
     await s.deps.orders.place({ instId: BTC, side: 'buy', ordType: 'market', tdMode: 'isolated', size: { unit: 'contracts', value: '1' } });
     await waitFor(() => position(s), 5000, 'the manual long');
     const calls = s.model.calls;
-    s.model.queue.push(decide({ action: 'long', stopPx: '59700' }));
+    // the stop 500 away: the ladder's first take-profit (60250) stays above the 60200 of the next test
+    s.model.queue.push(decide({ action: 'long', stopPx: '59500', targetPx: '60600' }));
     await closeAt(s, DAY + 17 * H);
     expect(s.model.calls).toBe(calls);
     expect(s.service.view()).toMatchObject({ status: 'blocked', reason: { code: 'FOREIGN_POSITION' } });
@@ -422,6 +423,52 @@ describe('the trader keeps its position covered and its books straight', () => {
     // the next day's 14:00 close, in the session
     await closeAt(s, DAY + 24 * H + 14 * H);
     expect(s.service.view().last?.verdict).toBe('not carried out: the position is already gone: the stop or the target took it before the decision arrived');
+  });
+});
+
+describe('the ladder take-profit', () => {
+  let s: Stack;
+  beforeAll(async () => {
+    s = await startStack('5', DAY + 13 * H + 45 * 60_000 + 5_000);
+  }, 30_000);
+  afterAll(async () => {
+    await stopStack(s);
+  });
+
+  it('closes half at 0.5 R, stops the rest at the break-even, and the rest cannot lose', async () => {
+    s.model.queue.push(decide({ action: 'long', stopPx: '59700', targetPx: '60600' }));
+    await closeAt(s, DAY + 14 * H);
+    const live = await waitFor(() => position(s), 5000, 'the long');
+    const full = D(live.pos);
+    // on the exchange: the stop, half at the entry plus half the stop's distance (the mark 60000 + 150), the rest at the target
+    const algos = (await s.deps.account.refreshAlgoOrders()).orders.filter((o) => o.instId === BTC);
+    expect(algos.map((o) => o.tpTriggerPx).filter((p) => p !== '').sort()).toEqual(['60150', '60600']);
+    expect((await stops(s)).map((o) => o.slTriggerPx)).toEqual(['59700']);
+    // the first leg fills: the next tick books the rest and moves its stop from the entry to the break-even
+    await moveTo(s, '60200');
+    await waitFor(() => D(position(s)?.pos ?? '0').lt(full), 5000, 'the first take-profit');
+    s.clock.now += 60_000;
+    await s.service.tick();
+    const even = D(live.avgPx).mul('1.001').div('0.1').ceil().mul('0.1').toFixed();
+    const held = s.service.stateCopy().position;
+    expect(held).toMatchObject({ contracts: D(position(s)?.pos ?? '0').toFixed(), stopPx: even });
+    expect(D(held?.contracts ?? '0').lt(full)).toBe(true);
+    expect((await stops(s)).map((o) => o.slTriggerPx)).toEqual([even]);
+    // the exchange's stop moved closer than the booked one (here by hand): a stop asked for between the two is not carried out, never loosened
+    const sl = (await stops(s))[0] as { algoId: string };
+    await s.deps.orders.amendStop({ instId: BTC, algoId: sl.algoId, slTriggerPx: '60100' });
+    s.model.queue.push(decide({ action: 'tighten_stop', stopPx: '60080' }));
+    await closeAt(s, DAY + 15 * H);
+    expect(s.service.view().last).toMatchObject({ executed: false, verdict: 'the stop on the exchange, 60100, is already as tight' });
+    expect(s.service.stateCopy().position?.stopPx).toBe('60100');
+    expect((await stops(s)).map((o) => o.slTriggerPx)).toEqual(['60100']);
+    // the price falls back towards the entry: the rest is stopped out and the trade made money
+    await moveTo(s, '60050');
+    await waitFor(() => !position(s), 5000, 'the rest stopped out');
+    s.clock.now += 60_000;
+    await s.service.tick();
+    expect(s.service.stateCopy().recent[0]).toMatchObject({ side: 'long', end: 'stop' });
+    expect(D(s.service.stateCopy().recent[0]?.pnl ?? '0').gt(0)).toBe(true);
   });
 });
 

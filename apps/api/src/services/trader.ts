@@ -9,13 +9,18 @@ import {
   Decimal,
   estimateUsd,
   inTraderSession,
+  ladderFirstTarget,
+  TRADER_TP1_SHARE,
+  traderBreakEven,
   traderSize,
   ZERO,
+  type DecimalInput,
   type Candle,
   type PlaceOrderRequest,
   type Position,
   type PosSide,
   type TraderAccountInfo,
+  type TraderControlState,
   type TraderDecision,
   type TraderDossier,
   type TraderLastDecision,
@@ -62,12 +67,13 @@ import { emptyTraderState, loadTraderState, RECENT_KEPT, rolledToDay, saveTrader
  * pre-commitments the exchange executes. hourly: at the hourly close and at a 15-minute
  * close that crossed a level of the day (detectTriggers). 15m: at every close. Its decision goes through checkDecision, then the
  * guardrails of the day (trade cap, daily loss, cooldown, kill switch, a resting limit), then the exchange: an isolated
- * order sized by traderSize with the stop attached (and the target as a take-profit), a close, or a tighter stop.
+ * order sized by traderSize with the stop attached and the ladder take-profit (half at 0.5 R, the rest at the target;
+ * once the first half fills the rest's stop goes to the break-even), a close, or a tighter stop.
  * Outside the session an open position is left to its stop: no call is made (the board's choice).
  *
  * The control (TRADER_CONTROL=1): at every entry the trader makes, a second book takes the same contracts with the same
  * stop and target distances in a direction drawn by a seeded coin flip, filled at the mark with CONTROL_SLIPPAGE and
- * CONTROL_FEE, and settled on the following 15-minute bars (the stop wins when both are touched in one bar). It is the
+ * CONTROL_FEE, and settled on the following 15-minute bars with the same ladder (the stop wins when both are touched in one bar). It is the
  * baseline the pass line compares the model with; it never touches the exchange.
  *
  * Every decision is appended to TRADER_LOG_FILE with its whole dossier, so it can be re-asked later; the day's counters,
@@ -109,6 +115,27 @@ const iso = (t: number): string => new Date(t).toISOString();
 const money = (v: Decimal): string => v.toDecimalPlaces(8).toFixed();
 /** The verdict on a close or a stop move that finds the position already gone */
 const POSITION_GONE = 'the position is already gone: the stop or the target took it before the decision arrived';
+
+type ControlPosition = NonNullable<TraderControlState['position']>;
+
+/**
+ * The control's position against one bar, with the trader's ladder: the stop wins when both are touched; the first
+ * take-profit closes TRADER_TP1_SHARE at its price (banked) and moves the stop to the entry; then the target. Changes `c`
+ * for the first leg; how it ended, or null while it is open.
+ */
+export function settleControlBar(c: ControlPosition, high: string, low: string, ctVal: string): { exitPx: string; end: 'stop' | 'target' } | null {
+  const long = c.side === 'long';
+  if (long ? D(low).lte(c.stopPx) : D(high).gte(c.stopPx)) return { exitPx: c.stopPx, end: 'stop' };
+  if (c.tp1Px !== undefined && (long ? D(high).gte(c.tp1Px) : D(low).lte(c.tp1Px))) {
+    const leg = D(c.contracts).mul(TRADER_TP1_SHARE);
+    c.banked = money(leg.mul(ctVal).mul(D(c.tp1Px).minus(c.entryPx).abs()));
+    c.contracts = money(D(c.contracts).minus(leg));
+    c.stopPx = c.entryPx;
+    delete c.tp1Px;
+  }
+  if (c.targetPx !== null && (long ? D(high).gte(c.targetPx) : D(low).lte(c.targetPx))) return { exitPx: c.targetPx, end: 'target' };
+  return null;
+}
 
 export function disabledTraderView(config: TraderConfig, now = Date.now()): TraderView {
   return {
@@ -458,8 +485,13 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     }
     if (verdict.action === 'tighten_stop') {
       if (!held) return { executed: false, note: 'tighten_stop without a position' };
-      const algo = this.deps.account.algoOrders?.orders.find((o) => o.instId === instId && o.slTriggerPx !== '');
+      const algo = (await this.deps.account.refreshAlgoOrders()).orders.find((o) => o.instId === instId && o.slTriggerPx !== '');
       if (!algo) throw new Error('no stop order found on the exchange to tighten');
+      // the exchange's stop can be tighter than the booked one (the ladder moved it when its first leg filled): never loosened
+      if (held.side === 'long' ? !D(verdict.stopPx).gt(algo.slTriggerPx) : !D(verdict.stopPx).lt(algo.slTriggerPx)) {
+        held.stopPx = algo.slTriggerPx;
+        return { executed: false, note: `the stop on the exchange, ${algo.slTriggerPx}, is already as tight` };
+      }
       await this.deps.orders.amendStop({ instId, algoId: algo.algoId, slTriggerPx: verdict.stopPx });
       held.stopPx = verdict.stopPx;
       const control = this.state.control.position;
@@ -488,7 +520,8 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       ...(posSide ? { posSide } : {}),
       size: { unit: 'contracts', value: size.contracts },
       slTriggerPx: verdict.stopPx,
-      ...(verdict.targetPx !== null ? { takeProfits: [{ triggerPx: verdict.targetPx, fraction: '1' }] } : {}),
+      // the ladder take-profit: half at 0.5 R, the rest at the target; the exchange moves the stop to the entry once the first leg fills
+      ...(verdict.targetPx !== null ? { takeProfits: [{ triggerPx: ladderFirstTarget(side, verdict.entryPx, verdict.stopPx), fraction: TRADER_TP1_SHARE }, { triggerPx: verdict.targetPx, fraction: D(1).minus(TRADER_TP1_SHARE).toFixed() }], breakevenAfterTp1: true } : {}),
       clOrdId,
     };
     const { order } = await this.deps.orders.place(req);
@@ -626,12 +659,38 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     } else if (held && live && live.avgPx !== '' && (!D(live.avgPx).eq(held.entryPx) || !D(live.pos).abs().eq(held.contracts))) {
       // the exchange's fill over the booked one: a position booked at the mark (a fill reported late, or one opened before
       // 2026-10-29, when every market entry was) is corrected as soon as it is seen; the break-even is measured from it
-      this.log.info({ booked: held.entryPx, fill: live.avgPx, contracts: live.pos }, 'trader position: the fill the exchange reports replaces the booked entry');
+      const shrank = D(live.pos).abs().lt(held.contracts);
+      this.log.info({ booked: held.entryPx, fill: live.avgPx, contracts: live.pos }, 'trader position: the fill and size the exchange reports replace the booked ones');
       held.entryPx = live.avgPx;
       held.contracts = D(live.pos).abs().toFixed();
+      // smaller: the ladder's first take-profit filled (or a part was closed by hand)
+      if (shrank) await this.stopRestAtBreakEven(held);
       return true;
     }
     return false;
+  }
+
+  /**
+   * The rest of a position whose ladder's first take-profit filled: the exchange moved its stop to the entry price (the
+   * cost-price stop); while the mark is beyond the break-even it goes on to it, the fill plus the fees (the owner's
+   * 「成交价加费用」), so that the rest cannot lose. The held stop follows the exchange's either way.
+   */
+  private async stopRestAtBreakEven(held: TraderPosition): Promise<void> {
+    const { instId } = this.config;
+    const tighter = (a: DecimalInput, b: DecimalInput): boolean => (held.side === 'long' ? D(a).gt(b) : D(a).lt(b));
+    try {
+      const algo = (await this.deps.account.refreshAlgoOrders()).orders.find((o) => o.instId === instId && o.slTriggerPx !== '');
+      if (!algo) return; // guardStop puts one back at the next close
+      if (tighter(algo.slTriggerPx, held.stopPx)) held.stopPx = algo.slTriggerPx;
+      const mark = this.deps.market.liveMarkPrice(instId);
+      const even = traderBreakEven(held.side, held.entryPx, { tickSz: this.deps.market.requireInstrument(instId).tickSz, fundingPoints: await this.fundingPoints(held) });
+      if (mark === undefined || !tighter(mark, even) || !tighter(even, held.stopPx)) return;
+      await this.deps.orders.amendStop({ instId, algoId: algo.algoId, slTriggerPx: even.toFixed() });
+      held.stopPx = even.toFixed();
+      this.log.info({ stopPx: held.stopPx, contracts: held.contracts }, 'trader ladder: the first take-profit filled, the rest is stopped at the break-even');
+    } catch (err) {
+      this.log.warn({ err: (err as Error).message }, 'the stop of the rest could not be moved to the break-even: the exchange keeps it at the entry');
+    }
   }
 
   private endOf(held: TraderPosition, bar: Candle | null, mark: string | null): TraderTradeResult['end'] {
@@ -697,7 +756,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     const targetPx = targetDist === null ? null : side === 'long' ? entry.plus(targetDist) : entry.minus(targetDist);
     const notional = D(position.contracts).mul(inst.ctVal).mul(entry);
     const fee = notional.mul(CONTROL_FEE).mul(2);
-    this.state.control.position = { side, contracts: position.contracts, entryPx: money(entry), stopPx: money(stopPx), targetPx: targetPx === null ? null : money(targetPx), openedAt: bar, clOrdId: 'control', equityAtEntry: '0', fee: money(fee) };
+    this.state.control.position = { side, contracts: position.contracts, entryPx: money(entry), stopPx: money(stopPx), targetPx: targetPx === null ? null : money(targetPx), openedAt: bar, clOrdId: 'control', equityAtEntry: '0', fee: money(fee), ...(targetPx === null ? {} : { tp1Px: money(D(ladderFirstTarget(side, entry, stopPx))) }) };
     this.state.control.trades += 1;
     this.record({ ts: bar, kind: 'control', instId: this.config.instId, control: { direction: side, entryPx: money(entry), stopPx: money(stopPx), targetPx: targetPx === null ? null : money(targetPx) } });
   }
@@ -716,21 +775,20 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     this.endControl(c, mark, 'close', bar);
   }
 
-  /** The control's position against the bar that just closed: the stop wins when both are touched. */
+  /** The control's position against the bar that just closed (settleControlBar). */
   private settleControl(fifteen: readonly Candle[], bar: number): void {
     const c = this.state.control.position;
     if (!c) return;
     const last = fifteen.find((x) => x.ts === bar - FIFTEEN_MINUTES_MS);
     if (!last || last.ts < c.openedAt) return;
-    const long = c.side === 'long';
-    if (long ? D(last.low).lte(c.stopPx) : D(last.high).gte(c.stopPx)) this.endControl(c, c.stopPx, 'stop', bar);
-    else if (c.targetPx !== null && (long ? D(last.high).gte(c.targetPx) : D(last.low).lte(c.targetPx))) this.endControl(c, c.targetPx, 'target', bar);
+    const ended = settleControlBar(c, last.high, last.low, this.deps.market.requireInstrument(this.config.instId).ctVal);
+    if (ended) this.endControl(c, ended.exitPx, ended.end, bar);
   }
 
-  private endControl(c: TraderPosition & { fee: string }, exitPx: string, end: TraderTradeResult['end'], bar: number): void {
+  private endControl(c: ControlPosition, exitPx: string, end: TraderTradeResult['end'], bar: number): void {
     const inst = this.deps.market.requireInstrument(this.config.instId);
     const diff = D(exitPx).minus(c.entryPx).mul(c.side === 'long' ? 1 : -1);
-    const pnl = D(c.contracts).mul(inst.ctVal).mul(diff).minus(c.fee);
+    const pnl = D(c.contracts).mul(inst.ctVal).mul(diff).plus(c.banked ?? 0).minus(c.fee);
     const result: TraderTradeResult = { side: c.side, openedAt: c.openedAt, closedAt: bar, entryPx: c.entryPx, exitPx, contracts: c.contracts, pnl: money(pnl), end };
     const control = this.state.control;
     control.position = null;

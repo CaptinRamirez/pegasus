@@ -1093,7 +1093,7 @@ GET /api/trader -> TraderView (packages/shared/src/trader.ts)
   position: TraderPosition & { unrealizedPnl: string | null } | null;
   today: { date; trades; pnl; consecutiveLosses; cooldownUntil; equityAtStart };
   usageToday: { calls; inputTokens; outputTokens; estimatedUsd };
-  control: { position; trades; pnlTotal; wins; losses } | null;   // the coin-flip control (TRADER_CONTROL=1)
+  control: { position; trades; pnlTotal; wins; losses } | null;   // the coin-flip control (TRADER_CONTROL=1); its position carries tp1Px until the ladder's first leg fills, then banked
   recent: TraderTradeResult[];                         // newest first, at most 50
   serverTime: number;
 }
@@ -1103,7 +1103,9 @@ GET /api/trader/log?limit=30 -> { records: TraderLogRecord[] }   // newest first
 
 The decision log itself is `TRADER_LOG_FILE` (`data/trader-log.jsonl`): one JSON line per decision (with the whole dossier the
 model saw), execution, result, control move or error. The trader's orders carry client order ids starting with `pt`; the
-journal shows them with source `trader`.
+journal shows them with source `trader`. Every entry carries the stop and the ladder take-profit (`takeProfits`: half at the
+entry plus half the stop's distance, the rest at the model's target, with `breakevenAfterTp1`); once the first leg has
+filled, the trader moves the rest's stop on from the entry to the break-even (the fill plus the round trip's fees).
 
 ## WebSocket `/ws?token=<API_TOKEN>`
 

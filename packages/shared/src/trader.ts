@@ -413,12 +413,39 @@ export type TraderVerdict =
   | { ok: false; action: TraderAction; reason: string };
 
 /**
- * Whether a decision may be carried out: the stop on the losing side of the entry (where is the model's call), the target beyond
- * the stop's distance, a limit price near the mark, a close or a tighter stop only with a position, an entry only
- * without one. A decision that fails is treated as `flat` and logged with the reason. A stop moved while the position
- * is in profit is kept beyond the break-even: the entry fill plus the round trip's fees, less the funding received on the
- * position per coin (`opts.fundingPoints`, in price points), rounded to `opts.tickSz` away from the entry; one asked for
- * on the losing side of it is placed at the break-even, with a note.
+ * The ladder take-profit (the owner, 2026-11-03: 「问题在于亏钱能亏到止损，赢钱就赢不到止盈」, then 「其实这个跟阶梯止盈止损是一样
+ * 的吧」, 「做吧」): every entry closes TRADER_TP1_SHARE of the position once the price has gone TRADER_TP1_R times the stop's
+ * distance its way, the rest at the model's target; when the first leg fills the stop of the rest moves to the break-even.
+ */
+export const TRADER_TP1_R = '0.5';
+export const TRADER_TP1_SHARE = '0.5';
+
+/** The ladder's first take-profit: TRADER_TP1_R of the stop's distance beyond the entry. */
+export function ladderFirstTarget(side: 'long' | 'short', entryPx: DecimalInput, stopPx: DecimalInput): string {
+  const step = D(entryPx).minus(stopPx).abs().mul(TRADER_TP1_R);
+  return (side === 'long' ? D(entryPx).plus(step) : D(entryPx).minus(step)).toFixed();
+}
+
+/**
+ * The break-even of a position (the owner, 2026-10-28: 「成交价加费用」): the entry fill moved by the round trip's fees
+ * (both legs at the taker fee) and by the funding: `fundingPoints` is what the position received per coin, in price points
+ * (paid: negative, so it raises a long's break-even). Rounded to `tickSz` away from the entry.
+ */
+export function traderBreakEven(side: 'long' | 'short', entryPx: DecimalInput, opts: { tickSz?: string; fundingPoints?: DecimalInput } = {}): Decimal {
+  const long = side === 'long';
+  const fees = D(TRADER_TAKER_FEE).mul(2);
+  const funding = D(opts.fundingPoints ?? 0);
+  const even = D(entryPx).mul(long ? D(1).plus(fees) : D(1).minus(fees)).plus(long ? funding.neg() : funding);
+  const tick = D(opts.tickSz ?? 0);
+  return tick.gt(0) ? (long ? even.div(tick).ceil() : even.div(tick).floor()).mul(tick) : even;
+}
+
+/**
+ * Whether a decision may be carried out: the stop on the losing side of the entry (where is the model's call), a target
+ * (the ladder's second leg) beyond the stop's distance, a limit price near the mark, a close or a tighter stop only with
+ * a position, an entry only without one. A decision that fails is treated as `flat` and logged with the reason. A stop
+ * moved while the position is in profit is kept beyond the break-even (traderBreakEven, with `opts.fundingPoints` and
+ * `opts.tickSz`); one asked for on the losing side of it is placed at the break-even, with a note.
  */
 export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrails, held: TraderPosition | null, opts: { tickSz?: string; fundingPoints?: DecimalInput } = {}): TraderVerdict {
   const m = D(mark);
@@ -432,16 +459,10 @@ export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrai
     const tighter = held.side === 'long' ? stop.gt(held.stopPx) && stop.lt(m) : stop.lt(held.stopPx) && stop.gt(m);
     if (!tighter) return { ok: false, action: d.action, reason: `the stop ${d.stopPx} is not tighter than ${held.stopPx} on the right side of the mark ${mark}` };
     // the owner, 2026-10-28, after a stop moved to below the entry of a +142 position turned it into a loss: a stop moved
-    // while the position is in profit locks profit, so it stays beyond the break-even: the entry fill plus the round
-    // trip's fees (the owner's 「成交价加费用」; both legs at the taker fee), less the funding received on the position per
-    // coin (paid: negative, so it raises a long's break-even). A stop asked for on the losing side of it is placed at the
-    // break-even, rounded to the tick away from the entry (2026-10-29: the owner took the reviewers' clamp over a refusal).
+    // while the position is in profit locks profit, so it stays beyond the break-even. A stop asked for on the losing side
+    // of it is placed at the break-even (2026-10-29: the owner took the reviewers' clamp over a refusal).
     const long = held.side === 'long';
-    const fees = D(TRADER_TAKER_FEE).mul(2);
-    const funding = D(opts.fundingPoints ?? 0);
-    let even = D(held.entryPx).mul(long ? D(1).plus(fees) : D(1).minus(fees)).plus(long ? funding.neg() : funding);
-    const tick = D(opts.tickSz ?? 0);
-    if (tick.gt(0)) even = (long ? even.div(tick).ceil() : even.div(tick).floor()).mul(tick);
+    const even = traderBreakEven(held.side, held.entryPx, opts);
     const inProfit = long ? m.gt(even) : m.lt(even);
     const locksLoss = long ? stop.lt(even) : stop.gt(even);
     if (inProfit && locksLoss) return { ok: true, action: 'tighten_stop', stopPx: even.toFixed(), note: `placed at the break-even ${even.toFixed()} instead of ${d.stopPx}: the position is in profit (entry ${held.entryPx}, mark ${mark}) and a stop moved now may not be on the losing side of the break-even` };
@@ -459,15 +480,13 @@ export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrai
   const stop = D(d.stopPx);
   const long = d.action === 'long';
   if (long ? !stop.lt(entry) : !stop.gt(entry)) return { ok: false, action: d.action, reason: `the stop ${d.stopPx} is on the wrong side of the entry ${entry.toFixed()}` };
-  let target: string | null = null;
-  if (d.targetPx !== null) {
-    if (!isDecimal(d.targetPx)) return { ok: false, action: d.action, reason: 'the target is not a price' };
-    const t = D(d.targetPx);
-    if (long ? !t.gt(entry) : !t.lt(entry)) return { ok: false, action: d.action, reason: `the target ${d.targetPx} is on the wrong side of the entry` };
-    if (t.minus(entry).abs().lt(stop.minus(entry).abs())) return { ok: false, action: d.action, reason: 'the target is closer than the stop: less than one to one' };
-    target = t.toFixed();
-  }
-  return { ok: true, action: d.action, entryType: d.entryType, entryPx: entry.toFixed(), stopPx: stop.toFixed(), targetPx: target };
+  // the ladder take-profit closes the rest at the target: an entry needs one (2026-11-03)
+  if (d.targetPx === null) return { ok: false, action: d.action, reason: 'an entry without a target: the ladder take-profit closes half at 0.5 R and the rest at the target' };
+  if (!isDecimal(d.targetPx)) return { ok: false, action: d.action, reason: 'the target is not a price' };
+  const t = D(d.targetPx);
+  if (long ? !t.gt(entry) : !t.lt(entry)) return { ok: false, action: d.action, reason: `the target ${d.targetPx} is on the wrong side of the entry` };
+  if (t.minus(entry).abs().lt(stop.minus(entry).abs())) return { ok: false, action: d.action, reason: 'the target is closer than the stop: less than one to one' };
+  return { ok: true, action: d.action, entryType: d.entryType, entryPx: entry.toFixed(), stopPx: stop.toFixed(), targetPx: t.toFixed() };
 }
 
 /**
@@ -611,7 +630,8 @@ export function traderCosts(mark: DecimalInput): TraderCosts {
 
 /** The coin-flip control: the same opportunities with a random direction, filled at the mark and settled on the bars. */
 export interface TraderControlState {
-  position: (TraderPosition & { fee: string }) | null;
+  /** tp1Px: the ladder's first take-profit, until it fills; banked: what that leg made */
+  position: (TraderPosition & { fee: string; tp1Px?: string; banked?: string }) | null;
   trades: number;
   pnlTotal: string;
   wins: number;

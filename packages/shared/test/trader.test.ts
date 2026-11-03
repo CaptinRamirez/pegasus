@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { D } from '../src/decimal.js';
-import { checkDecision, DEFAULT_TRADER_GUARDRAILS, recentTradesOf, swingPoints, traderCosts, wakeOf, emaAlignment, emaLast, emaSeries, estimateUsd, inTraderSession, macd, minutesTo, roundLevels, rsi, traderSize, volumeRatio, vwap, type TraderDecision, type TraderPosition } from '../src/trader.js';
+import { checkDecision, DEFAULT_TRADER_GUARDRAILS, ladderFirstTarget, traderBreakEven, recentTradesOf, swingPoints, traderCosts, wakeOf, emaAlignment, emaLast, emaSeries, estimateUsd, inTraderSession, macd, minutesTo, roundLevels, rsi, traderSize, volumeRatio, vwap, type TraderDecision, type TraderPosition } from '../src/trader.js';
 import type { Candle, Instrument } from '../src/types.js';
 
 const inst: Instrument = {
@@ -104,11 +104,13 @@ describe('checkDecision', () => {
     expect(checkDecision(decision({ action: 'short', stopPx: '82450', targetPx: '81700' }), '82150', g, null)).toMatchObject({ ok: true, action: 'short' });
   });
 
-  it('refuses a stop on the wrong side, a target under one to one, a limit far from the mark, an entry while holding', () => {
+  it('refuses a stop on the wrong side, no target or one under one to one, a limit far from the mark, an entry while holding', () => {
     expect(checkDecision(decision({ action: 'long', stopPx: '82100' }), '82000', g, null)).toMatchObject({ ok: false, reason: /wrong side/ });
     // how far the stop goes is the model's call: very near and very far both pass
-    expect(checkDecision(decision({ action: 'long', stopPx: '81950' }), '82000', g, null)).toMatchObject({ ok: true, stopPx: '81950' });
-    expect(checkDecision(decision({ action: 'long', stopPx: '78000' }), '82000', g, null)).toMatchObject({ ok: true, stopPx: '78000' });
+    expect(checkDecision(decision({ action: 'long', stopPx: '81950', targetPx: '82100' }), '82000', g, null)).toMatchObject({ ok: true, stopPx: '81950' });
+    expect(checkDecision(decision({ action: 'long', stopPx: '78000', targetPx: '86000' }), '82000', g, null)).toMatchObject({ ok: true, stopPx: '78000' });
+    // the ladder take-profit closes the rest at the target: an entry needs one
+    expect(checkDecision(decision({ action: 'long', stopPx: '81700' }), '82000', g, null)).toMatchObject({ ok: false, reason: /without a target/ });
     expect(checkDecision(decision({ action: 'long', stopPx: '81700', targetPx: '82100' }), '82000', g, null)).toMatchObject({ ok: false, reason: /one to one/ });
     expect(checkDecision(decision({ action: 'long', entryType: 'limit', limitPrice: '70000', stopPx: '69500' }), '82000', g, null)).toMatchObject({ ok: false, reason: /from the mark/ });
     expect(checkDecision(decision({ action: 'long', entryType: 'limit', limitPrice: null, stopPx: '81700' }), '82000', g, null)).toMatchObject({ ok: false, reason: /without a price/ });
@@ -149,6 +151,19 @@ describe('checkDecision', () => {
     expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '81600' }), '82300', g, held)).toMatchObject({ ok: false, reason: /not tighter/ });
     expect(checkDecision(decision({ action: 'tighten_stop', stopPx: '82400' }), '82300', g, held)).toMatchObject({ ok: false, reason: /not tighter/ });
     expect(checkDecision(decision({ action: 'flat' }), '82000', g, held)).toEqual({ ok: true, action: 'flat' });
+  });
+});
+
+describe('the ladder take-profit', () => {
+  it('puts the first leg half the stop s distance beyond the entry', () => {
+    expect(ladderFirstTarget('long', '82000', '81700')).toBe('82150');
+    expect(ladderFirstTarget('short', '77779.5', '79050')).toBe('77144.25');
+  });
+
+  it('measures the break-even from the fill, the fees and the funding, rounded away from the entry', () => {
+    expect(traderBreakEven('long', '82000').toFixed()).toBe('82082');
+    expect(traderBreakEven('short', '82000', { fundingPoints: '-10' }).toFixed()).toBe('81908');
+    expect(traderBreakEven('long', '80578.9', { tickSz: '0.1' }).toFixed()).toBe('80659.5');
   });
 });
 
