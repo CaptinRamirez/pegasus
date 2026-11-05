@@ -6,6 +6,7 @@ import { readBottomHeight, writeBottomHeight } from '../lib/bottomHeight';
 import type { BottomSize } from '../lib/bottomHeight';
 import { useStore } from '../store/store';
 import { useUi, type Tab } from '../store/ui';
+import { BooksPanel } from './BooksPanel';
 import { CampaignPanel } from './CampaignPanel';
 import { FillsTable } from './FillsTable';
 import { JournalPanel } from './JournalPanel';
@@ -33,7 +34,7 @@ export function defaultTab(status: CampaignServiceStatus | null, traderEnabled: 
 }
 
 /** Tabs that are pages of their own: the bottom panel opens taller for them. */
-const TALL: readonly Tab[] = ['campaign', 'trader', 'signals', 'journal'];
+const TALL: readonly Tab[] = ['campaign', 'trader', 'books', 'signals', 'journal'];
 
 export function BottomTabs() {
   const t = useT();
@@ -67,6 +68,7 @@ export function BottomTabs() {
   const tabs: { id: Tab; label: string; count?: number; title?: string }[] = [
     { id: 'campaign', label: t.tabs.campaign },
     { id: 'trader', label: t.tabs.trader },
+    { id: 'books', label: t.tabs.books, title: t.tabs.booksTitle },
     { id: 'signals', label: t.tabs.signals, title: t.tabs.signalsTitle },
     { id: 'journal', label: t.tabs.journal, title: t.tabs.journalTitle, count: openTrades },
     { id: 'positions', label: t.tabs.positions, count: positions },
@@ -97,6 +99,7 @@ export function BottomTabs() {
       >
         {tab === 'campaign' && <CampaignPanel />}
         {tab === 'trader' && <TraderPanel />}
+        {tab === 'books' && <BooksPanel />}
         {tab === 'signals' && <SignalsPanel />}
         {tab === 'journal' && <JournalPanel />}
         {tab === 'positions' && <PositionsTable />}

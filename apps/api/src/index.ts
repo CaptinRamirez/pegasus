@@ -8,6 +8,8 @@ import { createOkxClients, OkxUnreachableAtStartError, reachOkxAtStart, schedule
 import { buildServer } from './server.js';
 import { AccountService } from './services/account.js';
 import { CampaignService, disabledCampaignView } from './services/campaign.js';
+import { BooksService, okxBooksSources } from './services/books.js';
+import { WhaleRecorder, hyperliquidSources } from './services/whales.js';
 import { TraderService } from './services/trader.js';
 import { CampaignOrders } from './services/campaign-orders.js';
 import { CampaignSignalsService } from './services/campaign-signals.js';
@@ -103,6 +105,15 @@ async function main(): Promise<void> {
     log.info({ instId: config.trader.instId, model: config.trader.model, effort: config.trader.effort, session: `${g.sessionStartHour}-${g.sessionEndHour} UTC`, cadence: config.trader.cadence, control: config.trader.control, state: config.trader.stateFile }, 'TRADER ENABLED on the paper exchange');
   }
 
+  // The five paper books (docs/proposals/paper-books-2026-11.md) on OKX's public data; the launcher enables them on the plain paper stack.
+  const books = config.books.enabled ? new BooksService(config.books, { sources: okxBooksSources(clients.rest), log: log.child({ component: 'books' }) }) : null;
+  if (books) {
+    deps.books = books;
+    log.info({ file: config.books.file, start: config.books.start }, 'PAPER BOOKS ENABLED');
+  }
+  // Beside them, the Hyperliquid whale record (docs/proposals/owner-methods-2026-11.md): it can only be collected going forward.
+  const whales = config.whales.enabled ? new WhaleRecorder(config.whales, { sources: hyperliquidSources(), log: log.child({ component: 'whales' }) }) : null;
+
   // Risk wiring: equity feeds the daily PnL / loss limit; exposure feeds the state shown in the UI.
   account.on('balance', (b) => risk.updateEquity(b.totalEq));
   const refreshExposure = () => risk.updateExposure(account.openOrders.size, account.totalPositionNotional(), account.positionList(), (id) => market.specOf(id));
@@ -125,12 +136,16 @@ async function main(): Promise<void> {
   // The ledger, the pot's start or the closes missed while the API was down; it waits for the account by itself.
   if (campaign) void campaign.start().catch((err: unknown) => log.error({ err }, 'the campaign service could not start'));
   if (trader) void trader.start().catch((err: unknown) => log.error({ err }, 'the trader could not start'));
+  if (books) void books.start();
+  if (whales) void whales.start();
 
   const shutdown = async (signal: string) => {
     log.info({ signal }, 'shutting down');
     try {
       await campaign?.stop();
       trader?.stop();
+      books?.stop();
+      whales?.stop();
       await journal.stop();
       exitFollowUp.stop();
       await trailing.stop();

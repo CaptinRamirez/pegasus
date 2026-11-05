@@ -13,6 +13,7 @@ import { registerExitRoutes } from './routes/exits.js';
 import { registerJournalRoutes } from './routes/journal.js';
 import { registerMarketRoutes } from './routes/market.js';
 import { registerSignalRoutes } from './routes/signals.js';
+import { registerBooksRoutes } from './routes/books.js';
 import { registerTraderRoutes } from './routes/trader.js';
 import { registerTradingRoutes } from './routes/trading.js';
 
@@ -118,6 +119,7 @@ export async function buildServer(deps: Deps): Promise<FastifyInstance> {
   await registerAccountRoutes(app, deps);
   await registerSignalRoutes(app, deps);
   await registerTraderRoutes(app, deps);
+  await registerBooksRoutes(app, deps);
   await registerCampaignRoutes(app, deps);
   await registerCampaignSignalRoutes(app, deps);
   await registerJournalRoutes(app, deps);

@@ -3,6 +3,8 @@ import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { defaultEndpoints, type OkxCredentials, type OkxEndpoints } from '@pegasus/okx';
 import { CAMPAIGN_INSTRUMENTS, D, DEFAULT_CAMPAIGN_PARAMS, DEFAULT_POT_PARAMS, DEFAULT_TRADER_GUARDRAILS, SIGNAL_PHASE_HOURS, type CampaignStructure, type RiskConfig, type SignalPhase, type TdMode, type TraderGuardrails } from '@pegasus/shared';
+import type { BooksConfig } from './services/books.js';
+import type { WhalesConfig } from './services/whales.js';
 import type { TraderEffort } from './services/trader-model.js';
 
 /** The repository root, from where this module lives: the launcher, `pnpm dev:api` and tests run with different working directories. */
@@ -89,6 +91,14 @@ const envSchema = z.object({
    * without the first `.json`), so that the paper, the campaign and the mock accounts each keep their own.
    */
   TRAILING_STATE_FILE: z.string().default(''),
+
+  /** '1' keeps the five paper books (docs/proposals/paper-books-2026-11.md) on OKX's public data; the launcher sets it on the plain paper stack only. */
+  BOOKS_ENABLED: z.enum(['0', '1']).default('0'),
+  BOOKS_FILE: z.string().min(1).default('data/books.json'),
+  /** What each book starts with, USDT */
+  BOOKS_START: positive.default('10000'),
+  /** The Hyperliquid whale record (services/whales.ts), kept on the same stack as the books */
+  WHALES_FILE: z.string().min(1).default('data/hyperliquid-whales.jsonl'),
 
   /** '1' runs the Claude auto trader (docs/proposals/claude-auto-trader.md): paper trading only, on a stack of its own (never with CAMPAIGN_ENABLED=1). */
   TRADER_ENABLED: z.enum(['0', '1']).default('0'),
@@ -232,6 +242,10 @@ export interface AppConfig {
   exits: ExitsConfig;
   /** The Claude auto trader; `enabled` only in paper trading, never with the campaign on the same stack. */
   trader: TraderConfig;
+  /** The five paper books (services/books.ts). */
+  books: BooksConfig;
+  /** The Hyperliquid whale recorder (services/whales.ts); on with the books. */
+  whales: WhalesConfig;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -384,5 +398,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     exits: { enabled: exitsEnabled, stateFile: trailingFile },
     trader,
+    books: { enabled: e.BOOKS_ENABLED === '1', file: resolve(REPO_ROOT, e.BOOKS_FILE), start: e.BOOKS_START },
+    whales: { enabled: e.BOOKS_ENABLED === '1', file: resolve(REPO_ROOT, e.WHALES_FILE), top: 100 },
   };
 }

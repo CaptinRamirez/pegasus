@@ -100,6 +100,8 @@ export function paperEnv(port = DEFAULT_PORTS.paper) {
     // nor its trade journal
     JOURNAL_FILE: 'data/journal.paper.json',
     DATABASE_URL: '',
+    // the four paper books (docs/proposals/paper-books-2026-11.md) run on this stack only: the campaign and trader stacks turn them off
+    BOOKS_ENABLED: '1',
   };
 }
 
@@ -123,6 +125,7 @@ export function campaignEnv(port = CAMPAIGN_PORTS.paper, potStart = CAMPAIGN_POT
     LOG_DIR: 'logs/campaign',
     API_PORT: String(ports.api),
     WEB_ORIGINS: webOrigins(ports.web),
+    BOOKS_ENABLED: '0',
     CAMPAIGN_ENABLED: '1',
     CAMPAIGN_STATE_FILE: 'data/campaign-ledger.json',
     PAPER_STATE_FILE: 'data/paper-campaign.json',
@@ -151,6 +154,7 @@ export function traderEnv(port = TRADER_PORTS.paper, balance = TRADER_BALANCE, p
     API_PORT: String(ports.api),
     WEB_ORIGINS: webOrigins(ports.web),
     INSTRUMENTS: instId,
+    BOOKS_ENABLED: '0',
     CAMPAIGN_ENABLED: '0',
     TRADER_ENABLED: '1',
     TRADER_INSTRUMENT: instId,

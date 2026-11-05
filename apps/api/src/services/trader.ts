@@ -68,8 +68,10 @@ import { emptyTraderState, loadTraderState, RECENT_KEPT, rolledToDay, saveTrader
  * close that crossed a level of the day (detectTriggers). 15m: at every close. Its decision goes through checkDecision, then the
  * guardrails of the day (trade cap, daily loss, cooldown, kill switch, a resting limit), then the exchange: an isolated
  * order sized by traderSize with the stop attached and the ladder take-profit (half at 0.5 R, the rest at the target;
- * once the first half fills the rest's stop goes to the break-even), a close, or a tighter stop.
- * Outside the session an open position is left to its stop: no call is made (the board's choice).
+ * once the first half fills the rest's stop goes to the break-even), a close, or a tighter stop. An entry against the
+ * weekly trend (traderTrend, the dossier's `trend`) is sized at counterRiskPct within counterMaxLeverage and closed at
+ * the market at the first close counterMaxHoldMs after it (closeOverdue, in or out of the session); one on its barred
+ * side is refused. Outside the session an open position is left to its stop: no call is made (the board's choice).
  *
  * The control (TRADER_CONTROL=1): at every entry the trader makes, a second book takes the same contracts with the same
  * stop and target distances in a direction drawn by a seeded coin flip, filled at the mark with CONTROL_SLIPPAGE and
@@ -274,6 +276,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     await this.reconcilePosition(bar, now, equity, fifteen, null);
     await this.expirePendingLimit(bar);
     await this.guardStop(bar);
+    await this.closeOverdue(bar);
     this.settleControl(fifteen, bar);
     const done = (): void => {
       this.state.lastBarTs = bar;
@@ -351,7 +354,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       // the stop or the target took the position while the model was thinking: said as such, not as a refusal on the mark
       const gone = held !== null && (decision.action === 'close' || decision.action === 'tighten_stop') && !this.livePosition();
       const fundingPoints = !gone && decision.action === 'tighten_stop' && held ? await this.fundingPoints(held) : '0';
-      const verdict: TraderVerdict = gone ? { ok: false, action: decision.action, reason: POSITION_GONE } : checkDecision(decision, mark, this.config.guardrails, held, { tickSz: this.deps.market.requireInstrument(this.config.instId).tickSz, fundingPoints });
+      const verdict: TraderVerdict = gone ? { ok: false, action: decision.action, reason: POSITION_GONE } : checkDecision(decision, mark, this.config.guardrails, held, { tickSz: this.deps.market.requireInstrument(this.config.instId).tickSz, fundingPoints, trend: dossier.trend });
       if (!verdict.ok) verdictText = `not carried out: ${verdict.reason}`;
       else {
         const blocked = verdict.action === 'long' || verdict.action === 'short' ? this.entryBlocked(bar, equity) : null;
@@ -505,8 +508,13 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     }
     // long or short
     const inst = this.deps.market.requireInstrument(instId);
-    const size = traderSize({ equity, entryPx: verdict.entryPx, stopPx: verdict.stopPx, inst, guardrails: this.config.guardrails });
-    if (size === null) return { executed: false, note: `not carried out: ${D(equity).mul(this.config.guardrails.riskPct).toFixed(2)} of risk at that stop buys less than the minimum order` };
+    const g = this.config.guardrails;
+    // against the weekly trend (the owner, 2026-11-05: 「小杠杆，仓位小，短空」): the counter risk and leverage, closed after counterMaxHoldMs
+    const sizing = verdict.counter ? { riskPct: g.counterRiskPct, maxLeverage: g.counterMaxLeverage } : g;
+    const closeAt = verdict.counter ? { closeAt: now + g.counterMaxHoldMs } : {};
+    const counterNote = 'closeAt' in closeAt ? `, against the weekly trend: ${D(g.counterRiskPct).mul(100).toFixed()}% risk, closed at the market from ${iso(closeAt.closeAt)}` : '';
+    const size = traderSize({ equity, entryPx: verdict.entryPx, stopPx: verdict.stopPx, inst, guardrails: sizing });
+    if (size === null) return { executed: false, note: `not carried out: ${D(equity).mul(sizing.riskPct).toFixed(2)} of risk at that stop buys less than the minimum order` };
     const side = verdict.action;
     const posSide = posSideOf(side);
     await this.deps.orders.setIsolatedLeverage(instId, size.leverage, posSide ?? 'net');
@@ -527,8 +535,8 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     const { order } = await this.deps.orders.place(req);
     if (verdict.entryType === 'limit') {
       this.record({ ts: now, kind: 'execution', instId, order: { clOrdId, side: req.side, entryType: 'limit', contracts: size.contracts, entryPx: verdict.entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, leverage: size.leverage } });
-      this.state.pendingLimit = { clOrdId, side, contracts: size.contracts, px: verdict.entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, leverage: size.leverage, placedAt: now, barTs: bar, equityAtEntry: equity };
-      return { executed: true, note: `limit ${side} resting at ${verdict.entryPx}, stop ${verdict.stopPx}` };
+      this.state.pendingLimit = { clOrdId, side, contracts: size.contracts, px: verdict.entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, leverage: size.leverage, placedAt: now, barTs: bar, equityAtEntry: equity, ...closeAt };
+      return { executed: true, note: `limit ${side} resting at ${verdict.entryPx}, stop ${verdict.stopPx}${counterNote}` };
     }
     // Booked at the fill (the 2026-10-28 audit: the mark the model saw is not the price it got): the exchange reports the
     // position a moment after a market order fills; the mark stands in when it has not within two seconds.
@@ -546,8 +554,8 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     // entries) is booked too and ends at the next look as a 0 result; look the order up (rest.getOrder) if the log shows it
     if (!live) this.log.warn({ clOrdId, contracts, mark }, 'no position reported within two seconds of the market order: booked at the planned size and the mark');
     this.record({ ts: now, kind: 'execution', instId, order: { clOrdId, side: req.side, entryType: 'market', contracts, entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, leverage: size.leverage } });
-    this.openPosition({ side, contracts, entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, openedAt: now, clOrdId, equityAtEntry: equity }, mark, bar);
-    return { executed: true, note: `${side} ${contracts} contracts at ${entryPx}${filled ? '' : ' (the mark: no fill reported within 2 s)'}, stop ${verdict.stopPx}${verdict.targetPx ? `, target ${verdict.targetPx}` : ''}, ${size.leverage}x` };
+    this.openPosition({ side, contracts, entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, openedAt: now, clOrdId, equityAtEntry: equity, ...closeAt }, mark, bar);
+    return { executed: true, note: `${side} ${contracts} contracts at ${entryPx}${filled ? '' : ' (the mark: no fill reported within 2 s)'}, stop ${verdict.stopPx}${verdict.targetPx ? `, target ${verdict.targetPx}` : ''}, ${size.leverage}x${counterNote}` };
   }
 
   private openPosition(position: TraderPosition, mark: string, bar: number): void {
@@ -558,6 +566,24 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
   }
 
   // ---- the position on the exchange ----
+
+  /** A position against the weekly trend still held at its closeAt is closed at the market, and the control with it (the owner, 2026-11-05: 短空). */
+  private async closeOverdue(bar: number): Promise<void> {
+    const held = this.state.position;
+    if (!held || held.closeAt === undefined || held.closeAt > bar || this.closing || !this.livePosition()) return;
+    const { instId } = this.config;
+    const posSide = this.deps.account.config?.posMode === 'long_short_mode' ? held.side : undefined;
+    try {
+      await this.deps.orders.closePosition({ instId, mgnMode: 'isolated', ...(posSide ? { posSide } : {}) });
+    } catch (err) {
+      this.log.error({ err: (err as Error).message, closeAt: held.closeAt }, 'a position against the weekly trend could not be closed at its time; tried again at the next close');
+      return;
+    }
+    this.closing = true;
+    const mark = this.deps.market.liveMarkPrice(instId);
+    if (mark !== undefined) this.closeControlAtMark(mark, bar);
+    this.log.info({ side: held.side, openedAt: held.openedAt, closeAt: held.closeAt }, 'a position against the weekly trend reached its time: closed at the market');
+  }
 
   /** The funding the exchange reports on the held position (its fundingFee: received positive, paid negative) per coin, in price points; 0 when it reports none or cannot be read. */
   private async fundingPoints(held: TraderPosition): Promise<string> {
@@ -653,7 +679,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
         }
       }
       const entryPx = live.avgPx !== '' ? live.avgPx : p.px;
-      this.openPosition({ side: p.side, contracts: D(live.pos).abs().toFixed(), entryPx, stopPx: p.stopPx, targetPx: p.targetPx, openedAt: now, clOrdId: p.clOrdId, equityAtEntry: p.equityAtEntry }, entryPx, bar);
+      this.openPosition({ side: p.side, contracts: D(live.pos).abs().toFixed(), entryPx, stopPx: p.stopPx, targetPx: p.targetPx, openedAt: now, clOrdId: p.clOrdId, equityAtEntry: p.equityAtEntry, ...(p.closeAt === undefined ? {} : { closeAt: p.closeAt }) }, entryPx, bar);
       this.record({ ts: now, kind: 'execution', instId: this.config.instId, order: { clOrdId: p.clOrdId, side: p.side === 'long' ? 'buy' : 'sell', entryType: 'limit', contracts: p.contracts, entryPx, stopPx: p.stopPx, targetPx: p.targetPx, leverage: p.leverage } });
       return true;
     } else if (held && live && live.avgPx !== '' && (!D(live.avgPx).eq(held.entryPx) || !D(live.pos).abs().eq(held.contracts))) {

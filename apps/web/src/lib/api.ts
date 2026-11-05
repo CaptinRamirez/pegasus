@@ -1,4 +1,5 @@
 import type {
+  BooksView,
   AccountConfig,
   AlgoOrderList,
   AmendAlgoOrderRequest,
@@ -173,6 +174,8 @@ export const api = {
   campaign: () => http<CampaignView>('/api/campaign'),
   /** The Claude trader's state. */
   trader: () => http<TraderView>('/api/trader'),
+  /** The four paper books. */
+  books: () => http<BooksView>('/api/books'),
   /** The trader's decision log, newest first, without the dossiers. */
   traderLog: (limit: number) => http<{ records: TraderLogRecord[] }>('/api/trader/log', { query: { limit } }),
   campaignLog: (query: CampaignLogQuery = {}) => http<CampaignLogPage>('/api/campaign/log', { query }),

@@ -15,6 +15,7 @@ import type { RiskEngine } from './services/risk-engine.js';
 import type { SignalsService } from './services/signals.js';
 import type { Hub } from './ws/hub.js';
 
+import type { BooksService } from './services/books.js';
 import type { TraderService } from './services/trader.js';
 
 export interface Deps {
@@ -42,4 +43,6 @@ export interface Deps {
   exitFollowUp?: ExitFollowUp;
   /** The Claude auto trader (services/trader.ts); absent unless TRADER_ENABLED=1 (paper only, its own stack). */
   trader?: TraderService;
+  /** The five paper books (services/books.ts); absent unless BOOKS_ENABLED=1. */
+  books?: BooksService;
 }

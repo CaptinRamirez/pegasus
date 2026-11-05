@@ -637,10 +637,14 @@ at 10x on a hard-capped pot. Settings (`.env`):
 | `CAMPAIGN_MIN_STAKE` | `5.6` | the smallest stake; one above `CAMPAIGN_POT_START` is refused |
 | `CAMPAIGN_STRUCTURE` | `pyramid` | `pyramid` (a campaign that works adds to itself) or `noadd` |
 | `CAMPAIGN_CUT_HOUR` | `0` | UTC hour the campaign's daily bars close at: `0` (OKX's own `1Dutc` / `12Hutc` bars) or `4`, `8`, `12`, `16`, `20` (bars built from its `4H` candles; the 12-hour closes are at it and 12 hours later). Followed by the campaign, `GET /api/campaign/signals`, channel trailing and the replay beside the pot; a pot keeps the cut it was started with (another setting blocks it with `LEDGER_UNREADABLE`). `20` adopted on 2026-10-18 |
+| `BOOKS_ENABLED` | `0` | `1` keeps the five paper books (`docs/proposals/paper-books-2026-11.md`) on OKX's public data; the launcher sets it on the plain paper stack and turns it off on the campaign and trader stacks |
+| `BOOKS_FILE` | `data/books.json` | the books' ledger |
+| `BOOKS_START` | `10000` | what each book starts with, USDT |
+| `WHALES_FILE` | `data/hyperliquid-whales.jsonl` | with `BOOKS_ENABLED=1`: every 4 hours, the Hyperliquid leaderboard's 100 largest accounts and their open positions, one JSON line per snapshot (`services/whales.ts`) |
 | `TRADER_ENABLED` | `0` | `1` runs the Claude auto trader (`docs/proposals/claude-auto-trader.md`); paper only, refused with `CAMPAIGN_ENABLED=1` on the same stack (`pnpm start --trader` sets everything) |
 | `TRADER_INSTRUMENT` | `BTC-USDT-SWAP` | the one USDT swap it trades; tracked while the trader is enabled |
 | `TRADER_SESSION` | `0-24` | UTC hours in which it is asked and opens positions, Monday to Friday (by default the whole weekday, Asia to America, for the owner's daily-level trades; `13-21` is the US session); there is none on the weekend, and a position is left to its stop outside it |
-| `TRADER_RISK_PCT` | `0.10` | loss accepted per trade, fraction of the equity (the owner's "all out" of 2026-10-27; at 10x a stop closer than 1% cannot use all of it) |
+| `TRADER_RISK_PCT` | `0.05` | loss accepted per trade, fraction of the equity (0.10 from the owner's "all out" of 2026-10-27 until the owner lowered it on 2026-11-05; at 10x a stop closer than 0.5% cannot use all of it) |
 | `TRADER_MAX_TRADES_PER_DAY` | `3` | |
 | `TRADER_DAILY_LOSS_PCT` | `0.5` | loss of the day, fraction of the day's starting equity, at which it stops for the day |
 | `TRADER_MAX_CONSECUTIVE_LOSSES` | `0` | after this many losses in a row within the UTC day it pauses 24 hours; `0` never pauses |
@@ -1086,7 +1090,7 @@ GET /api/trader -> TraderView (packages/shared/src/trader.ts)
   reason: { code: string; message: string } | null;   // blocked: STATE_UNREADABLE, NO_MODEL_CREDENTIALS, ACCOUNT_UNAVAILABLE, FOREIGN_POSITION (a position on its account it did not open: it asks and opens nothing until it is closed)
   instId: string;
   session: { startHour: number; endHour: number; inSession: boolean };   // UTC
-  guardrails: TraderGuardrails;                        // riskPct, maxTradesPerDay, dailyLossPct, maxConsecutiveLosses, cooldownMs, session hours, maxLeverage, maxLimitDistancePct (the stop's distance is the model's call)
+  guardrails: TraderGuardrails;                        // riskPct, maxTradesPerDay, dailyLossPct, maxConsecutiveLosses, cooldownMs, session hours, maxLeverage, maxLimitDistancePct (the stop's distance is the model's call), counterRiskPct / counterMaxLeverage / counterMaxHoldMs (an entry against the weekly trend of the dossier's `trend`: 2%, 3x, closed at the market after 12 hours; position.closeAt)
   model: string;
   nextCallAt: number | null;                           // the next hourly close in session (every 15 minutes with TRADER_CADENCE=15m); Monday's open over the weekend
   last: { ts; decision: TraderDecision | null; verdict: string; executed: boolean; usage; triggers: string[]; error: string | null } | null;
@@ -1106,6 +1110,29 @@ model saw), execution, result, control move or error. The trader's orders carry 
 journal shows them with source `trader`. Every entry carries the stop and the ladder take-profit (`takeProfits`: half at the
 entry plus half the stop's distance, the rest at the model's target, with `breakevenAfterTp1`); once the first leg has
 filled, the trader moves the rest's stop on from the entry to the break-even (the fill plus the round trip's fees).
+
+## Paper books (`GET /api/books`)
+
+Five ledgers of `BOOKS_START` USDT each (`services/books.ts`, arithmetic in `packages/shared/src/books.ts`), settled on
+OKX's public data rather than on the paper exchange: the two-line regime on BTC-USDT spot and its buy-and-hold control,
+the positive carry (BTC and ETH spot long, perp short), the negative carry (perp long, the borrowed coin sold spot) and
+the dip long (5-day perp longs on 30 coins whose 1H/4H/1D/1W features meet one of 20 trained rules, `packages/shared/src/mtf-features.ts`).
+Fills at the ask and the bid of OKX's tickers at its taker fees (spot 0.1%, swap 0.05%); funding as OKX settles it;
+borrow interest hourly at the higher of OKX's posted base rate and its latest Simple Earn lending rate; the hedged legs
+are not margined. The route answers on every stack; where the books do not run, `enabled` is false.
+
+```
+GET /api/books -> BooksView (packages/shared/src/books.ts)
+{
+  enabled: boolean;
+  status: 'disabled' | 'starting' | 'running';
+  error: string | null;                                // the last look's failure; tried again every minute
+  books: BookView[];                                   // regime, hold, carryPos, carryNeg: equity, returnPct, maxDrawdownPct, positions (legs, funding, interest, fees, value), hourly curve, the last 60 events
+  regime: { ts; bull; close; sma200; sma50w } | null;  // the two lines as last read
+  nextDecisionAt: number | null;                       // 00:05 UTC of the next day
+  serverTime: number;
+}
+```
 
 ## WebSocket `/ws?token=<API_TOKEN>`
 

@@ -26,6 +26,7 @@ import {
   type TraderPreviousDecision,
   type TraderRecentTrade,
   traderCosts,
+  traderTrend,
 } from '@pegasus/shared';
 import type { OkxClients } from '../okx/clients.js';
 import type { MarketDataService } from './market-data.js';
@@ -196,6 +197,7 @@ export async function buildTraderDossier(input: BuildDossierInput): Promise<Trad
     derivatives,
     account: input.account,
     guardrails: g,
+    trend: traderTrend(frames),
     triggers: input.triggers,
     macro: input.macro,
     recentDecisions: input.recentDecisions,

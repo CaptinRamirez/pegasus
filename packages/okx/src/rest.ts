@@ -15,6 +15,8 @@ import type {
   OkxFill,
   OkxFundingRate,
   OkxFundingRateHistory,
+  OkxLendingRate,
+  OkxLoanQuota,
   OkxInstType,
   OkxInstrument,
   OkxLeverageInfo,
@@ -220,6 +222,16 @@ export class OkxRestClient {
   /** Settled funding records, newest first. OKX only keeps roughly the last three months. */
   getFundingRateHistory(instId: string, opts: { before?: number; after?: number; limit?: number } = {}): Promise<OkxFundingRateHistory[]> {
     return this.getData<OkxFundingRateHistory>('/api/v5/public/funding-rate-history', { instId, before: opts.before, after: opts.after, limit: opts.limit });
+  }
+
+  /** The posted base borrow rate (daily) and quota of each currency. */
+  getLoanQuota(): Promise<OkxLoanQuota[]> {
+    return this.getData<OkxLoanQuota>('/api/v5/public/interest-rate-loan-quota');
+  }
+
+  /** Simple Earn lending rates of a currency (annual), hourly, newest first; public. */
+  getLendingRateHistory(ccy: string, opts: { limit?: number } = {}): Promise<OkxLendingRate[]> {
+    return this.getData<OkxLendingRate>('/api/v5/finance/savings/lending-rate-history', { ccy, limit: opts.limit });
   }
 
   getOpenInterest(instType: OkxInstType, instId?: string): Promise<OkxOpenInterest[]> {

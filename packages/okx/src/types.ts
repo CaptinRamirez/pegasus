@@ -39,6 +39,8 @@ export interface OkxInstrument {
   state: 'live' | 'suspend' | 'preopen' | 'test';
   listTime: string;
   expTime: string;
+  /** 1 crypto, 3 stocks, 4 commodities, ... (swaps; absent elsewhere) */
+  instCategory?: string;
 }
 
 export interface OkxTicker {
@@ -115,6 +117,19 @@ export interface OkxFundingRateHistory {
   realizedRate: string;
   fundingTime: string;
   method?: string;
+}
+
+/** /api/v5/public/interest-rate-loan-quota: the posted base borrow rate of each currency (daily) and what OKX lends of it (in the currency). */
+export interface OkxLoanQuota {
+  basic: Array<{ ccy: string; rate: string; quota: string }>;
+}
+
+/** /api/v5/finance/savings/lending-rate-history: what Simple Earn lenders received, hourly; rate is annual. */
+export interface OkxLendingRate {
+  ccy: string;
+  amt: string;
+  rate: string;
+  ts: string;
 }
 
 /** [ts, open interest (USD), volume (USD)] from /rubik/stat/contracts/open-interest-volume */

@@ -112,10 +112,18 @@ describe('launcher options', () => {
     expect(() => loadConfig(env)).toThrow(/paper only/);
   });
 
+  it('the paper books run on the plain paper stack only, never on the campaign or trader stacks', () => {
+    expect(options.paperEnv().BOOKS_ENABLED).toBe('1');
+    expect(options.campaignEnv().BOOKS_ENABLED).toBe('0');
+    expect(options.traderEnv().BOOKS_ENABLED).toBe('0');
+    expect(loadConfig(options.paperEnv()).books).toMatchObject({ enabled: true, start: '10000', file: join(repo, 'data', 'books.json') });
+    expect(loadConfig(options.mockEnv()).books.enabled).toBe(false);
+  });
+
   it("--campaign is paper trading on the pot's own account, with the campaign enabled, whatever .env says", () => {
     const dotenv = { OKX_API_KEY: 'live-key', OKX_API_SECRET: 'live-secret', OKX_API_PASSPHRASE: 'live-pass', OKX_DEMO: '1', DATABASE_URL: 'postgres://live', CAMPAIGN_ENABLED: '0', CAMPAIGN_STATE_FILE: 'data/other-ledger.json', STATE_FILE: 'data/pegasus-state.json', INSTRUMENTS: 'SOL-USDT-SWAP' };
     const env = options.campaignEnv();
-    expect(env).toMatchObject({ ...options.paperEnv(9201), STATE_FILE: 'data/pegasus-state.campaign.json', JOURNAL_FILE: 'data/journal.campaign.json', CAMPAIGN_ENABLED: '1', CAMPAIGN_STATE_FILE: 'data/campaign-ledger.json', PAPER_STATE_FILE: 'data/paper-campaign.json', PAPER_BALANCE: '56' });
+    expect(env).toMatchObject({ ...options.paperEnv(9201), BOOKS_ENABLED: '0', STATE_FILE: 'data/pegasus-state.campaign.json', JOURNAL_FILE: 'data/journal.campaign.json', CAMPAIGN_ENABLED: '1', CAMPAIGN_STATE_FILE: 'data/campaign-ledger.json', PAPER_STATE_FILE: 'data/paper-campaign.json', PAPER_BALANCE: '56' });
     const config = loadConfig({ ...dotenv, ...env });
     expect(config.okx).toMatchObject({ paper: true, demo: false, credentials: { apiKey: 'paper', apiSecret: 'paper', passphrase: 'paper' }, endpoints: { restPrivate: 'http://127.0.0.1:9201' } });
     expect(config.campaign).toMatchObject({ enabled: true, potStart: '56', instruments: [...CAMPAIGN_INSTRUMENTS] });

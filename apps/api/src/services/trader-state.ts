@@ -23,6 +23,8 @@ export interface PendingLimit {
   /** The 15-minute bar the order was placed in; it is cancelled at the close of the next one if still unfilled */
   barTs: number;
   equityAtEntry: string;
+  /** Against the weekly trend: the position it fills into is closed at the market from this instant */
+  closeAt?: number;
 }
 
 export interface TraderUsageDay {

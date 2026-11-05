@@ -13,6 +13,9 @@ export const guardrails: TraderGuardrails = {
   sessionEndHour: 21,
   maxLeverage: '10',
   maxLimitDistancePct: '0.02',
+  counterRiskPct: '0.02',
+  counterMaxLeverage: '3',
+  counterMaxHoldMs: 12 * 3_600_000,
 };
 
 export const decision: TraderDecision = {

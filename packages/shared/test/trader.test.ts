@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { D } from '../src/decimal.js';
-import { checkDecision, DEFAULT_TRADER_GUARDRAILS, ladderFirstTarget, traderBreakEven, recentTradesOf, swingPoints, traderCosts, wakeOf, emaAlignment, emaLast, emaSeries, estimateUsd, inTraderSession, macd, minutesTo, roundLevels, rsi, traderSize, volumeRatio, vwap, type TraderDecision, type TraderPosition } from '../src/trader.js';
+import { checkDecision, DEFAULT_TRADER_GUARDRAILS, traderTrend, ladderFirstTarget, traderBreakEven, recentTradesOf, swingPoints, traderCosts, wakeOf, emaAlignment, emaLast, emaSeries, estimateUsd, inTraderSession, macd, minutesTo, roundLevels, rsi, traderSize, volumeRatio, vwap, type TraderDecision, type TraderFrame, type TraderPosition } from '../src/trader.js';
 import type { Candle, Instrument } from '../src/types.js';
 
 const inst: Instrument = {
@@ -100,7 +100,7 @@ describe('checkDecision', () => {
 
   it('accepts a long with the stop below, within the distance limits, and a target at least as far', () => {
     const v = checkDecision(decision({ action: 'long', stopPx: '81700', targetPx: '82500' }), '82000', g, null);
-    expect(v).toEqual({ ok: true, action: 'long', entryType: 'market', entryPx: '82000', stopPx: '81700', targetPx: '82500' });
+    expect(v).toEqual({ ok: true, action: 'long', entryType: 'market', entryPx: '82000', stopPx: '81700', targetPx: '82500', counter: false });
     expect(checkDecision(decision({ action: 'short', stopPx: '82450', targetPx: '81700' }), '82150', g, null)).toMatchObject({ ok: true, action: 'short' });
   });
 
@@ -118,9 +118,29 @@ describe('checkDecision', () => {
     expect(checkDecision(decision({ action: 'short', stopPx: '82450' }), '82000', g, held)).toMatchObject({ ok: false, reason: /while a long is held/ });
   });
 
+  it('the weekly trend (the owner, 2026-11-05): a counter entry passes marked, one on the barred side is refused', () => {
+    const frame = (bar: '1D' | '1W', f: Partial<TraderFrame>): TraderFrame => ({ bar, asOf: 0, close: '78308.7', ema5: null, ema10: null, ema21: null, ema50: null, ema200: null, alignment: null, macd: null, rsi14: null, atr14: null, volumeRatio: null, bars: [], swings: [], ...f });
+    const macd = (hist: string) => ({ macd: '0', signal: '0', hist, histRising: false });
+    // the weekly of 2026-11-02: bull alignment, MACD histogram +1277.75, RSI 52.3; the daily close above the weekly EMA21
+    const weekly = frame('1W', { ema21: '76733.17', alignment: 'bull', macd: macd('1277.75'), rsi14: '52.3' });
+    const bull = traderTrend([frame('1D', { close: '77439.4', rsi14: '38.2' }), weekly]);
+    expect(bull).toEqual({ weekly: 'bull', counterSide: 'short', barredSide: null });
+    // a daily close below the weekly EMA21 breaks the weekly structure: no trend, nothing counter
+    expect(traderTrend([frame('1D', { close: '76700', rsi14: '38.2' }), weekly]).weekly).toBeNull();
+    // RSI at 50 or a negative histogram: no trend
+    expect(traderTrend([frame('1D', { close: '77439.4' }), { ...weekly, rsi14: '50' }]).weekly).toBeNull();
+    expect(traderTrend([frame('1D', { close: '77439.4' }), { ...weekly, macd: macd('-1') }]).weekly).toBeNull();
+    const bear = traderTrend([frame('1D', { close: '70000', rsi14: '75' }), frame('1W', { ema21: '76733', alignment: 'bear', macd: macd('-5'), rsi14: '40' })]);
+    expect(bear).toEqual({ weekly: 'bear', counterSide: 'long', barredSide: 'long' });
+    expect(traderTrend([frame('1D', { rsi14: '29.9' })])).toEqual({ weekly: null, counterSide: null, barredSide: 'short' });
+    expect(checkDecision(decision({ action: 'short', stopPx: '82450', targetPx: '81700' }), '82150', g, null, { trend: bull })).toMatchObject({ ok: true, counter: true });
+    expect(checkDecision(decision({ action: 'long', stopPx: '81700', targetPx: '82500' }), '82000', g, null, { trend: bull })).toMatchObject({ ok: true, counter: false });
+    expect(checkDecision(decision({ action: 'long', stopPx: '81700', targetPx: '82500' }), '82000', g, null, { trend: bear })).toMatchObject({ ok: false, reason: /RSI14 is above 70/ });
+  });
+
   it('a limit entry is measured from its price', () => {
     const v = checkDecision(decision({ action: 'short', entryType: 'limit', limitPrice: '82150', stopPx: '82450', targetPx: '81700' }), '82000', g, null);
-    expect(v).toEqual({ ok: true, action: 'short', entryType: 'limit', entryPx: '82150', stopPx: '82450', targetPx: '81700' });
+    expect(v).toEqual({ ok: true, action: 'short', entryType: 'limit', entryPx: '82150', stopPx: '82450', targetPx: '81700', counter: false });
   });
 
   it('close and tighten_stop need a position; the new stop must be tighter and on the right side of the mark', () => {

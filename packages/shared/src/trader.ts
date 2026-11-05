@@ -162,6 +162,34 @@ export function swingPoints(candles: readonly Candle[], k = 3, n = 8): TraderSwi
   return out.slice(-n);
 }
 
+/**
+ * The weekly trend the code holds entries to (the owner, 2026-11-05: 「周线看macd还有均线吧，还有rsi」, 「周线多头的情况下要十分谨慎
+ * 做空，小杠杆，仓位小，短空。如果日线跌把周线结构走坏才考虑反转」). weekly bull: the weekly EMAs in bull alignment, its MACD
+ * histogram above 0, its RSI14 above 50 and the last daily close not below the weekly EMA21 (below it the daily has broken
+ * the weekly structure); bear: the reverse; null otherwise. counterSide is the side against it (sized and held by the
+ * counter guardrails); barredSide the side no entry may take: short while the daily RSI14 is below 30, long above 70.
+ */
+export interface TraderTrend {
+  weekly: 'bull' | 'bear' | null;
+  counterSide: 'long' | 'short' | null;
+  barredSide: 'long' | 'short' | null;
+}
+
+export function traderTrend(frames: readonly TraderFrame[]): TraderTrend {
+  const w = frames.find((f) => f.bar === '1W');
+  const d = frames.find((f) => f.bar === '1D');
+  let weekly: TraderTrend['weekly'] = null;
+  if (w && d && w.macd && w.rsi14 !== null && w.ema21 !== null) {
+    const hist = D(w.macd.hist);
+    const rsi = D(w.rsi14);
+    if (w.alignment === 'bull' && hist.gt(0) && rsi.gt(50) && D(d.close).gte(w.ema21)) weekly = 'bull';
+    else if (w.alignment === 'bear' && hist.lt(0) && rsi.lt(50) && D(d.close).lte(w.ema21)) weekly = 'bear';
+  }
+  const dRsi = d?.rsi14 ?? null;
+  const barredSide = dRsi === null ? null : D(dRsi).lt(30) ? 'short' : D(dRsi).gt(70) ? 'long' : null;
+  return { weekly, counterSide: weekly === 'bull' ? 'short' : weekly === 'bear' ? 'long' : null, barredSide };
+}
+
 /** Price levels around the market, from the 15-minute bars and the daily ones. null when the bars do not reach. */
 export interface TraderLevels {
   prevDayHigh: string | null;
@@ -218,6 +246,8 @@ export interface TraderPosition {
   clOrdId: string;
   /** Total equity when the position was opened: the trade's result is measured from it */
   equityAtEntry: string;
+  /** An entry against the weekly trend: the code closes it at the market at the first 15-minute close from this instant */
+  closeAt?: number;
 }
 
 export interface TraderAccountInfo {
@@ -273,12 +303,17 @@ export interface TraderGuardrails {
   maxLeverage: string;
   /** A limit entry may not be further than this from the mark */
   maxLimitDistancePct: string;
+  /** An entry against the weekly trend (traderTrend): its loss at the stop, fraction of the equity, its leverage cap, and how long it may be held */
+  counterRiskPct: string;
+  counterMaxLeverage: string;
+  counterMaxHoldMs: number;
 }
 
-// The owner on 2026-10-27, paper money: trade it all out. A tenth of the equity per trade, which a stop closer than 1%
-// cannot use in full at 10x; no pause after losses; a day stops at half the equity.
+// The owner on 2026-10-27, paper money: trade it all out; no pause after losses; a day stops at half the equity. The risk
+// per trade was a tenth of the equity until 2026-11-05, when the owner lowered it to 5% (「可以」, after the tests showed
+// that a smaller position cuts drawdowns better than any timing rule); a stop closer than 0.5% cannot use it in full at 10x.
 export const DEFAULT_TRADER_GUARDRAILS: TraderGuardrails = {
-  riskPct: '0.10',
+  riskPct: '0.05',
   maxTradesPerDay: 3,
   dailyLossPct: '0.5',
   maxConsecutiveLosses: 0,
@@ -288,6 +323,10 @@ export const DEFAULT_TRADER_GUARDRAILS: TraderGuardrails = {
   sessionEndHour: 24,
   maxLeverage: '10',
   maxLimitDistancePct: '0.02',
+  // the owner on 2026-11-05: against the weekly trend 「小杠杆，仓位小，短空」, then 2% risk, 3x at most, 12 hours
+  counterRiskPct: '0.02',
+  counterMaxLeverage: '3',
+  counterMaxHoldMs: 12 * 3_600_000,
 };
 
 /** A scheduled release of the economic calendar, as the model sees it (the calendar gives no actual figures). */
@@ -356,6 +395,8 @@ export interface TraderDossier {
   derivatives: TraderDerivatives;
   account: TraderAccountInfo;
   guardrails: TraderGuardrails;
+  /** The weekly trend the code holds entries to, from the 1W and 1D frames */
+  trend: TraderTrend;
   /** Why the model is being asked now: the session's open, its own recheck time, a wake level, the position, a release */
   triggers: string[];
   /** The economic calendar and the headlines of the last hours */
@@ -409,7 +450,7 @@ export type TraderVerdict =
   | { ok: true; action: 'flat' }
   | { ok: true; action: 'close' }
   | { ok: true; action: 'tighten_stop'; stopPx: string; note?: string }
-  | { ok: true; action: 'long' | 'short'; entryType: 'market' | 'limit'; entryPx: string; stopPx: string; targetPx: string | null }
+  | { ok: true; action: 'long' | 'short'; entryType: 'market' | 'limit'; entryPx: string; stopPx: string; targetPx: string | null; counter: boolean }
   | { ok: false; action: TraderAction; reason: string };
 
 /**
@@ -443,11 +484,12 @@ export function traderBreakEven(side: 'long' | 'short', entryPx: DecimalInput, o
 /**
  * Whether a decision may be carried out: the stop on the losing side of the entry (where is the model's call), a target
  * (the ladder's second leg) beyond the stop's distance, a limit price near the mark, a close or a tighter stop only with
- * a position, an entry only without one. A decision that fails is treated as `flat` and logged with the reason. A stop
+ * a position, an entry only without one, and none on `opts.trend`'s barred side (an entry on its counter side passes
+ * with `counter`). A decision that fails is treated as `flat` and logged with the reason. A stop
  * moved while the position is in profit is kept beyond the break-even (traderBreakEven, with `opts.fundingPoints` and
  * `opts.tickSz`); one asked for on the losing side of it is placed at the break-even, with a note.
  */
-export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrails, held: TraderPosition | null, opts: { tickSz?: string; fundingPoints?: DecimalInput } = {}): TraderVerdict {
+export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrails, held: TraderPosition | null, opts: { tickSz?: string; fundingPoints?: DecimalInput; trend?: TraderTrend } = {}): TraderVerdict {
   const m = D(mark);
   const pct = (a: DecimalInput, b: DecimalInput): Decimal => D(a).minus(b).abs().div(b);
   if (d.action === 'flat') return { ok: true, action: 'flat' };
@@ -470,6 +512,8 @@ export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrai
   }
   // long or short
   if (held) return { ok: false, action: d.action, reason: `${d.action} while a ${held.side} is held` };
+  if (opts.trend?.barredSide === d.action) return { ok: false, action: d.action, reason: `no ${d.action} while the daily RSI14 is ${d.action === 'short' ? 'below 30' : 'above 70'} (the owner, 2026-11-05)` };
+  const counter = opts.trend?.counterSide === d.action;
   let entry = m;
   if (d.entryType === 'limit') {
     if (!isDecimal(d.limitPrice)) return { ok: false, action: d.action, reason: 'limit entry without a price' };
@@ -486,7 +530,7 @@ export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrai
   const t = D(d.targetPx);
   if (long ? !t.gt(entry) : !t.lt(entry)) return { ok: false, action: d.action, reason: `the target ${d.targetPx} is on the wrong side of the entry` };
   if (t.minus(entry).abs().lt(stop.minus(entry).abs())) return { ok: false, action: d.action, reason: 'the target is closer than the stop: less than one to one' };
-  return { ok: true, action: d.action, entryType: d.entryType, entryPx: entry.toFixed(), stopPx: stop.toFixed(), targetPx: t.toFixed() };
+  return { ok: true, action: d.action, entryType: d.entryType, entryPx: entry.toFixed(), stopPx: stop.toFixed(), targetPx: t.toFixed(), counter };
 }
 
 /**
