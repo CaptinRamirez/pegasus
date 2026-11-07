@@ -1090,7 +1090,7 @@ GET /api/trader -> TraderView (packages/shared/src/trader.ts)
   reason: { code: string; message: string } | null;   // blocked: STATE_UNREADABLE, NO_MODEL_CREDENTIALS, ACCOUNT_UNAVAILABLE, FOREIGN_POSITION (a position on its account it did not open: it asks and opens nothing until it is closed)
   instId: string;
   session: { startHour: number; endHour: number; inSession: boolean };   // UTC
-  guardrails: TraderGuardrails;                        // riskPct, maxTradesPerDay, dailyLossPct, maxConsecutiveLosses, cooldownMs, session hours, maxLeverage, maxLimitDistancePct (the stop's distance is the model's call), counterRiskPct / counterMaxLeverage / counterMaxHoldMs (an entry against the weekly trend of the dossier's `trend`: 2%, 3x, closed at the market after 12 hours; position.closeAt)
+  guardrails: TraderGuardrails;                        // riskPct, maxTradesPerDay, dailyLossPct, maxConsecutiveLosses, cooldownMs, session hours, maxLeverage, maxLimitDistancePct (a stop closer to the entry than one daily ATR14 is widened to it; the dossier's `holds` names why every entry is refused at the moment: no weekly trend, the day of and after a big US release or election, the last 24 hours' range beyond 1.5 daily ATR), counterRiskPct / counterMaxLeverage / counterMaxHoldMs (an entry against the weekly trend of the dossier's `trend`: 2%, 3x, closed at the market after 12 hours; position.closeAt)
   model: string;
   nextCallAt: number | null;                           // the next hourly close in session (every 15 minutes with TRADER_CADENCE=15m); Monday's open over the weekend
   last: { ts; decision: TraderDecision | null; verdict: string; executed: boolean; usage; triggers: string[]; error: string | null } | null;

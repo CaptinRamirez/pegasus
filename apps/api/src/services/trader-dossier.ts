@@ -26,6 +26,7 @@ import {
   type TraderPreviousDecision,
   type TraderRecentTrade,
   traderCosts,
+  traderHolds,
   traderTrend,
 } from '@pegasus/shared';
 import type { OkxClients } from '../okx/clients.js';
@@ -179,6 +180,7 @@ export async function buildTraderDossier(input: BuildDossierInput): Promise<Trad
   const [funding, oi] = await Promise.all([sources.funding(instId).catch(() => ({ rate: null, mean72h: null })), sources.openInterest(instId).catch(() => ({ oi: null, change24hPct: null }))]);
   const derivatives: TraderDerivatives = { fundingRate: funding.rate, fundingMean72h: funding.mean72h, openInterest: oi.oi, oiChange24hPct: oi.change24hPct };
   const g = input.guardrails;
+  const trend = traderTrend(frames);
   return {
     instId,
     asOf: now,
@@ -197,7 +199,8 @@ export async function buildTraderDossier(input: BuildDossierInput): Promise<Trad
     derivatives,
     account: input.account,
     guardrails: g,
-    trend: traderTrend(frames),
+    trend,
+    holds: traderHolds({ now, trend, frames, calendar: input.macro.calendar }),
     triggers: input.triggers,
     macro: input.macro,
     recentDecisions: input.recentDecisions,

@@ -8,6 +8,7 @@
  *   submit       create the batch (once: refuses while batch.json exists)       ANTHROPIC_API_KEY
  *   collect      save the batch's answers once it has ended                     ANTHROPIC_API_KEY
  *   score        the pre-registered tests                                       no key
+ *   rules [live] the holds and the stop floor of 2026-11-07 on the replay's entries (live: on the entries of data/trader-log.jsonl since 2026-10-21)  no key
  * Files in data/trader-replay/. Prices in the scoring are plain numbers: statistics, not money that is booked.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -21,13 +22,17 @@ import {
   ladderFirstTarget,
   traderBreakEven,
   traderDecisionSchema,
+  traderHolds,
+  traderTrend,
   TRADER_MAKER_FEE,
   TRADER_TAKER_FEE,
   type Candle,
   type TraderAccountInfo,
   type TraderBar,
+  type TraderDecision,
   type TraderDossier,
   type TraderGuardrails,
+  type TraderVerdict,
 } from '@pegasus/shared';
 import type { OkxCandleRow } from '@pegasus/okx';
 import { mapCandle, toOkxBar } from '../src/okx/mappers.js';
@@ -314,6 +319,15 @@ async function minuteBars(): Promise<Bar1m[]> {
   return bars;
 }
 
+/** The minute bars since `from` for the live entries, kept in m1-live.json and fetched again once two hours old. */
+async function liveMinuteBars(from: number): Promise<Bar1m[]> {
+  const cached = existsSync(DIR + 'm1-live.json') ? readJson<Bar1m[]>('m1-live.json') : [];
+  if (cached.length > 0 && cached.at(-1)![0] > Date.now() - 2 * H) return cached;
+  const bars = (await okxCandles('1m', from)).filter((c) => c.confirm && c.ts >= from).map((c): Bar1m => [c.ts, Number(c.open), Number(c.high), Number(c.low), Number(c.close)]);
+  writeJson('m1-live.json', bars);
+  return bars;
+}
+
 /** Index of the first bar opening at or after `t`. */
 function at(m1: Bar1m[], t: number): number {
   let lo = 0;
@@ -337,7 +351,7 @@ function priceAt(m1: Bar1m[], t: number): number | null {
  * stop at the break-even, out at market after 7 days); B = the stop twice as far at half the size, out after 24 hours.
  * The stop wins a minute that touches both. R = net PnL over the risk at the original stop.
  */
-function simulate(m1: Bar1m[], i: number, side: 'long' | 'short', entry: number, stop: number, target: number, entryFee: number, mode: 'A' | 'B', cut = Infinity): number {
+function simulateRun(m1: Bar1m[], i: number, side: 'long' | 'short', entry: number, stop: number, target: number, entryFee: number, mode: 'A' | 'B', cut = Infinity): { r: number; exit: number } {
   const s = side === 'long' ? 1 : -1;
   const dist = Math.abs(entry - stop);
   // `cut`: a stand-aside flag (owner-methods-2026-11.md, idea 3) closes the position at the market at that minute
@@ -349,13 +363,15 @@ function simulate(m1: Bar1m[], i: number, side: 'long' | 'short', entry: number,
   let left = 1;
   let banked = 0;
   let px = entry;
+  let exit = end;
   for (let j = i; j < m1.length && m1[j]![0] < end; j++) {
-    const [, , high, low, close] = m1[j]!;
+    const [ts, , high, low, close] = m1[j]!;
     const adverse = s > 0 ? low : high;
     const favour = s > 0 ? high : low;
     px = close;
     if (s * (adverse - stopNow) <= 0) {
       px = stopNow;
+      exit = ts;
       break;
     }
     if (mode === 'B') continue;
@@ -366,11 +382,14 @@ function simulate(m1: Bar1m[], i: number, side: 'long' | 'short', entry: number,
     }
     if (s * (favour - target) >= 0) {
       px = target;
+      exit = ts;
       break;
     }
   }
-  return (size * (banked + left * (s * (px - entry) - px * TAKER) - entry * entryFee)) / dist;
+  return { r: (size * (banked + left * (s * (px - entry) - px * TAKER) - entry * entryFee)) / dist, exit };
 }
+
+const simulate = (m1: Bar1m[], i: number, side: 'long' | 'short', entry: number, stop: number, target: number, entryFee: number, mode: 'A' | 'B', cut = Infinity): number => simulateRun(m1, i, side, entry, stop, target, entryFee, mode, cut).r;
 
 /** Mean, and its standard error with the rows grouped by `key` (sums of the deviations within a group). */
 function clustered(rows: Array<{ v: number; key: string }>): { n: number; mean: number; se: number; t: number } {
@@ -389,12 +408,14 @@ const isoWeek = (t: number): string => {
   return `${d.getUTCFullYear()}-${Math.ceil(((d.getTime() - Date.UTC(d.getUTCFullYear(), 0, 1)) / DAY + 1) / 7)}`;
 };
 
-async function score(): Promise<void> {
+type EntryVerdict = Extract<TraderVerdict, { ok: true; action: 'long' | 'short' }>;
+
+/** The history, the guardrails, the minute bars and the batch's usable answers in time order. */
+async function load(): Promise<{ h: History; g: TraderGuardrails; m1: Bar1m[]; rows: Array<{ p: Point; d: ReplayDecision }> }> {
   const h = readJson<History>('history.json');
   const pts = new Map(readJson<Point[]>('points.json').map((p) => [p.id, p]));
   const g = lastLiveDossier().guardrails;
   const m1 = await minuteBars();
-  const daily = h.candles['1D'];
   const answers = readLines<{ id: string; type: string; text: string | null }>(DIR + 'results.jsonl');
   const problems: string[] = [];
   const rows: Array<{ p: Point; d: ReplayDecision }> = [];
@@ -406,6 +427,21 @@ async function score(): Promise<void> {
   }
   rows.sort((a, b) => a.p.t - b.p.t);
   console.log(`${answers.length} answers, ${rows.length} usable${problems.length ? `; not usable: ${problems.join(', ')}` : ''}`);
+  return { h, g, m1, rows };
+}
+
+/** Where an entry fills on the minute bars: a market order at the close `t`, a limit order where it is touched within 15 minutes; null when it is not. */
+function fillOf(v: EntryVerdict, t: number, m1: Bar1m[]): { i: number; entry: number; fee: number } | null {
+  const entry = Number(v.entryPx);
+  const i = at(m1, t);
+  if (v.entryType !== 'limit') return { i, entry, fee: TAKER };
+  const fill = m1.slice(i, at(m1, t + 15 * MIN)).findIndex(([, , hi, lo]) => (v.action === 'long' ? lo <= entry : hi >= entry));
+  return fill < 0 ? null : { i: i + fill + 1, entry, fee: MAKER };
+}
+
+async function score(): Promise<void> {
+  const { h, g, m1, rows } = await load();
+  const daily = h.candles['1D'];
 
   // ---- direction ----
   const trendUp = (t: number): boolean => {
@@ -470,18 +506,12 @@ async function score(): Promise<void> {
       rejected++;
       continue;
     }
-    const entry = Number(v.entryPx);
-    let i = at(m1, p.t);
-    let fee = TAKER;
-    if (v.entryType === 'limit') {
-      const fill = m1.slice(i, at(m1, p.t + 15 * MIN)).findIndex(([, , hi, lo]) => (v.action === 'long' ? lo <= entry : hi >= entry));
-      if (fill < 0) {
-        unfilled++;
-        continue;
-      }
-      i += fill + 1;
-      fee = MAKER;
+    const f = fillOf(v, p.t, m1);
+    if (!f) {
+      unfilled++;
+      continue;
     }
+    const { i, entry, fee } = f;
     if (i >= m1.length) continue;
     const stop = Number(v.stopPx);
     const target = Number(v.targetPx);
@@ -555,8 +585,185 @@ async function score(): Promise<void> {
   writeJson('score.json', report);
 }
 
+// ---- the holds and the stop floor of 2026-11-07 (traderHolds, checkDecision's `atr`) ----
+
+/** The big US releases of the replay's months and after, as the calendar shows them: FOMC statements, CPI, payrolls (UTC). */
+const BIG_RELEASES = [
+  ...['2026-07-29T18:00Z', '2026-09-16T18:00Z', '2026-10-28T18:00Z'].map((d) => ({ time: Date.parse(d), title: 'FOMC Statement' })),
+  ...['2026-07-14T12:30Z', '2026-08-12T12:30Z', '2026-09-11T12:30Z', '2026-10-14T12:30Z', '2026-11-10T13:30Z'].map((d) => ({ time: Date.parse(d), title: 'CPI m/m' })),
+  ...['2026-07-02T12:30Z', '2026-08-07T12:30Z', '2026-09-04T12:30Z', '2026-10-02T12:30Z', '2026-11-06T13:30Z'].map((d) => ({ time: Date.parse(d), title: 'Non-Farm Employment Change' })),
+].map((e) => ({ ...e, country: 'USD', impact: 'High' }));
+
+interface RuleRow {
+  t: number;
+  holds: string[];
+  /** A, the live structure, as decided */
+  base: number;
+  /** A with the stop at the floor; null when the entry is refused (the target within the floor) */
+  floor: number | null;
+  /** A with the stop at the floor and the target kept as it was */
+  floorKept: number;
+  widened: boolean;
+}
+
+const dayOf = (t: number): string => new Date(t).toISOString().slice(0, 10);
+const holdKind = (h: string): 'trend' | 'event' | 'range' => (h.startsWith('no weekly') ? 'trend' : h.startsWith('big event') ? 'event' : 'range');
+
+/** One entry under the rules: the holds at its dossier, and the simulation with the stop as decided and at the floor. */
+function ruleRow(d: TraderDecision, dossier: TraderDossier, g: TraderGuardrails, f: { i: number; entry: number; fee: number }, m1: Bar1m[], v: EntryVerdict): RuleRow {
+  // the dossiers logged before 2026-11-05 carry no trend
+  const trend = (dossier as Partial<TraderDossier>).trend ?? traderTrend(dossier.frames);
+  const holds = traderHolds({ now: dossier.asOf, trend, frames: dossier.frames, calendar: [...dossier.macro.calendar, ...BIG_RELEASES] });
+  const atr = dossier.frames.find((x) => x.bar === '1D')?.atr14 ?? null;
+  const stop = Number(v.stopPx);
+  const target = Number(v.targetPx);
+  const v2 = checkDecision(d, dossier.mark, g, null, { atr, tickSz: '0.1' });
+  const floored = v2.ok && (v2.action === 'long' || v2.action === 'short') ? v2 : null;
+  const dist = Math.max(Math.abs(f.entry - stop), Number(atr ?? 0));
+  return {
+    t: dossier.asOf,
+    holds,
+    base: simulate(m1, f.i, v.action, f.entry, stop, target, f.fee, 'A'),
+    floor: floored ? simulate(m1, f.i, v.action, f.entry, Number(floored.stopPx), target, f.fee, 'A') : null,
+    floorKept: simulate(m1, f.i, v.action, f.entry, v.action === 'long' ? f.entry - dist : f.entry + dist, target, f.fee, 'A'),
+    widened: floored?.note !== undefined,
+  };
+}
+
+/** A decision point of the replay with what the rules read at it. */
+interface Pt {
+  t: number;
+  mark: string;
+  d: ReplayDecision;
+  holds: string[];
+  atr: number | null;
+}
+
+interface Trade {
+  t: number;
+  exit: number;
+  r: number;
+  holds: string[];
+  widened: boolean;
+}
+
+/**
+ * The entries taken the way the live trader takes them: in time order, none while a position is open (the replay's
+ * decisions were made flat, so a point inside a position is skipped, not asked), at most maxTradesPerDay a day, none
+ * the hold refuses, each run to its exit in A, the live structure. floorAtr: the stop floor in daily ATRs (null: none);
+ * an entry whose target is within the floor is refused, as live.
+ */
+function sequential(pts: Pt[], g: TraderGuardrails, m1: Bar1m[], hold: (holds: string[]) => boolean, floorAtr: number | null): { trades: Trade[]; refused: number } {
+  const trades: Trade[] = [];
+  let busyUntil = 0;
+  let day = '';
+  let today = 0;
+  let refused = 0;
+  for (const p of pts) {
+    if (p.t < busyUntil || (p.d.action !== 'long' && p.d.action !== 'short') || hold(p.holds)) continue;
+    if (dayOf(p.t) !== day) {
+      day = dayOf(p.t);
+      today = 0;
+    }
+    if (today >= g.maxTradesPerDay) continue;
+    const v = checkDecision(p.d, p.mark, g, null, { tickSz: '0.1', atr: floorAtr !== null && p.atr !== null ? String(p.atr * floorAtr) : null });
+    if (!v.ok || (v.action !== 'long' && v.action !== 'short')) {
+      refused++;
+      continue;
+    }
+    const f = fillOf(v, p.t, m1);
+    if (!f || f.i >= m1.length) continue;
+    const run = simulateRun(m1, f.i, v.action, f.entry, Number(v.stopPx), Number(v.targetPx), f.fee, 'A');
+    trades.push({ t: p.t, exit: run.exit, r: run.r, holds: p.holds, widened: v.note !== undefined });
+    busyUntil = run.exit;
+    today++;
+  }
+  return { trades, refused };
+}
+
+/** Mean R and its t with the trades clustered by ISO week, the win share, and the equity compounded at riskPct a trade with its deepest drawdown. */
+function stats(trades: Trade[], riskPct: number): { n: number; mean: number; se: number; t: number; total: number; win: number; eq: number; dd: number } {
+  if (trades.length === 0) return { n: 0, mean: 0, se: 0, t: 0, total: 0, win: 0, eq: 1, dd: 0 };
+  const s = clustered(trades.map((x) => ({ v: x.r, key: isoWeek(x.t) })));
+  let eq = 1;
+  let peak = 1;
+  let dd = 0;
+  for (const x of trades) {
+    eq *= 1 + riskPct * x.r;
+    peak = Math.max(peak, eq);
+    dd = Math.min(dd, eq / peak - 1);
+  }
+  return { ...s, total: s.mean * s.n, win: trades.filter((x) => x.r > 0).length / trades.length, eq, dd };
+}
+
+function show(name: string, trades: Trade[], riskPct: number, extra = ''): void {
+  const s = stats(trades, riskPct);
+  console.log(`  ${name.padEnd(40)} n ${String(s.n).padStart(3)}  mean ${s.mean.toFixed(3).padStart(7)}R  t ${s.t.toFixed(2).padStart(6)}  won ${(s.win * 100).toFixed(0).padStart(3)}%  total ${s.total.toFixed(1).padStart(6)}R  equity x${s.eq.toFixed(2)}, deepest drawdown ${(s.dd * 100).toFixed(0)}%${extra}`);
+}
+
+const HOLD_NAMES = [['trend', 'no weekly trend'], ['event', 'the day of and after a big event'], ['range', '24h range beyond 1.5 daily ATR']] as const;
+
+async function rules(): Promise<void> {
+  const { h, g, m1, rows } = await load();
+  const pts: Pt[] = [];
+  for (const { p, d } of rows) {
+    const dossier = await dossierAt(h, p.t, g);
+    const holds = traderHolds({ now: p.t, trend: dossier.trend, frames: dossier.frames, calendar: BIG_RELEASES });
+    const atr = dossier.frames.find((x) => x.bar === '1D')?.atr14 ?? null;
+    pts.push({ t: p.t, mark: p.mark, d, holds, atr: atr === null ? null : Number(atr) });
+  }
+  const risk = Number(g.riskPct);
+  const pct = (x: number): string => `${(x * 100).toFixed(0)}%`;
+  const share = (f: (holds: string[]) => boolean): string => pct(pts.filter((p) => f(p.holds)).length / pts.length);
+  console.log(`\n== the rules of 2026-11-07 run like the live trader on the replay's ${pts.length} decision points, 2026-07-01 to 2026-10-30: one position at a time, at most ${g.maxTradesPerDay} entries a day, A = the live structure, SE by ISO week, equity at ${pct(risk)} a trade`);
+  console.log(`  points held: ${HOLD_NAMES.map(([kind, name]) => `${name} ${share((hs) => hs.some((x) => holdKind(x) === kind))}`).join(', ')}, any ${share((hs) => hs.length > 0)}`);
+  const none = (): boolean => false;
+  const base = sequential(pts, g, m1, none, null);
+  show('baseline: as decided', base.trades, risk);
+  for (const [kind, name] of HOLD_NAMES) {
+    // the baseline's own trades split by what the hold would have said, the two groups as independent clusters
+    const flagged = stats(base.trades.filter((x) => x.holds.some((hh) => holdKind(hh) === kind)), risk);
+    const free = stats(base.trades.filter((x) => !x.holds.some((hh) => holdKind(hh) === kind)), risk);
+    const se = Math.sqrt(flagged.se ** 2 + free.se ** 2);
+    console.log(`      the baseline's ${flagged.n} entries this hold would refuse made ${flagged.mean.toFixed(3)}R each, the other ${free.n} ${free.mean.toFixed(3)}R: difference ${(flagged.mean - free.mean).toFixed(3)}R, t ${(se > 0 ? (flagged.mean - free.mean) / se : 0).toFixed(2)}`);
+    show(`hold: ${name}`, sequential(pts, g, m1, (hs) => hs.some((hh) => holdKind(hh) === kind), null).trades, risk);
+  }
+  for (const k of [0.5, 1, 1.5, 2]) {
+    const run = sequential(pts, g, m1, none, k);
+    show(`stop floor ${k} daily ATR`, run.trades, risk, `; ${run.trades.filter((x) => x.widened).length} widened, ${run.refused - base.refused} refused for the target`);
+  }
+  show('the three holds, no floor', sequential(pts, g, m1, (hs) => hs.length > 0, null).trades, risk);
+  const all = sequential(pts, g, m1, (hs) => hs.length > 0, 1);
+  show('all four (floor 1 ATR)', all.trades, risk, `; ${all.trades.filter((x) => x.widened).length} widened, ${all.refused - base.refused} refused for the target`);
+}
+
+/** The same on the live entries: the dossiers of data/trader-log.jsonl, the real results from the journal, the simulation on the minute bars. */
+async function rulesLive(): Promise<void> {
+  const g = lastLiveDossier().guardrails;
+  const m1 = await liveMinuteBars(Date.UTC(2026, 9, 21));
+  const records = readLines<{ ts: number; dossier?: TraderDossier; decision?: TraderDecision | null; verdict: string }>(`${ROOT}data/trader-log.jsonl`);
+  const journal = JSON.parse(readFileSync(`${ROOT}data/journal.trader.json`, 'utf8')) as { trades: Array<{ trade: { source: string; status: string; direction: string; openedAt: number; netPnl: string; closeReason: string } }> };
+  const closed = journal.trades.map((x) => x.trade).filter((t) => t.source === 'trader' && t.status === 'closed');
+  const out: Array<RuleRow & { side: string; real: number | null; end: string }> = [];
+  for (const r of records) {
+    const d = r.decision;
+    if (!r.dossier || !d || (d.action !== 'long' && d.action !== 'short')) continue;
+    const m = /^(limit )?(long|short) .*?at ([\d.]+), stop ([\d.]+)/.exec(r.verdict);
+    if (!m) continue;
+    const v = checkDecision(d, r.dossier.mark, g, null);
+    if (!v.ok || (v.action !== 'long' && v.action !== 'short')) continue;
+    const f = { i: at(m1, r.ts), entry: Number(m[3]), fee: m[1] ? MAKER : TAKER };
+    if (f.i >= m1.length) continue;
+    const real = closed.find((t) => t.direction === v.action && t.openedAt >= r.ts && t.openedAt < r.ts + 20 * MIN) ?? null;
+    out.push({ ...ruleRow(d, r.dossier, g, f, m1, v), side: v.action, real: real ? Number(real.netPnl) : null, end: real?.closeReason ?? '-' });
+  }
+  console.log(`\n== the live entries since 2026-10-21 (${out.length}) and what the rules would have read at each: real = the account's result with the model's own exits; sim = A, the live structure run to its stop or target, as decided and with the stop at 1 daily ATR (a different structure from the real exits: read it for whether the stop survives, not for the money)`);
+  for (const r of out) console.log(`  ${new Date(r.t).toISOString().slice(5, 16)} ${r.side.padEnd(5)} real ${r.real === null ? '   open' : r.real.toFixed(0).padStart(7)} ${r.end.padEnd(8)} sim ${r.base.toFixed(2).padStart(6)}R  floor ${r.floor === null ? 'refused' : `${r.floor.toFixed(2).padStart(6)}R`}  ${r.holds.map(holdKind).join(',') || '-'}`);
+  console.log(`  real total ${out.reduce((s, r) => s + (r.real ?? 0), 0).toFixed(0)} USDT over ${out.filter((r) => r.real !== null).length} closed trades: too few to score a rule on`);
+}
+
 const [cmd, arg] = process.argv.slice(2);
-const commands: Record<string, () => Promise<void>> = { build, check, pilot: () => pilot(Number(arg ?? 3)), submit, collect, score };
+const commands: Record<string, () => Promise<void>> = { build, check, pilot: () => pilot(Number(arg ?? 3)), submit, collect, score, rules: () => (arg === 'live' ? rulesLive() : rules()) };
 const run = commands[cmd ?? ''];
 if (!run) {
   console.log(`usage: tsx scripts/trader-replay.ts ${Object.keys(commands).join('|')}`);

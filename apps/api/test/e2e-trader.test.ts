@@ -57,8 +57,12 @@ class ScriptedModel implements TraderModel {
 
 const decide = (over: Partial<TraderDecision>): TraderDecision => ({ action: 'flat', entryType: 'market', limitPrice: null, stopPx: null, targetPx: null, confidence: 0.55, reasons: ['测试'], invalidation: '测试', oneLiner: '测试', recheckMinutes: 60, wakeAbove: null, wakeBelow: null, ...over });
 
-/** Flat synthetic candles around PRICE, confirmed up to the clock; the forming bar last. weeklyRise: weekly closes rising 1% a week to PRICE (a weekly bull trend). */
-function sources(clock: { now: number }, mark: () => string | null, weeklyRise = false): TraderDossierSources {
+/**
+ * Flat synthetic candles around PRICE, confirmed up to the clock; the forming bar last. The weekly closes rise (bull) or
+ * fall (bear) 1% a week to PRICE: a weekly trend, since entries are held without one. The daily wicks are 50 wide so that
+ * the day's range of the flat bars stays within 1.5 daily ATR.
+ */
+function sources(clock: { now: number }, mark: () => string | null, weekly: 'bull' | 'bear' = 'bull'): TraderDossierSources {
   const durations: Record<TraderBar, number> = { '15m': M15, '1H': H, '4H': 4 * H, '1D': 24 * H, '1W': 7 * 24 * H };
   return {
     async candles(_instId, bar, limit) {
@@ -68,9 +72,9 @@ function sources(clock: { now: number }, mark: () => string | null, weeklyRise =
       for (let i = limit - 1; i >= 0; i--) {
         const ts = forming - i * d;
         const wiggle = (i % 7) - 3;
-        // the weekly is flat (no weekly trend: nothing counter) unless weeklyRise
-        const close = bar !== '1W' ? PRICE + wiggle : weeklyRise ? Math.round(PRICE * 0.99 ** i) : PRICE;
-        out.push({ ts, open: String(close - 1), high: String(close + 5), low: String(close - 5), close: String(close), vol: '10', volCcy: '0', confirm: ts < forming });
+        const close = bar !== '1W' ? PRICE + wiggle : Math.round(PRICE * (weekly === 'bull' ? 0.99 : 1.01) ** i);
+        const wick = bar === '1D' ? 50 : 5;
+        out.push({ ts, open: String(close - 1), high: String(close + wick), low: String(close - wick), close: String(close), vol: '10', volCcy: '0', confirm: ts < forming });
       }
       return out;
     },
@@ -103,7 +107,7 @@ async function waitFor<T>(fn: () => T | undefined | null | false, timeoutMs = 50
   }
 }
 
-async function startStack(maxTradesPerDay: string, start: number, cadence: 'hourly' | 'model' = 'hourly', weeklyRise = false): Promise<Stack> {
+async function startStack(maxTradesPerDay: string, start: number, cadence: 'hourly' | 'model' = 'hourly', weekly: 'bull' | 'bear' = 'bull'): Promise<Stack> {
   const dir = mkdtempSync(join(tmpdir(), 'pegasus-trader-'));
   const mock = await startMockOkx({ port: 0, seed: 7, tickIntervalMs: 50, volatility: 0, posMode: 'net_mode', initialPrices: { [BTC]: String(PRICE) }, initialBalanceUsdt: '5600' });
   const config = loadConfig({
@@ -156,7 +160,7 @@ async function startStack(maxTradesPerDay: string, start: number, cadence: 'hour
       await new Promise((r) => setTimeout(r, Math.min(ms, 5)));
     },
     model,
-    sources: sources(clock, () => market.liveMarkPrice(BTC) ?? null, weeklyRise),
+    sources: sources(clock, () => market.liveMarkPrice(BTC) ?? null, weekly),
     macro: { read: async () => structuredClone(stack.macro) },
     checkEveryMs: 0,
     pollMs: 1,
@@ -623,7 +627,7 @@ describe('the trader watches the mark between closes', () => {
 describe('an entry against the weekly trend (the owner, 2026-11-05)', () => {
   let s: Stack;
   beforeAll(async () => {
-    s = await startStack('3', DAY + 13 * H + 45 * 60_000 + 5_000, 'hourly', true);
+    s = await startStack('3', DAY + 13 * H + 45 * 60_000 + 5_000, 'hourly', 'bull');
   }, 30_000);
   afterAll(async () => {
     await stopStack(s);

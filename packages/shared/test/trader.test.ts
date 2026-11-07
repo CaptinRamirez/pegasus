@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { D } from '../src/decimal.js';
-import { checkDecision, DEFAULT_TRADER_GUARDRAILS, traderTrend, ladderFirstTarget, traderBreakEven, recentTradesOf, swingPoints, traderCosts, wakeOf, emaAlignment, emaLast, emaSeries, estimateUsd, inTraderSession, macd, minutesTo, roundLevels, rsi, traderSize, volumeRatio, vwap, type TraderDecision, type TraderFrame, type TraderPosition } from '../src/trader.js';
+import { checkDecision, DEFAULT_TRADER_GUARDRAILS, traderHolds, traderTrend, ladderFirstTarget, traderBreakEven, recentTradesOf, swingPoints, traderCosts, wakeOf, emaAlignment, emaLast, emaSeries, estimateUsd, inTraderSession, macd, minutesTo, roundLevels, rsi, traderSize, volumeRatio, vwap, type TraderBarRow, type TraderDecision, type TraderFrame, type TraderPosition } from '../src/trader.js';
 import type { Candle, Instrument } from '../src/types.js';
 
 const inst: Instrument = {
@@ -136,6 +136,33 @@ describe('checkDecision', () => {
     expect(checkDecision(decision({ action: 'short', stopPx: '82450', targetPx: '81700' }), '82150', g, null, { trend: bull })).toMatchObject({ ok: true, counter: true });
     expect(checkDecision(decision({ action: 'long', stopPx: '81700', targetPx: '82500' }), '82000', g, null, { trend: bull })).toMatchObject({ ok: true, counter: false });
     expect(checkDecision(decision({ action: 'long', stopPx: '81700', targetPx: '82500' }), '82000', g, null, { trend: bear })).toMatchObject({ ok: false, reason: /RSI14 is above 70/ });
+  });
+
+  it('holds entries (the owner, 2026-11-07): no weekly trend, a big event, a big move; and widens a stop to one daily ATR', () => {
+    const frame = (bar: '1H' | '1D' | '1W', f: Partial<TraderFrame>): TraderFrame => ({ bar, asOf: 0, close: '80000', ema5: null, ema10: null, ema21: null, ema50: null, ema200: null, alignment: null, macd: null, rsi14: null, atr14: null, volumeRatio: null, bars: [], swings: [], ...f });
+    const bar = (ts: number, hi: number, lo: number): TraderBarRow => [ts, '80000', String(hi), String(lo), '80000', '1'];
+    const quiet = Array.from({ length: 24 }, (_, i) => bar(i, 80500, 79500));
+    const wild = [...quiet.slice(0, 23), bar(23, 83000, 79500)];
+    const weekly = frame('1W', { ema21: '76733', alignment: 'bull', macd: { macd: '0', signal: '0', hist: '1277', histRising: false }, rsi14: '52.3' });
+    const daily = frame('1D', { close: '80000', rsi14: '45', atr14: '2000' });
+    const bull = traderTrend([daily, weekly]);
+    const now = Date.UTC(2026, 10, 7, 12);
+    expect(traderHolds({ now, trend: bull, frames: [frame('1H', { bars: quiet }), daily, weekly], calendar: [] })).toEqual([]);
+    expect(traderHolds({ now, trend: { weekly: null, counterSide: null, barredSide: null }, frames: [daily], calendar: [] })).toEqual([expect.stringMatching(/no weekly trend/)]);
+    // the election results of the night of 2026-11-03: held from 22:00 UTC on the 3rd to the end of the 5th
+    expect(traderHolds({ now: Date.UTC(2026, 10, 3, 21, 59), trend: bull, frames: [daily], calendar: [] })).toEqual([]);
+    expect(traderHolds({ now: Date.UTC(2026, 10, 5, 23, 59), trend: bull, frames: [daily], calendar: [] })).toEqual([expect.stringMatching(/US midterm election results.*until 2026-11-06T00:00:00/)]);
+    // a big US release of the calendar gets the same window; a medium-impact or another release does not
+    const fomc = { time: Date.UTC(2026, 11, 9, 19), title: 'FOMC Statement', country: 'USD', impact: 'High' };
+    expect(traderHolds({ now: Date.UTC(2026, 11, 10, 23), trend: bull, frames: [daily], calendar: [fomc] })).toEqual([expect.stringMatching(/FOMC Statement/)]);
+    expect(traderHolds({ now: Date.UTC(2026, 11, 10, 23), trend: bull, frames: [daily], calendar: [{ ...fomc, impact: 'Medium' }, { ...fomc, title: 'ISM Services PMI' }] })).toEqual([]);
+    expect(traderHolds({ now, trend: bull, frames: [frame('1H', { bars: wild }), daily, weekly], calendar: [] })).toEqual([expect.stringMatching(/range 3500 is beyond 1.5 daily ATR \(2000\)/)]);
+    expect(checkDecision(decision({ action: 'long', stopPx: '81700', targetPx: '82500' }), '82000', g, null, { holds: ['no weekly trend'] })).toMatchObject({ ok: false, reason: /entries are held: no weekly trend/ });
+    // the stop floor: a stop 300 from the entry at an ATR of 2000.5 is placed 2000.5 away, to the tick; the target must reach as far
+    expect(checkDecision(decision({ action: 'long', stopPx: '81700', targetPx: '85000' }), '82000', g, null, { atr: '2000.5', tickSz: '0.1' })).toMatchObject({ ok: true, stopPx: '79999.5', targetPx: '85000', note: /widened from 81700 to 79999.5/ });
+    expect(checkDecision(decision({ action: 'short', stopPx: '82300', targetPx: '79000' }), '82000', g, null, { atr: '2000.5', tickSz: '0.1' })).toMatchObject({ ok: true, stopPx: '84000.5' });
+    expect(checkDecision(decision({ action: 'long', stopPx: '81700', targetPx: '82500' }), '82000', g, null, { atr: '2000' })).toMatchObject({ ok: false, reason: /target 82500 is closer than the stop 80000/ });
+    expect(checkDecision(decision({ action: 'long', stopPx: '79000', targetPx: '85000' }), '82000', g, null, { atr: '2000' })).toEqual({ ok: true, action: 'long', entryType: 'market', entryPx: '82000', stopPx: '79000', targetPx: '85000', counter: false });
   });
 
   it('a limit entry is measured from its price', () => {

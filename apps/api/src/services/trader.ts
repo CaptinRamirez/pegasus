@@ -354,7 +354,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       // the stop or the target took the position while the model was thinking: said as such, not as a refusal on the mark
       const gone = held !== null && (decision.action === 'close' || decision.action === 'tighten_stop') && !this.livePosition();
       const fundingPoints = !gone && decision.action === 'tighten_stop' && held ? await this.fundingPoints(held) : '0';
-      const verdict: TraderVerdict = gone ? { ok: false, action: decision.action, reason: POSITION_GONE } : checkDecision(decision, mark, this.config.guardrails, held, { tickSz: this.deps.market.requireInstrument(this.config.instId).tickSz, fundingPoints, trend: dossier.trend });
+      const verdict: TraderVerdict = gone ? { ok: false, action: decision.action, reason: POSITION_GONE } : checkDecision(decision, mark, this.config.guardrails, held, { tickSz: this.deps.market.requireInstrument(this.config.instId).tickSz, fundingPoints, trend: dossier.trend, holds: dossier.holds, atr: dossier.frames.find((f) => f.bar === '1D')?.atr14 ?? null });
       if (!verdict.ok) verdictText = `not carried out: ${verdict.reason}`;
       else {
         const blocked = verdict.action === 'long' || verdict.action === 'short' ? this.entryBlocked(bar, equity) : null;
@@ -513,6 +513,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     const sizing = verdict.counter ? { riskPct: g.counterRiskPct, maxLeverage: g.counterMaxLeverage } : g;
     const closeAt = verdict.counter ? { closeAt: now + g.counterMaxHoldMs } : {};
     const counterNote = 'closeAt' in closeAt ? `, against the weekly trend: ${D(g.counterRiskPct).mul(100).toFixed()}% risk, closed at the market from ${iso(closeAt.closeAt)}` : '';
+    const floorNote = verdict.note ? `, ${verdict.note}` : '';
     const size = traderSize({ equity, entryPx: verdict.entryPx, stopPx: verdict.stopPx, inst, guardrails: sizing });
     if (size === null) return { executed: false, note: `not carried out: ${D(equity).mul(sizing.riskPct).toFixed(2)} of risk at that stop buys less than the minimum order` };
     const side = verdict.action;
@@ -536,7 +537,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     if (verdict.entryType === 'limit') {
       this.record({ ts: now, kind: 'execution', instId, order: { clOrdId, side: req.side, entryType: 'limit', contracts: size.contracts, entryPx: verdict.entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, leverage: size.leverage } });
       this.state.pendingLimit = { clOrdId, side, contracts: size.contracts, px: verdict.entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, leverage: size.leverage, placedAt: now, barTs: bar, equityAtEntry: equity, ...closeAt };
-      return { executed: true, note: `limit ${side} resting at ${verdict.entryPx}, stop ${verdict.stopPx}${counterNote}` };
+      return { executed: true, note: `limit ${side} resting at ${verdict.entryPx}, stop ${verdict.stopPx}${counterNote}${floorNote}` };
     }
     // Booked at the fill (the 2026-10-28 audit: the mark the model saw is not the price it got): the exchange reports the
     // position a moment after a market order fills; the mark stands in when it has not within two seconds.
@@ -555,7 +556,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     if (!live) this.log.warn({ clOrdId, contracts, mark }, 'no position reported within two seconds of the market order: booked at the planned size and the mark');
     this.record({ ts: now, kind: 'execution', instId, order: { clOrdId, side: req.side, entryType: 'market', contracts, entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, leverage: size.leverage } });
     this.openPosition({ side, contracts, entryPx, stopPx: verdict.stopPx, targetPx: verdict.targetPx, openedAt: now, clOrdId, equityAtEntry: equity, ...closeAt }, mark, bar);
-    return { executed: true, note: `${side} ${contracts} contracts at ${entryPx}${filled ? '' : ' (the mark: no fill reported within 2 s)'}, stop ${verdict.stopPx}${verdict.targetPx ? `, target ${verdict.targetPx}` : ''}, ${size.leverage}x${counterNote}` };
+    return { executed: true, note: `${side} ${contracts} contracts at ${entryPx}${filled ? '' : ' (the mark: no fill reported within 2 s)'}, stop ${verdict.stopPx}${verdict.targetPx ? `, target ${verdict.targetPx}` : ''}, ${size.leverage}x${counterNote}${floorNote}` };
   }
 
   private openPosition(position: TraderPosition, mark: string, bar: number): void {

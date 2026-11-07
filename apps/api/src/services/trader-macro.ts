@@ -1,4 +1,4 @@
-import type { TraderHeadline, TraderMacro, TraderMacroEvent } from '@pegasus/shared';
+import { TRADER_BIG_RELEASE, type TraderHeadline, type TraderMacro, type TraderMacroEvent } from '@pegasus/shared';
 
 /**
  * The macro block of the trader's dossier: the economic calendar (ForexFactory's weekly JSON, the free feed most
@@ -79,12 +79,17 @@ export function parseRss(xml: string, source: string): RawHeadline[] {
   return out;
 }
 
-/** The releases that matter around `now`: high impact anywhere and medium impact for the US, from two hours ago to a day ahead, oldest first. */
+/**
+ * The releases that matter around `now`: high impact anywhere and medium impact for the US, from two hours ago to a day
+ * ahead, oldest first; a big US release (TRADER_BIG_RELEASE) stays two days, since traderHolds holds entries through the
+ * day after it.
+ */
 export function calendarWindow(events: readonly RawCalendarEvent[], now: number): TraderMacroEvent[] {
   const out: TraderMacroEvent[] = [];
   for (const e of events) {
     const time = Date.parse(e.date);
-    if (!Number.isFinite(time) || time < now - 2 * HOUR_MS || time > now + 24 * HOUR_MS) continue;
+    const back = e.country === 'USD' && e.impact === 'High' && TRADER_BIG_RELEASE.test(e.title) ? 48 * HOUR_MS : 2 * HOUR_MS;
+    if (!Number.isFinite(time) || time < now - back || time > now + 24 * HOUR_MS) continue;
     if (!(e.impact === 'High' || (e.country === 'USD' && e.impact === 'Medium'))) continue;
     out.push({ time, title: e.title, country: e.country, impact: e.impact, forecast: e.forecast, previous: e.previous, minutesFromNow: Math.round((time - now) / MINUTE_MS) });
   }

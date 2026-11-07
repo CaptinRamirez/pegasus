@@ -190,6 +190,39 @@ export function traderTrend(frames: readonly TraderFrame[]): TraderTrend {
   return { weekly, counterSide: weekly === 'bull' ? 'short' : weekly === 'bear' ? 'long' : null, barredSide };
 }
 
+/**
+ * Why the code holds every entry at this moment (the owner, 2026-11-07, after three stops on 2026-11-04, the day after
+ * the US midterm election, two of them shorts against the weekly: 「无趋势就不下单不就得了？」, 「11 04是美国中期选举后的那几天，应该
+ * 小心才对」): no weekly trend; a big scheduled event (TRADER_BIG_EVENTS, and the calendar's high-impact US releases matching
+ * TRADER_BIG_RELEASE) from two hours before it to the end of the UTC day after its day; the last 24 hours' range beyond
+ * TRADER_RANGE_ATR daily ATRs (a big move has happened: the owner, 2026-10, 「有大动作就等，局势明朗再说」). One sentence each,
+ * for the model and the log; empty when entries are open.
+ */
+export const TRADER_BIG_EVENTS: ReadonlyArray<{ time: number; title: string }> = [
+  // the calendar carries releases, not elections; the results came in on the night of the 3rd
+  { time: Date.UTC(2026, 10, 4), title: 'US midterm election results' },
+];
+export const TRADER_BIG_RELEASE = /FOMC|Federal Funds|CPI|Non-Farm/i;
+export const TRADER_RANGE_ATR = '1.5';
+/** The least a stop may be from the entry, in daily ATR14s (checkDecision) */
+export const TRADER_STOP_ATR = '1';
+const DAY_MS = 24 * 3_600_000;
+
+export function traderHolds(input: { now: number; trend: TraderTrend; frames: readonly TraderFrame[]; calendar: ReadonlyArray<Pick<TraderMacroEvent, 'time' | 'title' | 'country' | 'impact'>> }): string[] {
+  const out: string[] = [];
+  if (input.trend.weekly === null) out.push('no weekly trend (the owner, 2026-11-07: 「无趋势就不下单」)');
+  const events = [...TRADER_BIG_EVENTS, ...input.calendar.filter((e) => e.country === 'USD' && e.impact === 'High' && TRADER_BIG_RELEASE.test(e.title))];
+  const big = events.find((e) => input.now >= e.time - 2 * 3_600_000 && input.now < Math.floor(e.time / DAY_MS) * DAY_MS + 2 * DAY_MS);
+  if (big) out.push(`big event: ${big.title} at ${new Date(big.time).toISOString()}, no entry until ${new Date(Math.floor(big.time / DAY_MS) * DAY_MS + 2 * DAY_MS).toISOString()} (the owner, 2026-11-07)`);
+  const last24 = input.frames.find((f) => f.bar === '1H')?.bars.slice(-24) ?? [];
+  const atr = input.frames.find((f) => f.bar === '1D')?.atr14 ?? null;
+  if (last24.length === 24 && atr !== null) {
+    const range = last24.reduce((hi, b) => Decimal.max(hi, b[2]), D(last24[0]![2])).minus(last24.reduce((lo, b) => Decimal.min(lo, b[3]), D(last24[0]![3])));
+    if (range.gt(D(atr).mul(TRADER_RANGE_ATR))) out.push(`the last 24 hours' range ${range.toFixed()} is beyond ${TRADER_RANGE_ATR} daily ATR (${atr}): a big move has happened, wait (the owner, 2026-11-07)`);
+  }
+  return out;
+}
+
 /** Price levels around the market, from the 15-minute bars and the daily ones. null when the bars do not reach. */
 export interface TraderLevels {
   prevDayHigh: string | null;
@@ -397,6 +430,8 @@ export interface TraderDossier {
   guardrails: TraderGuardrails;
   /** The weekly trend the code holds entries to, from the 1W and 1D frames */
   trend: TraderTrend;
+  /** Why the code refuses every entry at this moment (traderHolds); empty when entries are open */
+  holds: string[];
   /** Why the model is being asked now: the session's open, its own recheck time, a wake level, the position, a release */
   triggers: string[];
   /** The economic calendar and the headlines of the last hours */
@@ -450,7 +485,7 @@ export type TraderVerdict =
   | { ok: true; action: 'flat' }
   | { ok: true; action: 'close' }
   | { ok: true; action: 'tighten_stop'; stopPx: string; note?: string }
-  | { ok: true; action: 'long' | 'short'; entryType: 'market' | 'limit'; entryPx: string; stopPx: string; targetPx: string | null; counter: boolean }
+  | { ok: true; action: 'long' | 'short'; entryType: 'market' | 'limit'; entryPx: string; stopPx: string; targetPx: string | null; counter: boolean; note?: string }
   | { ok: false; action: TraderAction; reason: string };
 
 /**
@@ -484,12 +519,14 @@ export function traderBreakEven(side: 'long' | 'short', entryPx: DecimalInput, o
 /**
  * Whether a decision may be carried out: the stop on the losing side of the entry (where is the model's call), a target
  * (the ladder's second leg) beyond the stop's distance, a limit price near the mark, a close or a tighter stop only with
- * a position, an entry only without one, and none on `opts.trend`'s barred side (an entry on its counter side passes
- * with `counter`). A decision that fails is treated as `flat` and logged with the reason. A stop
+ * a position, an entry only without one, none while `opts.holds` names a reason (traderHolds) and none on `opts.trend`'s
+ * barred side (an entry on its counter side passes with `counter`). A stop closer to the entry than TRADER_STOP_ATR
+ * daily ATRs (`opts.atr`, the 1D ATR14) is placed at that distance, rounded to the tick away from the entry, with a note;
+ * the target must still be at least as far. A decision that fails is treated as `flat` and logged with the reason. A stop
  * moved while the position is in profit is kept beyond the break-even (traderBreakEven, with `opts.fundingPoints` and
  * `opts.tickSz`); one asked for on the losing side of it is placed at the break-even, with a note.
  */
-export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrails, held: TraderPosition | null, opts: { tickSz?: string; fundingPoints?: DecimalInput; trend?: TraderTrend } = {}): TraderVerdict {
+export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrails, held: TraderPosition | null, opts: { tickSz?: string; fundingPoints?: DecimalInput; trend?: TraderTrend; holds?: readonly string[]; atr?: string | null } = {}): TraderVerdict {
   const m = D(mark);
   const pct = (a: DecimalInput, b: DecimalInput): Decimal => D(a).minus(b).abs().div(b);
   if (d.action === 'flat') return { ok: true, action: 'flat' };
@@ -512,6 +549,7 @@ export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrai
   }
   // long or short
   if (held) return { ok: false, action: d.action, reason: `${d.action} while a ${held.side} is held` };
+  if (opts.holds && opts.holds.length > 0) return { ok: false, action: d.action, reason: `entries are held: ${opts.holds.join('; ')}` };
   if (opts.trend?.barredSide === d.action) return { ok: false, action: d.action, reason: `no ${d.action} while the daily RSI14 is ${d.action === 'short' ? 'below 30' : 'above 70'} (the owner, 2026-11-05)` };
   const counter = opts.trend?.counterSide === d.action;
   let entry = m;
@@ -521,16 +559,28 @@ export function checkDecision(d: TraderDecision, mark: string, g: TraderGuardrai
     if (pct(entry, m).gt(g.maxLimitDistancePct)) return { ok: false, action: d.action, reason: `the limit price ${d.limitPrice} is more than ${D(g.maxLimitDistancePct).mul(100).toFixed()}% from the mark ${mark}` };
   }
   if (!isDecimal(d.stopPx)) return { ok: false, action: d.action, reason: 'an entry without a stop price' };
-  const stop = D(d.stopPx);
+  let stop = D(d.stopPx);
   const long = d.action === 'long';
   if (long ? !stop.lt(entry) : !stop.gt(entry)) return { ok: false, action: d.action, reason: `the stop ${d.stopPx} is on the wrong side of the entry ${entry.toFixed()}` };
+  // the owner, 2026-11-07, after 23 entries with a median stop of 0.58 daily ATR and every stop-out within 0.75: a
+  // daily-level trade carries a daily-level stop. Widened to TRADER_STOP_ATR x the 1D ATR14; the size follows the stop.
+  let note: string | undefined;
+  if (opts.atr !== null && opts.atr !== undefined && isDecimal(opts.atr)) {
+    const floor = D(opts.atr).mul(TRADER_STOP_ATR);
+    if (entry.minus(stop).abs().lt(floor)) {
+      const tick = D(opts.tickSz ?? 0);
+      const raw = long ? entry.minus(floor) : entry.plus(floor);
+      stop = tick.gt(0) ? (long ? raw.div(tick).floor() : raw.div(tick).ceil()).mul(tick) : raw;
+      note = `stop widened from ${d.stopPx} to ${stop.toFixed()}: at least ${TRADER_STOP_ATR} daily ATR (${opts.atr}) from the entry (the owner, 2026-11-07)`;
+    }
+  }
   // the ladder take-profit closes the rest at the target: an entry needs one (2026-11-03)
   if (d.targetPx === null) return { ok: false, action: d.action, reason: 'an entry without a target: the ladder take-profit closes half at 0.5 R and the rest at the target' };
   if (!isDecimal(d.targetPx)) return { ok: false, action: d.action, reason: 'the target is not a price' };
   const t = D(d.targetPx);
   if (long ? !t.gt(entry) : !t.lt(entry)) return { ok: false, action: d.action, reason: `the target ${d.targetPx} is on the wrong side of the entry` };
-  if (t.minus(entry).abs().lt(stop.minus(entry).abs())) return { ok: false, action: d.action, reason: 'the target is closer than the stop: less than one to one' };
-  return { ok: true, action: d.action, entryType: d.entryType, entryPx: entry.toFixed(), stopPx: stop.toFixed(), targetPx: t.toFixed(), counter };
+  if (t.minus(entry).abs().lt(stop.minus(entry).abs())) return { ok: false, action: d.action, reason: `the target ${d.targetPx} is closer than the stop ${stop.toFixed()}: less than one to one${note ? ` (${note})` : ''}` };
+  return { ok: true, action: d.action, entryType: d.entryType, entryPx: entry.toFixed(), stopPx: stop.toFixed(), targetPx: t.toFixed(), counter, ...(note ? { note } : {}) };
 }
 
 /**
