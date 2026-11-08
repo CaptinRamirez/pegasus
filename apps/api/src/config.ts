@@ -2,7 +2,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { defaultEndpoints, type OkxCredentials, type OkxEndpoints } from '@pegasus/okx';
-import { CAMPAIGN_INSTRUMENTS, D, DEFAULT_CAMPAIGN_PARAMS, DEFAULT_POT_PARAMS, DEFAULT_TRADER_GUARDRAILS, SIGNAL_PHASE_HOURS, type CampaignStructure, type RiskConfig, type SignalPhase, type TdMode, type TraderGuardrails } from '@pegasus/shared';
+import { CAMPAIGN_INSTRUMENTS, D, DEFAULT_CAMPAIGN_PARAMS, DEFAULT_POT_PARAMS, DEFAULT_TRADER_GUARDRAILS, LEADER_INSTRUMENTS, SIGNAL_PHASE_HOURS, type CampaignStructure, type RiskConfig, type SignalPhase, type TdMode, type TraderGuardrails } from '@pegasus/shared';
 import type { BooksConfig } from './services/books.js';
 import type { WhalesConfig } from './services/whales.js';
 import type { TraderEffort } from './services/trader-model.js';
@@ -92,7 +92,7 @@ const envSchema = z.object({
    */
   TRAILING_STATE_FILE: z.string().default(''),
 
-  /** '1' keeps the five paper books (docs/proposals/paper-books-2026-11.md) on OKX's public data; the launcher sets it on the plain paper stack only. */
+  /** '1' keeps the six paper books (docs/proposals/paper-books-2026-11.md) on OKX's public data; the launcher sets it on the plain paper stack only. */
   BOOKS_ENABLED: z.enum(['0', '1']).default('0'),
   BOOKS_FILE: z.string().min(1).default('data/books.json'),
   /** What each book starts with, USDT */
@@ -102,6 +102,13 @@ const envSchema = z.object({
 
   /** '1' runs the Claude auto trader (docs/proposals/claude-auto-trader.md): paper trading only, on a stack of its own (never with CAMPAIGN_ENABLED=1). */
   TRADER_ENABLED: z.enum(['0', '1']).default('0'),
+  /**
+   * leader (the default since 2026-11-08): the lead-trader style of services/trader-leader.ts, BTC and ETH long only in lots,
+   * cross margin, no stop, the breaker at 40% (LEADER_RULES in @pegasus/shared). stops: the earlier style of services/trader.ts,
+   * one position of TRADER_INSTRUMENT with a stop and a target. The two keep separate state files: a flat file of the other
+   * style is moved aside, one with a position blocks the trader.
+   */
+  TRADER_STYLE: z.enum(['leader', 'stops']).default('leader'),
   /** The one USDT swap it trades; tracked like INSTRUMENTS while the trader is enabled. */
   TRADER_INSTRUMENT: z.string().default('BTC-USDT-SWAP'),
   /** The window in which it opens positions, UTC hours start-end (the US cash session is 13:30 to 20:00 UTC). */
@@ -180,6 +187,8 @@ export interface CampaignConfig {
 /** The Claude auto trader (services/trader.ts). */
 export interface TraderConfig {
   enabled: boolean;
+  /** leader: services/trader-leader.ts on LEADER_INSTRUMENTS; stops: services/trader.ts on instId */
+  style: 'leader' | 'stops';
   instId: string;
   guardrails: TraderGuardrails;
   model: string;
@@ -242,7 +251,7 @@ export interface AppConfig {
   exits: ExitsConfig;
   /** The Claude auto trader; `enabled` only in paper trading, never with the campaign on the same stack. */
   trader: TraderConfig;
-  /** The five paper books (services/books.ts). */
+  /** The six paper books (services/books.ts). */
   books: BooksConfig;
   /** The Hyperliquid whale recorder (services/whales.ts); on with the books. */
   whales: WhalesConfig;
@@ -321,6 +330,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     });
   const trader: TraderConfig = {
     enabled: traderEnabled,
+    style: e.TRADER_STYLE,
     instId: traderInst,
     guardrails: { ...DEFAULT_TRADER_GUARDRAILS, riskPct: e.TRADER_RISK_PCT, maxTradesPerDay: e.TRADER_MAX_TRADES_PER_DAY, dailyLossPct: e.TRADER_DAILY_LOSS_PCT, maxConsecutiveLosses: e.TRADER_MAX_CONSECUTIVE_LOSSES, sessionStartHour: sessionStart, sessionEndHour: sessionEnd },
     model: e.TRADER_MODEL,
@@ -335,8 +345,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   // The campaign's instruments are tracked like the terminal's own (market data, the instrument list, positions)
   // whenever the market data is OKX's (live, demo, paper): the signals page shows the campaign rule on them, and
   // following a signal needs them tracked. A local mock (endpoints overridden) lists only its own instruments. The
-  // trader's instrument is tracked wherever the trader runs.
-  const tracked = traderEnabled ? [traderInst] : [];
+  // trader's instruments are tracked wherever the trader runs.
+  const tracked = traderEnabled ? (e.TRADER_STYLE === 'leader' ? [...LEADER_INSTRUMENTS] : [traderInst]) : [];
   const instruments = campaignEnabled || !overridden ? [...new Set([...ownInstruments, ...campaignInstruments, ...tracked])] : [...new Set([...ownInstruments, ...tracked])];
   const phaseNames = e.SIGNAL_PHASES.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
   const unknownPhases = phaseNames.filter((s) => !SIGNAL_PHASE_HOURS.some((h) => String(h) === s));

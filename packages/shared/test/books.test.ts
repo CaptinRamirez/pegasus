@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { D } from '../src/decimal.js';
-import { applyFunding, applyInterest, bookEquity, bookView, carryNegPlan, closePosition, hourlyBorrowRate, newBook, openPosition, regimeRead, type BookPrices, type BookQuote } from '../src/books.js';
+import { applyFunding, applyInterest, bookEquity, bookView, carryNegPlan, closePosition, hourlyBorrowRate, ladderPlan, newBook, openPosition, regimeRead, type BookPosition, type BookPrices, type BookQuote } from '../src/books.js';
+import type { MtfBar } from '../src/mtf-features.js';
 
 const pricesOf = (quotes: Record<string, BookQuote>, marks: Record<string, string> = {}): BookPrices => ({ quote: (id) => quotes[id], mark: (id) => marks[id] });
 
@@ -67,5 +68,29 @@ describe('the paper books', () => {
     b.curve = [[0, '10000'], [1, '12000'], [2, '9000'], [3, '11000']];
     const v = bookView(b, pricesOf({}));
     expect(v).toMatchObject({ equity: '10000.00', returnPct: '0.00', maxDrawdownPct: '-25.00' });
+  });
+
+  it('the ladder buys a first lot at the range low with a weak RSI, adds a daily ATR lower, and sells everything on a bounce in profit', () => {
+    const H = 3_600_000;
+    const DAY = 86_400_000;
+    // 25 closed daily bars ranging 90–120 with ranges of 4: the 20-day range is 90–120, the daily ATR14 about 4
+    const d1: MtfBar[] = Array.from({ length: 25 }, (_, i): MtfBar => [i * DAY, '104', String(i === 24 ? 120 : 110 + (i % 3)), String(i === 20 ? 90 : 100 - (i % 3)), '104', '1']);
+    const h1Of = (closes: number[]): MtfBar[] => closes.map((c, i): MtfBar => [i * H, String(c), String(c + 0.5), String(c - 0.5), String(c), '1']);
+    // 60 falling closes 110 → 80.5: RSI near 0, close in the lower 35% of the range → a first lot
+    expect(ladderPlan(h1Of(Array.from({ length: 60 }, (_, i) => 110 - i * 0.5)), d1, [])?.action).toBe('open');
+    // the same closes but still in the middle of the range: nothing
+    expect(ladderPlan(h1Of(Array.from({ length: 60 }, (_, i) => 130 - i * 0.5)), d1, [])).toBeNull();
+    const lot = (px: string, openedAt: number): BookPosition => ({ coin: 'ETH', openedAt, legs: [{ kind: 'perp', instId: 'ETH-USDT-SWAP', qty: '1', entryPx: px }], funding: '0', interest: '0', fees: '0' });
+    // a lot at 100, the close at 80.5: more than one ATR (about 4) under it → one more lot
+    expect(ladderPlan(h1Of(Array.from({ length: 60 }, (_, i) => 110 - i * 0.5)), d1, [lot('100', 0)])?.action).toBe('add');
+    // five lots already: no more
+    expect(ladderPlan(h1Of(Array.from({ length: 60 }, (_, i) => 110 - i * 0.5)), d1, [0, 1, 2, 3, 4].map((k) => lot(String(100 - k * 4), k)))).toBeNull();
+    // a bounce: 40 falling closes then 20 rising to 100, over the EMA20 with a strong RSI, the average entry 85 in profit → sell everything
+    const bounce = h1Of([...Array.from({ length: 40 }, (_, i) => 100 - i * 0.5), ...Array.from({ length: 20 }, (_, i) => 81 + i)]);
+    expect(ladderPlan(bounce, d1, [lot('90', 0), lot('80', 1)])?.action).toBe('close');
+    // the same bounce with the average entry above the close: carried
+    expect(ladderPlan(bounce, d1, [lot('110', 0), lot('105', 1)])?.action).not.toBe('close');
+    // too little history
+    expect(ladderPlan(h1Of([100, 99]), d1, [])).toBeNull();
   });
 });

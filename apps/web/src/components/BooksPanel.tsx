@@ -7,8 +7,8 @@ import { DASH, fmtLocalMinute, fmtNum, fmtSigned, fmtUtcMinute, signOf } from '.
 import { Countdown } from './campaign/CampaignSummary';
 import { LoadFailed } from './LoadFailed';
 
-/** One line colour per book, in this order (blue, orange, violet, yellow, magenta): checked for colour-blind separation as a set; the legend names each line. */
-export const BOOK_COLOR: Record<BookKey, string> = { regime: '#2a78d6', hold: '#eb6834', carryPos: '#6250d6', carryNeg: '#eda100', dipLong: '#e87ba4' };
+/** One line colour per book, in this order (blue, orange, violet, yellow, magenta, teal): checked for colour-blind separation as a set; the legend names each line. */
+export const BOOK_COLOR: Record<BookKey, string> = { regime: '#2a78d6', hold: '#eb6834', carryPos: '#6250d6', carryNeg: '#eda100', dipLong: '#e87ba4', ladder: '#139a8c' };
 
 const when = (ts: number): string => `${fmtLocalMinute(ts)} · ${fmtUtcMinute(ts)}`;
 

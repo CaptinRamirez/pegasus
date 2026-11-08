@@ -637,12 +637,13 @@ at 10x on a hard-capped pot. Settings (`.env`):
 | `CAMPAIGN_MIN_STAKE` | `5.6` | the smallest stake; one above `CAMPAIGN_POT_START` is refused |
 | `CAMPAIGN_STRUCTURE` | `pyramid` | `pyramid` (a campaign that works adds to itself) or `noadd` |
 | `CAMPAIGN_CUT_HOUR` | `0` | UTC hour the campaign's daily bars close at: `0` (OKX's own `1Dutc` / `12Hutc` bars) or `4`, `8`, `12`, `16`, `20` (bars built from its `4H` candles; the 12-hour closes are at it and 12 hours later). Followed by the campaign, `GET /api/campaign/signals`, channel trailing and the replay beside the pot; a pot keeps the cut it was started with (another setting blocks it with `LEDGER_UNREADABLE`). `20` adopted on 2026-10-18 |
-| `BOOKS_ENABLED` | `0` | `1` keeps the five paper books (`docs/proposals/paper-books-2026-11.md`) on OKX's public data; the launcher sets it on the plain paper stack and turns it off on the campaign and trader stacks |
+| `BOOKS_ENABLED` | `0` | `1` keeps the six paper books (`docs/proposals/paper-books-2026-11.md`) on OKX's public data; the launcher sets it on the plain paper stack and turns it off on the campaign and trader stacks |
 | `BOOKS_FILE` | `data/books.json` | the books' ledger |
 | `BOOKS_START` | `10000` | what each book starts with, USDT |
 | `WHALES_FILE` | `data/hyperliquid-whales.jsonl` | with `BOOKS_ENABLED=1`: every 4 hours, the Hyperliquid leaderboard's 100 largest accounts and their open positions, one JSON line per snapshot (`services/whales.ts`) |
 | `TRADER_ENABLED` | `0` | `1` runs the Claude auto trader (`docs/proposals/claude-auto-trader.md`); paper only, refused with `CAMPAIGN_ENABLED=1` on the same stack (`pnpm start --trader` sets everything) |
-| `TRADER_INSTRUMENT` | `BTC-USDT-SWAP` | the one USDT swap it trades; tracked while the trader is enabled |
+| `TRADER_STYLE` | `leader` | `leader` (since 2026-11-08): the lead-trader style of `services/trader-leader.ts`, BTC and ETH long only in lots of 10% of the equity, the next lot a daily ATR14 under the last, 5 lots a coin, all positions at most 1x the equity, cross margin, no stop, the breaker selling everything at a 40% loss from the start (`LEADER_RULES`, `checkLeaderDecision` in `packages/shared/src/trader.ts`); asked at every daily close, at its recheck time and at the levels it names, every day. `stops`: the earlier style of `services/trader.ts` below (one position of `TRADER_INSTRUMENT` with a stop and a target, weekdays). The styles keep separate state files: a flat file of the other style is moved aside (`.stops-v1`), one holding a position blocks the trader |
+| `TRADER_INSTRUMENT` | `BTC-USDT-SWAP` | the one USDT swap the `stops` style trades; the `leader` style trades `LEADER_INSTRUMENTS` (BTC and ETH), tracked while the trader is enabled |
 | `TRADER_SESSION` | `0-24` | UTC hours in which it is asked and opens positions, Monday to Friday (by default the whole weekday, Asia to America, for the owner's daily-level trades; `13-21` is the US session); there is none on the weekend, and a position is left to its stop outside it |
 | `TRADER_RISK_PCT` | `0.05` | loss accepted per trade, fraction of the equity (0.10 from the owner's "all out" of 2026-10-27 until the owner lowered it on 2026-11-05; at 10x a stop closer than 0.5% cannot use all of it) |
 | `TRADER_MAX_TRADES_PER_DAY` | `3` | |
@@ -651,7 +652,7 @@ at 10x on a hard-capped pot. Settings (`.env`):
 | `TRADER_MODEL` / `TRADER_EFFORT` | `claude-opus-5-5` / `high` | the model (the SDK reads `ANTHROPIC_API_KEY` from the environment; without it the trader is `blocked`) and its effort |
 | `TRADER_CADENCE` | `model` | `model`: the model names at every decision when it looks again (15 to 480 minutes) and the prices that wake it earlier; it is also asked at the session's first close of the day, right after a high-impact US release, and, between closes, as soon as the mark reaches a wake level (the mark is watched every 15 s, a hit asks at most once per 5 minutes); never at its stop or target, which the exchange executes. `hourly`: the hourly closes and the 15-minute closes that cross a level of the day; `15m`: every 15-minute close |
 | `TRADER_NEWS` | `1` | the economic calendar (ForexFactory's weekly feed: time, impact, forecast, previous) and the last six hours of headlines from the Federal Reserve, CNBC Economy, MarketWatch and Cointelegraph in the dossier (`services/trader-macro.ts`) |
-| `TRADER_CONTROL` | `1` | the coin-flip control beside the trader |
+| `TRADER_CONTROL` | `1` | the coin-flip control beside the `stops` style; the `leader` style's control is the mechanical ladder book of the plain paper stack |
 | `TRADER_CALENDAR` | | scheduled events the model is told about, `YYYY-MM-DD name;...` |
 | `TRADER_STATE_FILE` / `TRADER_LOG_FILE` | `data/trader-state.json` / `data/trader-log.jsonl` | its state and its decision log |
 | `CAMPAIGN_STATE_FILE` | `data/campaign-ledger.json` | the campaign's ledger (below), under the repository root unless the path is absolute; kept in this file whichever store the API uses. It belongs to the paper account the pot runs on: a new paper account wants a new ledger |
@@ -1075,14 +1076,23 @@ Error codes returned by the API:
 
 ## Trader (`GET /api/trader`, `GET /api/trader/log`)
 
-The Claude auto trader of `docs/proposals/claude-auto-trader.md` (`services/trader.ts`): paper only, on a stack of its own
-(`pnpm start --trader`, `TRADER_ENABLED=1`, never with the campaign on the same account). Both routes answer on every
-stack; where the trader is disabled the view has `enabled: false` and status `disabled`.
+The Claude auto trader of `docs/proposals/claude-auto-trader.md` (`services/trader-leader.ts` with `TRADER_STYLE=leader`, the
+default; `services/trader.ts` with `stops`): paper only, on a stack of its own (`pnpm start --trader`, `TRADER_ENABLED=1`,
+never with the campaign on the same account). Both routes answer on every stack; where the trader is disabled the view has
+`enabled: false` and status `disabled`.
 
 ```ts
 GET /api/trader -> TraderView (packages/shared/src/trader.ts)
 {
   enabled: boolean;
+  style: 'stops' | 'leader';
+  leader?: {                                          // the leader style: its rules, ladders and breaker
+    rules: { lotShare; maxLots; addAtr; maxExposure; breakerPct; recheckMinMinutes; recheckMaxMinutes };
+    startEquity: string; breakerEquity: string;       // the equity the record began with, and (1 - breakerPct) of it
+    exposure: string; exposurePct: string;            // every position at the marks, and as a fraction of the equity
+    halted: string | null;                            // why the trader stopped (the breaker); status blocked, reason BREAKER
+    coins: Array<{ instId; lots: Array<{ contracts; entryPx; openedAt; clOrdId }>; contracts; avgPx; lastLotPx; notional; unrealizedPnl; atr; nextAddBelow; wake }>;
+  };
   cadence: 'model' | 'hourly' | '15m';
   wake: { at: number; above: string | null; below: string | null; setAt: number } | null;   // the next look the model asked for
   upcoming: TraderMacroEvent[];                      // releases still to come in the next day
@@ -1093,16 +1103,16 @@ GET /api/trader -> TraderView (packages/shared/src/trader.ts)
   guardrails: TraderGuardrails;                        // riskPct, maxTradesPerDay, dailyLossPct, maxConsecutiveLosses, cooldownMs, session hours, maxLeverage, maxLimitDistancePct (a stop closer to the entry than one daily ATR14 is widened to it; the dossier's `holds` names why every entry is refused at the moment: no weekly trend, the day of and after a big US release or election, the last 24 hours' range beyond 1.5 daily ATR), counterRiskPct / counterMaxLeverage / counterMaxHoldMs (an entry against the weekly trend of the dossier's `trend`: 2%, 3x, closed at the market after 12 hours; position.closeAt)
   model: string;
   nextCallAt: number | null;                           // the next hourly close in session (every 15 minutes with TRADER_CADENCE=15m); Monday's open over the weekend
-  last: { ts; decision: TraderDecision | null; verdict: string; executed: boolean; usage; triggers: string[]; error: string | null } | null;
-  position: TraderPosition & { unrealizedPnl: string | null } | null;
+  last: { ts; decision: TraderDecision | LeaderDecision | null; verdict: string; executed: boolean; usage; triggers: string[]; error: string | null } | null;   // LeaderDecision: action buy | sell | hold, confidence, reasons, invalidation, oneLiner, recheckMinutes, wakeAbove, wakeBelow
+  position: TraderPosition & { unrealizedPnl: string | null } | null;   // null in the leader style (see leader.coins)
   today: { date; trades; pnl; consecutiveLosses; cooldownUntil; equityAtStart };
   usageToday: { calls; inputTokens; outputTokens; estimatedUsd };
   control: { position; trades; pnlTotal; wins; losses } | null;   // the coin-flip control (TRADER_CONTROL=1); its position carries tp1Px until the ladder's first leg fills, then banked
-  recent: TraderTradeResult[];                         // newest first, at most 50
+  recent: TraderTradeResult[];                         // newest first, at most 50; in the leader style each carries instId and ends by close (the model's sale), breaker or external, its pnl the lots against the mark less taker fees (funding not in it; the journal has the exact trade)
   serverTime: number;
 }
 
-GET /api/trader/log?limit=30 -> { records: TraderLogRecord[] }   // newest first, 1 to 200, each record without its dossier
+GET /api/trader/log?limit=30 -> { records: TraderLogRecord[] }   // newest first, 1 to 200, each record without its dossier; the leader style's executions carry `lot` ({ clOrdId, side: buy | sell, contracts, px, lots, notional }) instead of `order`
 ```
 
 The decision log itself is `TRADER_LOG_FILE` (`data/trader-log.jsonl`): one JSON line per decision (with the whole dossier the
@@ -1113,10 +1123,12 @@ filled, the trader moves the rest's stop on from the entry to the break-even (th
 
 ## Paper books (`GET /api/books`)
 
-Five ledgers of `BOOKS_START` USDT each (`services/books.ts`, arithmetic in `packages/shared/src/books.ts`), settled on
+Six ledgers of `BOOKS_START` USDT each (`services/books.ts`, arithmetic in `packages/shared/src/books.ts`), settled on
 OKX's public data rather than on the paper exchange: the two-line regime on BTC-USDT spot and its buy-and-hold control,
-the positive carry (BTC and ETH spot long, perp short), the negative carry (perp long, the borrowed coin sold spot) and
-the dip long (5-day perp longs on 30 coins whose 1H/4H/1D/1W features meet one of 20 trained rules, `packages/shared/src/mtf-features.ts`).
+the positive carry (BTC and ETH spot long, perp short), the negative carry (perp long, the borrowed coin sold spot),
+the dip long (5-day perp longs on 30 coins whose 1H/4H/1D/1W features meet one of 20 trained rules, `packages/shared/src/mtf-features.ts`)
+and the ladder (ETH and BTC perps bought in lots of 10% of the start on the way down, up to 5 a coin, never stopped, sold
+together on the bounce when in profit; decided every hour once the 1H bars are confirmed).
 Fills at the ask and the bid of OKX's tickers at its taker fees (spot 0.1%, swap 0.05%); funding as OKX settles it;
 borrow interest hourly at the higher of OKX's posted base rate and its latest Simple Earn lending rate; the hedged legs
 are not margined. The route answers on every stack; where the books do not run, `enabled` is false.
@@ -1127,7 +1139,7 @@ GET /api/books -> BooksView (packages/shared/src/books.ts)
   enabled: boolean;
   status: 'disabled' | 'starting' | 'running';
   error: string | null;                                // the last look's failure; tried again every minute
-  books: BookView[];                                   // regime, hold, carryPos, carryNeg: equity, returnPct, maxDrawdownPct, positions (legs, funding, interest, fees, value), hourly curve, the last 60 events
+  books: BookView[];                                   // regime, hold, carryPos, carryNeg, dipLong, ladder: equity, returnPct, maxDrawdownPct, positions (legs, funding, interest, fees, value), hourly curve, the last 60 events
   regime: { ts; bull; close; sma200; sma50w } | null;  // the two lines as last read
   nextDecisionAt: number | null;                       // 00:05 UTC of the next day
   serverTime: number;

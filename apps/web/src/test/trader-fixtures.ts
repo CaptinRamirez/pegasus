@@ -46,6 +46,7 @@ export const flatDecision: TraderDecision = {
 
 export const enabledView: TraderView = {
   enabled: true,
+  style: 'stops',
   cadence: 'model',
   wake: { at: NOW + 30 * 60_000, above: '83000', below: '81200', setAt: NOW - 30 * 60_000 },
   upcoming: [

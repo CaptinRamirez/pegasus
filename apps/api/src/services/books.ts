@@ -13,6 +13,9 @@ import {
   DIP_MAX_POSITIONS,
   DIP_RULES,
   DIP_SHARE,
+  LADDER_COINS,
+  LADDER_SHARE,
+  ladderPlan,
   mtfFeatures,
   newBook,
   ruleHolds,
@@ -38,14 +41,15 @@ import {
 } from '@pegasus/shared';
 
 /**
- * The five paper books (docs/proposals/paper-books-2026-11.md), on the plain paper stack (BOOKS_ENABLED=1, set by the
+ * The six paper books (docs/proposals/paper-books-2026-11.md), on the plain paper stack (BOOKS_ENABLED=1, set by the
  * launcher): the two-line regime and its buy-and-hold control on BTC-USDT spot, the positive carry (BTC and ETH spot
- * long, perp short), the negative carry (a long perp hedged by a borrowed coin sold spot) and the dip long (packages/
- * shared/src/mtf-features.ts: 5-day longs on the coins whose 1H/4H/1D/1W features meet a rule), each a ledger of its own
+ * long, perp short), the negative carry (a long perp hedged by a borrowed coin sold spot), the dip long (packages/
+ * shared/src/mtf-features.ts: 5-day longs on the coins whose 1H/4H/1D/1W features meet a rule) and the ladder (ETH and
+ * BTC perps bought in lots on the way down, sold together on the bounce, never stopped), each a ledger of its own
  * in BOOKS_FILE, settled on OKX's public data (packages/shared/src/books.ts has the arithmetic). Every minute the
  * tickers and marks are read; every ten minutes the funding OKX settled on the held perps is booked; every whole hour
- * the borrow interest and a point of each equity curve; once a day after 00:00 UTC (and at the very first look) the
- * regime and the negative carry decide. The account of the stack and the paper exchange are never touched.
+ * the borrow interest and a point of each equity curve, and once the hour's 1H bars are confirmed the ladder decides;
+ * once a day after 00:00 UTC (and at the very first look) the regime and the negative carry decide. The account of the stack and the paper exchange are never touched.
  */
 
 export interface BooksConfig {
@@ -79,6 +83,7 @@ const HOUR = 3_600_000;
 const DAY = 86_400_000;
 const FUNDING_EVERY_MS = 10 * 60_000;
 const DECIDE_AFTER_MS = 5 * 60_000;
+const LADDER_AFTER_MS = 2 * 60_000;
 const CURVE_KEPT = 20_000;
 // the owner, 2026-11-05: the big direction is held in spot (「拿住大方向就搞现货」): no funding, no liquidation
 const BTC_SPOT = 'BTC-USDT';
@@ -136,7 +141,7 @@ export function loadBooks(file: string): BooksState | null {
   // a book added after the file was written starts when it is first read
   const now = Date.now();
   const books = BOOK_KEYS.map((k) => v.books.find((b) => b.key === k) ?? newBook(k, v.books[0]?.start ?? '10000', now));
-  return { ...v, books, regime: v.regime ?? null };
+  return { ...v, books, regime: v.regime ?? null, ladderHour: v.ladderHour ?? null };
 }
 
 export function saveBooks(file: string, state: BooksState): void {
@@ -213,6 +218,7 @@ export class BooksService {
       this.fundingAt = now;
     }
     await this.bookInterest(state, now);
+    await this.ladderHour(state, now);
     const dayStart = Math.floor(now / DAY) * DAY;
     if (state.lastDecisionDay !== utcDate(now) && (state.lastDecisionDay === null || now >= dayStart + DECIDE_AFTER_MS)) {
       await this.decide(state, now);
@@ -367,6 +373,41 @@ export class BooksService {
       opened.push(coin);
     }
     return { closed, opened };
+  }
+
+  /**
+   * The sixth book's hour: once the 1H bars that closed at the top of the hour are confirmed, each of LADDER_COINS is read
+   * (ladderPlan in packages/shared/src/books.ts): a first lot of LADDER_SHARE of the start at the ask, one more lot a daily ATR
+   * under the last, or every lot sold at the bid on the bounce in profit. A bar not yet confirmed leaves the hour for the next look.
+   */
+  private async ladderHour(state: BooksState, now: number): Promise<void> {
+    const hourStart = Math.floor(now / HOUR) * HOUR;
+    if (state.ladderHour === hourStart || now < hourStart + LADDER_AFTER_MS) return;
+    const s = this.deps.sources;
+    const p = this.prices;
+    const book = this.book(state, 'ladder');
+    const plans: Array<{ coin: string; instId: string; plan: ReturnType<typeof ladderPlan> }> = [];
+    for (const coin of LADDER_COINS) {
+      const instId = `${coin}-USDT-SWAP`;
+      const h1 = await s.bars(instId, '1H');
+      const last = h1[h1.length - 1];
+      if (!last || last[0] !== hourStart - HOUR) return;
+      plans.push({ coin, instId, plan: ladderPlan(h1, await s.bars(instId, '1Dutc'), book.positions.filter((x) => x.coin === coin)) });
+    }
+    state.ladderHour = hourStart;
+    const moved: string[] = [];
+    for (const { coin, instId, plan } of plans) {
+      if (plan === null) continue;
+      if (plan.action === 'close') {
+        for (const pos of book.positions.filter((x) => x.coin === coin)) closePosition(book, pos, p, now, plan.why);
+      } else {
+        const q = p.quote(instId);
+        if (!q) continue;
+        openPosition(book, coin, [{ kind: 'perp', instId, qty: D(book.start).mul(LADDER_SHARE).div(q.ask).toFixed(8) }], p, now, `${plan.action === 'add' ? 'add' : 'first lot'}: ${plan.why}`);
+      }
+      moved.push(`${coin} ${plan.action}`);
+    }
+    if (moved.length > 0) this.deps.log.info({ moved, lots: book.positions.length }, 'paper books: the ladder moved');
   }
 
   private curvePoint(state: BooksState, now: number): void {

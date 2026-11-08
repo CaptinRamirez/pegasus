@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react';
-import type { TraderDecision, TraderLastDecision, TraderLogRecord, TraderTradeResult, TraderView } from '@pegasus/shared';
+import type { AnyTraderDecision, LeaderInfo, TraderLastDecision, TraderLogRecord, TraderTradeResult, TraderView } from '@pegasus/shared';
 import { useTrader, useTraderLog } from '../hooks/useTrader';
 import { labelOf, useT } from '../i18n';
 import { DASH, fmtContracts, fmtLocalMinute, fmtNum, fmtPct, fmtPx, fmtSigned, fmtUtcMinute, signOf } from '../lib/format';
@@ -36,7 +36,9 @@ function StatusCard({ view }: { view: TraderView }) {
         {view.reason !== null && <span className="campaign-reason" title={view.reason.code}>{view.reason.message}</span>}
       </div>
       <Field k={t.trader.session}>
-        {view.session.startHour === 0 && view.session.endHour === 24 ? (
+        {view.style === 'leader' ? (
+          t.trader.sessionEveryDay
+        ) : view.session.startHour === 0 && view.session.endHour === 24 ? (
           t.trader.sessionAllDay
         ) : (
           <>
@@ -60,13 +62,21 @@ function StatusCard({ view }: { view: TraderView }) {
       <Field k={t.trader.cadence}>{labelOf(t.trader.cadenceLabel, view.cadence)}</Field>
       <Field k={t.trader.model}>{view.model}</Field>
       <div className="campaign-note trader-guardrails" title={t.trader.guardrails}>
-        {t.trader.guardrailsLine({
-          risk: fmtPct(g.riskPct, 2),
-          trades: g.maxTradesPerDay,
-          daily: fmtPct(g.dailyLossPct, 2),
-          losses: g.maxConsecutiveLosses,
-          leverage: g.maxLeverage,
-        })}
+        {view.leader !== undefined
+          ? t.trader.leaderRulesLine({
+              lot: fmtPct(view.leader.rules.lotShare, 0),
+              maxLots: view.leader.rules.maxLots,
+              addAtr: view.leader.rules.addAtr,
+              exposure: fmtPct(view.leader.rules.maxExposure, 0),
+              breaker: fmtPct(view.leader.rules.breakerPct, 0),
+            })
+          : t.trader.guardrailsLine({
+              risk: fmtPct(g.riskPct, 2),
+              trades: g.maxTradesPerDay,
+              daily: fmtPct(g.dailyLossPct, 2),
+              losses: g.maxConsecutiveLosses,
+              leverage: g.maxLeverage,
+            })}
       </div>
     </section>
   );
@@ -117,9 +127,9 @@ function LastCard({ last }: { last: TraderLastDecision | null }) {
                 {t.trader.invalidation}: {d.invalidation}
               </div>
               <div className="trader-prices">
-                {d.limitPrice !== null && <Field k={t.trader.limit}>{fmtPx(d.limitPrice)}</Field>}
-                {d.stopPx !== null && <Field k={t.trader.stop}>{fmtPx(d.stopPx)}</Field>}
-                {d.targetPx !== null && <Field k={t.trader.target}>{fmtPx(d.targetPx)}</Field>}
+                {'stopPx' in d && d.limitPrice !== null && <Field k={t.trader.limit}>{fmtPx(d.limitPrice)}</Field>}
+                {'stopPx' in d && d.stopPx !== null && <Field k={t.trader.stop}>{fmtPx(d.stopPx)}</Field>}
+                {'stopPx' in d && d.targetPx !== null && <Field k={t.trader.target}>{fmtPx(d.targetPx)}</Field>}
                 <Field k={t.trader.confidence}>{fmtPct(d.confidence, 0)}</Field>
               </div>
             </>
@@ -160,6 +170,62 @@ function PositionCard({ position }: { position: NonNullable<TraderView['position
         <Pnl v={position.unrealizedPnl} />
       </Field>
       <Field k={t.trader.openedAt}>{when(position.openedAt)}</Field>
+    </section>
+  );
+}
+
+/** The lead-trader style: the ladders of the coins, the exposure and the breaker. */
+function LeaderCard({ leader }: { leader: LeaderInfo }) {
+  const t = useT();
+  const coin = (instId: string): string => instId.split('-')[0] ?? instId;
+  return (
+    <section className="campaign-card trader-position trader-leader">
+      <h4>{t.trader.leader}</h4>
+      <div className="campaign-note dim">{t.trader.leaderNote}</div>
+      {leader.halted !== null && (
+        <div className="notice notice-warn">
+          {t.trader.halted}: {leader.halted}
+        </div>
+      )}
+      <Field k={t.trader.startEquity}>{fmtNum(leader.startEquity, 2)}</Field>
+      <Field k={t.trader.breakerEquity}>{fmtNum(leader.breakerEquity, 2)}</Field>
+      <Field k={t.trader.exposure}>
+        {fmtNum(leader.exposure, 2)} <span className="dim">({fmtPct(leader.exposurePct, 0)})</span>
+      </Field>
+      <div className="campaign-scroll">
+        <table className="table campaign-table">
+          <thead>
+            <tr>
+              <th className="left">{t.trader.coin}</th>
+              <th>{t.trader.lots}</th>
+              <th>{t.trader.contracts}</th>
+              <th>{t.trader.avgEntry}</th>
+              <th>{t.trader.lastLot}</th>
+              <th>{t.trader.nextAddBelow}</th>
+              <th>{t.trader.notional}</th>
+              <th>{t.trader.unrealized}</th>
+              <th className="left">{t.trader.nextLookAt}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {leader.coins.map((c) => (
+              <tr key={c.instId}>
+                <td className="left">{coin(c.instId)}</td>
+                <td>{c.lots.length === 0 ? <span className="dim">{t.trader.noLots}</span> : c.lots.length}</td>
+                <td>{fmtContracts(c.contracts)}</td>
+                <td>{c.avgPx === null ? DASH : fmtPx(c.avgPx)}</td>
+                <td>{c.lastLotPx === null ? DASH : fmtPx(c.lastLotPx)}</td>
+                <td>{c.nextAddBelow === null ? DASH : fmtPx(c.nextAddBelow)}</td>
+                <td>{fmtNum(c.notional, 2)}</td>
+                <td>
+                  <Pnl v={c.unrealizedPnl} />
+                </td>
+                <td className="left num">{c.wake === null ? DASH : `${when(c.wake.at)}${c.wake.above !== null || c.wake.below !== null ? ` · ${t.trader.wakeLine(c.wake.above === null ? null : fmtPx(c.wake.above), c.wake.below === null ? null : fmtPx(c.wake.below))}` : ''}`}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }
@@ -209,6 +275,7 @@ function ControlCard({ control }: { control: NonNullable<TraderView['control']> 
 
 function RecentTable({ recent }: { recent: TraderView['recent'] }) {
   const t = useT();
+  const coins = recent.some((r) => r.instId !== undefined);
   return (
     <section className="campaign-section trader-recent">
       <h4>{t.trader.recent}</h4>
@@ -220,6 +287,7 @@ function RecentTable({ recent }: { recent: TraderView['recent'] }) {
             <thead>
               <tr>
                 <th className="left">{t.trader.time}</th>
+                {coins && <th className="left">{t.trader.coin}</th>}
                 <th className="left">{t.trader.sideLabel}</th>
                 <th>{t.trader.entry}</th>
                 <th>{t.trader.exit}</th>
@@ -229,8 +297,9 @@ function RecentTable({ recent }: { recent: TraderView['recent'] }) {
             </thead>
             <tbody>
               {recent.map((r) => (
-                <tr key={`${r.openedAt}-${r.closedAt}`}>
+                <tr key={`${r.instId ?? ''}-${r.openedAt}-${r.closedAt}`}>
                   <td className="left">{when(r.closedAt)}</td>
+                  {coins && <td className="left">{r.instId?.split('-')[0] ?? DASH}</td>}
                   <td className="left">{labelOf(t.trader.side, r.side)}</td>
                   <td>{fmtPx(r.entryPx)}</td>
                   <td>{r.exitPx === null ? DASH : fmtPx(r.exitPx)}</td>
@@ -251,7 +320,7 @@ function RecentTable({ recent }: { recent: TraderView['recent'] }) {
 /** The recheck time of a record: its time plus the minutes asked, up to the next 15-minute close. */
 const nextLookAt = (ts: number, minutes: number): number => Math.ceil((ts + minutes * 60_000) / 900_000) * 900_000;
 
-function DecisionDetail({ r, d }: { r: TraderLogRecord; d: TraderDecision }) {
+function DecisionDetail({ r, d }: { r: TraderLogRecord; d: AnyTraderDecision }) {
   const t = useT();
   const px = (v: string | null): string | null => (v === null ? null : fmtPx(v));
   return (
@@ -304,6 +373,9 @@ function LogRow({ r }: { r: TraderLogRecord }) {
   } else if (r.order !== undefined) {
     const o = r.order;
     body = t.trader.orderLine(side(o.side === 'buy' ? 'long' : 'short'), fmtContracts(o.contracts), fmtPx(o.entryPx), fmtPx(o.stopPx), tp(o.targetPx), o.leverage);
+  } else if (r.lot !== undefined) {
+    const l = r.lot;
+    body = t.trader.lotLine(r.instId.split('-')[0] ?? r.instId, l.side, fmtContracts(l.contracts), fmtPx(l.px), l.lots, fmtNum(l.notional, 2));
   } else if (r.result !== undefined) {
     body = <ResultLine x={r.result} />;
   } else if (r.control !== undefined) {
@@ -385,6 +457,7 @@ export function TraderPanel() {
         <StatusCard view={view} />
         <LastCard last={view.last} />
         {view.position !== null && <PositionCard position={view.position} />}
+        {view.leader !== undefined && <LeaderCard leader={view.leader} />}
         {view.upcoming.length > 0 && <UpcomingCard upcoming={view.upcoming} />}
         <TodayCard view={view} />
         {view.control !== null && <ControlCard control={view.control} />}

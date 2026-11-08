@@ -17,7 +17,7 @@ export type MtfBar = [ts: number, open: string, high: string, low: string, close
 export type MtfFeatures = Record<string, number>;
 export type MtfRule = ReadonlyArray<readonly [key: string, op: 'le' | 'ge' | 'gt' | 'eq', value: number]>;
 
-function emaSeq(v: readonly Decimal[], n: number): Array<Decimal | null> {
+export function emaSeq(v: readonly Decimal[], n: number): Array<Decimal | null> {
   const out: Array<Decimal | null> = v.map(() => null);
   if (v.length < n) return out;
   const k = D(2).div(n + 1);
@@ -30,7 +30,7 @@ function emaSeq(v: readonly Decimal[], n: number): Array<Decimal | null> {
   return out;
 }
 
-function rsiSeq(v: readonly Decimal[], n = 14): Array<Decimal | null> {
+export function rsiSeq(v: readonly Decimal[], n = 14): Array<Decimal | null> {
   const out: Array<Decimal | null> = v.map(() => null);
   let g = ZERO;
   let l = ZERO;
@@ -53,7 +53,7 @@ function rsiSeq(v: readonly Decimal[], n = 14): Array<Decimal | null> {
   return out;
 }
 
-function atrSeq(b: readonly MtfBar[], n = 14): Array<Decimal | null> {
+export function atrSeq(b: readonly MtfBar[], n = 14): Array<Decimal | null> {
   const out: Array<Decimal | null> = b.map(() => null);
   let a = ZERO;
   for (let i = 0; i < b.length; i++) {

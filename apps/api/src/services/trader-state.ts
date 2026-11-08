@@ -1,6 +1,6 @@
-import { copyFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { TraderControlState, TraderPosition, TraderPreviousDecision, TraderTradeResult, TraderWake } from '@pegasus/shared';
+import type { TraderControlState, TraderLogRecord, TraderPosition, TraderPreviousDecision, TraderTradeResult, TraderWake } from '@pegasus/shared';
 
 /**
  * What the Claude auto trader keeps across restarts (TRADER_STATE_FILE): the day's counters the guardrails read, the
@@ -133,10 +133,26 @@ export function loadTraderState(file: string, now: number): TraderStateLoad {
   return { ok: true, state: parsed as TraderState };
 }
 
-export function saveTraderState(file: string, state: TraderState): void {
+export function saveTraderState(file: string, state: object): void {
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(`${file}.tmp`, JSON.stringify(state, null, 2));
   renameSync(`${file}.tmp`, file);
+}
+
+/** GET /api/trader/log: the newest `limit` records of a decision log, without their dossiers; a line cut by a crash is skipped. */
+export function readTraderLog(file: string, limit: number): { records: TraderLogRecord[] } {
+  if (!existsSync(file)) return { records: [] };
+  const lines = readFileSync(file, 'utf8').split('\n').filter((l) => l.trim() !== '');
+  const records: TraderLogRecord[] = [];
+  for (const line of lines.slice(-limit).reverse()) {
+    try {
+      const { dossier: _dossier, ...rest } = JSON.parse(line) as TraderLogRecord;
+      records.push(rest);
+    } catch {
+      // skipped
+    }
+  }
+  return { records };
 }
 
 /** The counters of a new UTC day: everything of the day starts again; the position, the control and the recents stay. */

@@ -1,3 +1,4 @@
+import { LEADER_INSTRUMENTS } from '@pegasus/shared';
 import { createFetchers, FileCache } from '@pegasus/backtest/campaign';
 import { loadConfig } from './config.js';
 import { PgStore } from './db/pg-store.js';
@@ -10,6 +11,7 @@ import { AccountService } from './services/account.js';
 import { CampaignService, disabledCampaignView } from './services/campaign.js';
 import { BooksService, okxBooksSources } from './services/books.js';
 import { WhaleRecorder, hyperliquidSources } from './services/whales.js';
+import { LeaderTraderService } from './services/trader-leader.js';
 import { TraderService } from './services/trader.js';
 import { CampaignOrders } from './services/campaign-orders.js';
 import { CampaignSignalsService } from './services/campaign-signals.js';
@@ -98,14 +100,14 @@ async function main(): Promise<void> {
   // The campaign rule read per coin with a plan to follow each signal by hand (GET /api/campaign/signals).
   deps.campaignSignals = new CampaignSignalsService({ config, clients, market, account, risk, journal, campaign: campaign ?? undefined, disabledView: () => disabledCampaignView(config.campaign), log });
   // The Claude auto trader on its own paper stack (docs/proposals/claude-auto-trader.md); loadConfig refuses it outside paper trading or beside the campaign.
-  const trader = config.trader.enabled ? new TraderService(config.trader, { clients, market, account, risk, orders, log }) : null;
+  const trader = !config.trader.enabled ? null : config.trader.style === 'leader' ? new LeaderTraderService(config.trader, { clients, market, account, risk, orders, log }) : new TraderService(config.trader, { clients, market, account, risk, orders, log });
   if (trader) {
     deps.trader = trader;
     const g = config.trader.guardrails;
-    log.info({ instId: config.trader.instId, model: config.trader.model, effort: config.trader.effort, session: `${g.sessionStartHour}-${g.sessionEndHour} UTC`, cadence: config.trader.cadence, control: config.trader.control, state: config.trader.stateFile }, 'TRADER ENABLED on the paper exchange');
+    log.info({ style: config.trader.style, instId: config.trader.style === 'leader' ? LEADER_INSTRUMENTS.join(',') : config.trader.instId, model: config.trader.model, effort: config.trader.effort, session: `${g.sessionStartHour}-${g.sessionEndHour} UTC`, cadence: config.trader.cadence, control: config.trader.control, state: config.trader.stateFile }, 'TRADER ENABLED on the paper exchange');
   }
 
-  // The five paper books (docs/proposals/paper-books-2026-11.md) on OKX's public data; the launcher enables them on the plain paper stack.
+  // The six paper books (docs/proposals/paper-books-2026-11.md) on OKX's public data; the launcher enables them on the plain paper stack.
   const books = config.books.enabled ? new BooksService(config.books, { sources: okxBooksSources(clients.rest), log: log.child({ component: 'books' }) }) : null;
   if (books) {
     deps.books = books;

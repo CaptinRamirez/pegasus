@@ -1,14 +1,15 @@
 import { D, ZERO, type Decimal, type DecimalInput } from './decimal.js';
+import { atrSeq, emaSeq, rsiSeq, type MtfBar } from './mtf-features.js';
 
 /**
- * The five paper books of docs/proposals/paper-books-2026-11.md: each a ledger of its own, settled on OKX's live public
+ * The six paper books of docs/proposals/paper-books-2026-11.md: each a ledger of its own, settled on OKX's live public
  * data (tickers for the fills, OKX's funding settlements, OKX's borrow rates) rather than on the paper exchange, which
  * has no spot and no borrowing. Market orders fill at the ask (buys) and the bid (sells) at OKX's taker fees; the
  * hedged legs are not margined, so nothing is liquidated. Pure arithmetic; the service in apps/api/src/services/books.ts
  * fetches the data and keeps the file.
  */
 
-export const BOOK_KEYS = ['regime', 'hold', 'carryPos', 'carryNeg', 'dipLong'] as const;
+export const BOOK_KEYS = ['regime', 'hold', 'carryPos', 'carryNeg', 'dipLong', 'ladder'] as const;
 export type BookKey = (typeof BOOK_KEYS)[number];
 
 export const BOOK_SPOT_FEE = '0.001';
@@ -23,6 +24,21 @@ export const CARRY_POS_COINS = ['BTC', 'ETH'] as const;
 export const DIP_SHARE = '0.05';
 export const DIP_HOLD_MS = 5 * 86_400_000;
 export const DIP_MAX_POSITIONS = 20;
+/**
+ * The sixth book (ladder, 第 6 本账 of the proposal): ETH and BTC perps bought in lots on the way down and sold together on the
+ * bounce, never stopped out. Each lot is LADDER_SHARE of the book's starting capital in notional; a first lot when the 1H close
+ * is under LADDER_POS_MAX of the last 20 closed daily bars' range with 1H RSI14 under LADDER_RSI_IN; one more lot each time the
+ * close is LADDER_ADD_ATR daily ATR14 under the last lot, up to LADDER_MAX_LOTS; all lots sold when the 1H close is at or above
+ * its EMA20 with RSI14 at or above LADDER_RSI_OUT and the lots' average entry is in profit. Nothing is margined, so a losing
+ * ladder is carried (cross margin in practice; the 2024-02 → 2026-11 replay carried one for 235 days).
+ */
+export const LADDER_COINS = ['ETH', 'BTC'] as const;
+export const LADDER_SHARE = '0.1';
+export const LADDER_MAX_LOTS = 5;
+export const LADDER_ADD_ATR = '1';
+export const LADDER_POS_MAX = '0.35';
+export const LADDER_RSI_IN = 45;
+export const LADDER_RSI_OUT = 50;
 export const BOOKS_VERSION = 1;
 
 /** One leg: coins, signed (+ long, − short); a spot short is borrowed coins sold. */
@@ -77,6 +93,8 @@ export interface BooksState {
   lastDecisionDay: string | null;
   /** The regime rule as last read */
   regime: RegimeReading | null;
+  /** The hour (its start, ms) the ladder last decided on */
+  ladderHour: number | null;
 }
 
 export interface RegimeReading {
@@ -135,7 +153,7 @@ export function newBook(key: BookKey, start: DecimalInput, ts: number): Book {
 }
 
 export function newBooksState(start: DecimalInput, ts: number): BooksState {
-  return { version: BOOKS_VERSION, books: BOOK_KEYS.map((k) => newBook(k, start, ts)), fundingSeen: {}, interestUntil: null, lastDecisionDay: null, regime: null };
+  return { version: BOOKS_VERSION, books: BOOK_KEYS.map((k) => newBook(k, start, ts)), fundingSeen: {}, interestUntil: null, lastDecisionDay: null, regime: null, ladderHour: null };
 }
 
 /** The value of one leg at the market: a perp its unrealized PnL at the mark (the mid without one), a spot long what its bid sells it for, a spot short minus what its ask buys it back for. */
@@ -315,6 +333,42 @@ export function carryNegPlan(candidates: readonly CarryCandidate[], held: readon
     open.push({ c, usdt: usdt.toFixed() });
   }
   return { close, open };
+}
+
+export interface LadderPlan {
+  action: 'open' | 'add' | 'close';
+  why: string;
+}
+
+/**
+ * The ladder's decision for one coin at a 1H close: `h1` and `d1` its closed 1H and daily bars (oldest first, the last 1H bar the
+ * one just closed), `lots` the book's open positions in the coin. null with too little history or nothing to do.
+ */
+export function ladderPlan(h1: readonly MtfBar[], d1: readonly MtfBar[], lots: readonly BookPosition[]): LadderPlan | null {
+  if (h1.length < 50 || d1.length < 21) return null;
+  const closes = h1.map((b) => D(b[4]));
+  const c = closes[closes.length - 1] as Decimal;
+  const rsi = rsiSeq(closes)[closes.length - 1] ?? null;
+  const e20 = emaSeq(closes, 20)[closes.length - 1] ?? null;
+  const atr = atrSeq(d1)[d1.length - 1] ?? null;
+  if (rsi === null || e20 === null || atr === null || atr.lte(0)) return null;
+  const last20 = d1.slice(-20);
+  const hi = last20.reduce<Decimal>((m, b) => (D(b[2]).gt(m) ? D(b[2]) : m), D(last20[0]![2]));
+  const lo = last20.reduce<Decimal>((m, b) => (D(b[3]).lt(m) ? D(b[3]) : m), D(last20[0]![3]));
+  if (hi.lte(lo)) return null;
+  const pos20 = c.minus(lo).div(hi.minus(lo));
+  if (lots.length === 0) {
+    return pos20.lt(LADDER_POS_MAX) && rsi.lt(LADDER_RSI_IN) ? { action: 'open', why: `range ${pos20.mul(100).toFixed(0)}%, RSI ${rsi.toFixed(0)}` } : null;
+  }
+  const legs = lots.flatMap((p) => p.legs);
+  const qty = legs.reduce<Decimal>((s, l) => s.plus(l.qty), ZERO);
+  if (qty.lte(0)) return null;
+  const avg = legs.reduce<Decimal>((s, l) => s.plus(D(l.qty).mul(l.entryPx)), ZERO).div(qty);
+  if (c.gte(e20) && rsi.gte(LADDER_RSI_OUT) && c.gt(avg)) return { action: 'close', why: `bounce: close ${c.toFixed()} over EMA20 ${e20.toFixed(1)}, RSI ${rsi.toFixed(0)}, average ${avg.toFixed(1)}` };
+  const lastLot = lots.reduce((m, p) => (p.openedAt > m.openedAt ? p : m));
+  const lastPx = D(lastLot.legs[0]?.entryPx ?? avg);
+  if (lots.length < LADDER_MAX_LOTS && c.lte(lastPx.minus(atr.mul(LADDER_ADD_ATR)))) return { action: 'add', why: `lot ${lots.length + 1}: close ${c.toFixed()}, ${LADDER_ADD_ATR} ATR (${atr.toFixed(1)}) under the last lot ${lastPx.toFixed()}` };
+  return null;
 }
 
 /** The view of one book: its equity at the market, return since its start and largest fall of its hourly curve. */

@@ -16,6 +16,7 @@ import type { SignalsService } from './services/signals.js';
 import type { Hub } from './ws/hub.js';
 
 import type { BooksService } from './services/books.js';
+import type { LeaderTraderService } from './services/trader-leader.js';
 import type { TraderService } from './services/trader.js';
 
 export interface Deps {
@@ -41,8 +42,8 @@ export interface Deps {
   trailing?: ChannelTrailingService;
   /** The trailing exits that follow an opening order, and the leftovers of closed positions (services/exit-orders.ts). */
   exitFollowUp?: ExitFollowUp;
-  /** The Claude auto trader (services/trader.ts); absent unless TRADER_ENABLED=1 (paper only, its own stack). */
-  trader?: TraderService;
-  /** The five paper books (services/books.ts); absent unless BOOKS_ENABLED=1. */
+  /** The Claude auto trader (services/trader-leader.ts, or services/trader.ts with TRADER_STYLE=stops); absent unless TRADER_ENABLED=1 (paper only, its own stack). */
+  trader?: TraderService | LeaderTraderService;
+  /** The six paper books (services/books.ts); absent unless BOOKS_ENABLED=1. */
   books?: BooksService;
 }

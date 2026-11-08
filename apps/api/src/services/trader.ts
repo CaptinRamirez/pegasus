@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
   checkDecision,
@@ -47,7 +47,7 @@ import type { RiskEngine } from './risk-engine.js';
 import { buildTraderDossier, detectTriggers, exchangeDossierSources, FIFTEEN_MINUTES_MS, fifteenCloseAtOrBefore, type TraderDossierSources } from './trader-dossier.js';
 import { FeedMacroSource, NO_MACRO, type TraderMacroSource } from './trader-macro.js';
 import { ClaudeTraderModel, hasAnthropicCredentials, type TraderModel, type TraderModelAnswer } from './trader-model.js';
-import { emptyTraderState, loadTraderState, RECENT_KEPT, rolledToDay, saveTraderState, utcDate, type PendingLimit, type TraderState } from './trader-state.js';
+import { emptyTraderState, loadTraderState, readTraderLog, RECENT_KEPT, rolledToDay, saveTraderState, utcDate, type PendingLimit, type TraderState } from './trader-state.js';
 
 /**
  * The Claude auto trader (docs/proposals/claude-auto-trader.md): on its own paper stack (TRADER_ENABLED=1, paper only,
@@ -142,6 +142,7 @@ export function settleControlBar(c: ControlPosition, high: string, low: string, 
 export function disabledTraderView(config: TraderConfig, now = Date.now()): TraderView {
   return {
     enabled: false,
+    style: config.style,
     status: 'disabled',
     reason: { code: 'TRADER_DISABLED', message: 'the trader is not enabled (TRADER_ENABLED=1, paper trading only, on a stack of its own)' },
     instId: config.instId,
@@ -883,18 +884,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
 
   /** GET /api/trader/log: the newest `limit` records, without their dossiers. */
   logPage(limit: number): { records: TraderLogRecord[] } {
-    if (!existsSync(this.config.logFile)) return { records: [] };
-    const lines = readFileSync(this.config.logFile, 'utf8').split('\n').filter((l) => l.trim() !== '');
-    const records: TraderLogRecord[] = [];
-    for (const line of lines.slice(-limit).reverse()) {
-      try {
-        const { dossier: _dossier, ...rest } = JSON.parse(line) as TraderLogRecord;
-        records.push(rest);
-      } catch {
-        // a line cut by a crash is skipped
-      }
-    }
-    return { records };
+    return readTraderLog(this.config.logFile, limit);
   }
 
   /** For tests */
@@ -942,6 +932,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
     const upcoming = (this.lastMacro?.calendar ?? []).filter((e) => e.time >= now).slice(0, 6);
     return {
       enabled: true,
+      style: 'stops',
       cadence: this.config.cadence,
       wake: this.config.cadence === 'model' ? (this.state.wake ?? null) : null,
       upcoming,

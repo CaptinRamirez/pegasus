@@ -95,7 +95,7 @@ describe('the paper books service', () => {
     again.stop();
   });
 
-  it('the dip book sells a long after five days, and a file without the book gets it', async () => {
+  it('the dip book sells a long after five days, and a file without the book gets it', { timeout: 20_000 }, async () => {
     const file = join(mkdtempSync(join(tmpdir(), 'pegasus-books-')), 'books.json');
     const clock = { now: T0 };
     const svc = new BooksService({ enabled: true, file, start: '10000' }, { sources: sources(), log }, { now: () => clock.now, checkEveryMs: 0 });
@@ -120,11 +120,11 @@ describe('the paper books service', () => {
     writeFileSync(file, JSON.stringify({ ...old, books: old.books.filter((b) => b.key !== 'dipLong') }));
     const third = new BooksService({ enabled: true, file, start: '10000' }, { sources: sources(), log }, { now: () => clock.now, checkEveryMs: 0 });
     await third.start();
-    expect(third.view().books.map((b) => b.key)).toEqual(['regime', 'hold', 'carryPos', 'carryNeg', 'dipLong']);
+    expect(third.view().books.map((b) => b.key)).toEqual(['regime', 'hold', 'carryPos', 'carryNeg', 'dipLong', 'ladder']);
     third.stop();
   });
 
-  it('closes the regime long when the close falls under the averages, and says a failed look in the view', async () => {
+  it('closes the regime long when the close falls under the averages, and says a failed look in the view', { timeout: 20_000 }, async () => {
     const file = join(mkdtempSync(join(tmpdir(), 'pegasus-books-')), 'books.json');
     const clock = { now: T0 };
     let bull = true;

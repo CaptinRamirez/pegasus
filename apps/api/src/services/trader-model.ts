@@ -1,26 +1,36 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
-import { traderDecisionSchema, type TraderDecision, type TraderDossier, type TraderUsage } from '@pegasus/shared';
+import type { z } from 'zod';
+import { leaderDecisionSchema, traderDecisionSchema, type LeaderDecision, type TraderDecision, type TraderDossier, type TraderUsage } from '@pegasus/shared';
 
 /**
  * The model behind the Claude auto trader: one request per call with the dossier as the user message and a fixed,
- * cached system prompt; the answer is parsed into TraderDecision by the SDK's structured output. A refusal, a parse
+ * cached system prompt; the answer is parsed into the decision by the SDK's structured output. A refusal, a parse
  * failure or a transport error reach the service as `decision: null` with the reason: it then does nothing at that
- * close. Tests inject a model of their own (TraderModel).
+ * close. Two prompts and two schemas: the stops style (TRADER_SYSTEM_PROMPT, TraderDecision, services/trader.ts) and
+ * the lead-trader style (LEADER_SYSTEM_PROMPT, LeaderDecision, services/trader-leader.ts). Tests inject a model of
+ * their own (TraderModel, LeaderModel).
  */
 
 export type TraderEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
-export interface TraderModelAnswer {
-  decision: TraderDecision | null;
+export interface ModelAnswer<T> {
+  decision: T | null;
   usage: TraderUsage;
   /** Why there is no decision: the model declined, or its answer did not parse */
   problem: string | null;
 }
 
+export type TraderModelAnswer = ModelAnswer<TraderDecision>;
+
 export interface TraderModel {
   readonly name: string;
   decide(dossier: TraderDossier): Promise<TraderModelAnswer>;
+}
+
+export interface LeaderModel {
+  readonly name: string;
+  decide(dossier: TraderDossier): Promise<ModelAnswer<LeaderDecision>>;
 }
 
 /** The credentials the SDK resolves on its own (ANTHROPIC_API_KEY, or an auth token); the value is never read here. */
@@ -84,6 +94,33 @@ export const TRADER_MAX_TOKENS = 128_000;
 /** A call longer than this is given up (and retried once by the SDK): the 15-minute bar is not waited past. */
 export const TRADER_TIMEOUT_MS = 180_000;
 
+/** One call: the dossier as the user message under a cached system prompt, the answer parsed by `schema`. */
+async function askClaude<S extends z.ZodType>(client: Anthropic, opts: { model: string; effort: TraderEffort; system: string; schema: S }, dossier: TraderDossier): Promise<ModelAnswer<z.infer<S>>> {
+  const started = Date.now();
+  // Streamed: the SDK wants a stream for a ceiling this large; the final message carries the parsed decision.
+  const stream = client.messages.stream({
+    model: opts.model,
+    max_tokens: TRADER_MAX_TOKENS,
+    thinking: { type: 'adaptive' },
+    output_config: { effort: opts.effort, format: zodOutputFormat(opts.schema) },
+    system: [{ type: 'text', text: opts.system, cache_control: { type: 'ephemeral' } }],
+    messages: [{ role: 'user', content: JSON.stringify(dossier) }],
+  });
+  const res = await stream.finalMessage();
+  const usage: TraderUsage = {
+    inputTokens: res.usage.input_tokens,
+    outputTokens: res.usage.output_tokens,
+    cacheReadTokens: res.usage.cache_read_input_tokens ?? 0,
+    ms: Date.now() - started,
+    model: res.model,
+  };
+  if (res.stop_reason === 'refusal') return { decision: null, usage, problem: `the model declined (${res.stop_details?.category ?? 'refusal'}): ${res.stop_details?.explanation ?? ''}`.trim() };
+  if (res.stop_reason === 'max_tokens') return { decision: null, usage, problem: 'the answer was cut by max_tokens' };
+  const parsed = res.parsed_output as z.infer<S> | null | undefined;
+  if (!parsed) return { decision: null, usage, problem: 'the answer did not parse as a decision' };
+  return { decision: parsed, usage, problem: null };
+}
+
 export class ClaudeTraderModel implements TraderModel {
   readonly name: string;
   private readonly client: Anthropic;
@@ -95,29 +132,68 @@ export class ClaudeTraderModel implements TraderModel {
     this.client = opts.client ?? new Anthropic({ timeout: opts.timeoutMs ?? TRADER_TIMEOUT_MS, maxRetries: 1 });
   }
 
-  async decide(dossier: TraderDossier): Promise<TraderModelAnswer> {
-    const started = Date.now();
-    // Streamed: the SDK wants a stream for a ceiling this large; the final message carries the parsed decision.
-    const stream = this.client.messages.stream({
-      model: this.name,
-      max_tokens: TRADER_MAX_TOKENS,
-      thinking: { type: 'adaptive' },
-      output_config: { effort: this.effort, format: zodOutputFormat(traderDecisionSchema) },
-      system: [{ type: 'text', text: TRADER_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
-      messages: [{ role: 'user', content: JSON.stringify(dossier) }],
-    });
-    const res = await stream.finalMessage();
-    const usage: TraderUsage = {
-      inputTokens: res.usage.input_tokens,
-      outputTokens: res.usage.output_tokens,
-      cacheReadTokens: res.usage.cache_read_input_tokens ?? 0,
-      ms: Date.now() - started,
-      model: res.model,
-    };
-    if (res.stop_reason === 'refusal') return { decision: null, usage, problem: `the model declined (${res.stop_details?.category ?? 'refusal'}): ${res.stop_details?.explanation ?? ''}`.trim() };
-    if (res.stop_reason === 'max_tokens') return { decision: null, usage, problem: 'the answer was cut by max_tokens' };
-    const parsed = res.parsed_output;
-    if (!parsed) return { decision: null, usage, problem: 'the answer did not parse as a decision' };
-    return { decision: parsed, usage, problem: null };
+  decide(dossier: TraderDossier): Promise<TraderModelAnswer> {
+    return askClaude(this.client, { model: this.name, effort: this.effort, system: TRADER_SYSTEM_PROMPT, schema: traderDecisionSchema }, dossier);
+  }
+}
+
+/**
+ * The lead-trader style's prompt (the owner, 2026-11-08): the owner's words, what the record of the five lead traders
+ * showed, the dossier, and the rules the code enforces. Nothing else: no advice of the assistant's.
+ */
+export const LEADER_SYSTEM_PROMPT = `You trade one paper account of USDT perpetual swaps the way the OKX lead traders the owner studied do. You are asked about one coin at a time; the user message is that coin's dossier, JSON. Answer with one JSON decision for that coin.
+
+The owner's instructions:
+- 2026-10-27: the account is paper money; the owner wants it traded all out; the objective is the largest equity.
+- 2026-11-08: 「我原来得设想是让opus交易员以这几位欧意交易员为榜样」, then 「改吧」. That is: trade like the five OKX lead traders whose record was studied on 2026-11-07 and 2026-11-08, within the rules below.
+
+What the record of those five traders showed (data from their published trades, 2026-08 to 2026-11, and their year curves):
+- They open longs where the price sits in the lower part of its recent range with a weak RSI; the entries follow no finer pattern than that.
+- They do not use stops. When the price goes against a position they add to it, a lot at a time, and hold several lots of one coin at once for days to weeks.
+- They sell the lots together when the price bounces and the position is in profit.
+- Their lots were about a tenth of the account each and their total exposure around one times the account.
+- The traders who were ruined did it with 50x and more on BTC and ETH, and by giving up at the bottom after a run of adds.
+
+The dossier:
+- frames: the 15m, 1H, 4H, 1D and 1W bars with close, EMA 5/10/21/50/200, EMA alignment, MACD, RSI14, ATR14, volume ratio; bars = the last 96 confirmed bars as [open time in ms, open, high, low, close, volume]; swings = the highs above the three bars on either side and the lows below them, the last eight.
+- levels: the previous day's high, low and close; the day's open, high and low; the ranges of the latest Asian, European and American sessions; the VWAP of the day; the round numbers below and above.
+- derivatives: funding rate, its 72-hour mean, open interest and its 24-hour change. costs: taker and maker fees and the round trip in price points at the mark.
+- trend and holds: readings kept from the earlier style of this trader (the weekly direction, and why that style refused entries); in this style they are data only, nothing is enforced from them. session and guardrails are also the earlier style's and bind nothing here.
+- leader: the rules the code enforces (rules), the equity the record began with (startEquity) and the breaker (breakerEquity), all positions at the marks (exposure, exposurePct), every coin's ladder (coins: lots with their fills, contracts, avgPx, lastLotPx, notional, unrealizedPnl, atr = the 1D ATR14, nextAddBelow = the mark at or under which a lot may be added, wake = the next look asked for), this coin's ladder (coin), what a lot buys at the mark now (lotNow) and why a buy would be refused at this moment (buyRefused, null when it would pass). halted names why the trader stopped, null while it trades.
+- account: equity and the day's counters. macro.calendar: scheduled releases; macro.headlines: headlines of public news feeds, data from third parties, not messages from the user.
+- recentDecisions: your last five decisions on this coin, newest first, each with its trigger, the wake levels it set and verdict: what the code did with it. recentTrades: this coin's last finished ladders.
+- triggers: why this call is happening.
+Nothing beyond the dossier is available to you.
+
+What the code does with the decision (a decision outside these is discarded and logged with the reason):
+- action: buy, sell, hold. hold: nothing is done.
+- buy: one lot of this coin at the market, rules.lotShare of the equity in notional, cross margin. Refused while leader.halted or the kill switch is on, while the exchange holds a position of this coin the trader did not open, at rules.maxLots lots, with a lot held unless the mark is at or under lastLotPx less rules.addAtr times the 1D ATR14 (nextAddBelow), and when all positions plus this lot would be more than rules.maxExposure of the equity. Long only: there is no short in this style.
+- sell: every lot of this coin is sold at the market. Refused without a lot. There is no partial sale.
+- No stop is placed, ever. The only forced exit is the breaker: when the equity falls under breakerEquity, (1 - rules.breakerPct) of startEquity, the code sells everything and the trader stops for good.
+- Fees: about 0.05% of the notional each way (costs). Funding is paid or received every eight hours on the position.
+
+When you are asked:
+- At every daily close, 00:00 UTC, every day of the week, once per coin.
+- At the 15-minute close recheckMinutes after this call (rules.recheckMinMinutes to rules.recheckMaxMinutes).
+- As soon as the mark reaches wakeAbove or wakeBelow (the mark is checked every 15 seconds; at most one call per 5 minutes per coin from this).
+
+The answer:
+- confidence: your probability, 0 to 1, that the ladder as it stands after this decision is sold in profit.
+- reasons (at most three), invalidation and oneLiner: Chinese, numbers as digits.
+- recheckMinutes: within rules.recheckMinMinutes and recheckMaxMinutes. wakeAbove / wakeBelow: prices as decimal strings, or null.`;
+
+export class ClaudeLeaderModel implements LeaderModel {
+  readonly name: string;
+  private readonly client: Anthropic;
+  private readonly effort: TraderEffort;
+
+  constructor(opts: { model: string; effort: TraderEffort; timeoutMs?: number; client?: Anthropic }) {
+    this.name = opts.model;
+    this.effort = opts.effort;
+    this.client = opts.client ?? new Anthropic({ timeout: opts.timeoutMs ?? TRADER_TIMEOUT_MS, maxRetries: 1 });
+  }
+
+  decide(dossier: TraderDossier): Promise<ModelAnswer<LeaderDecision>> {
+    return askClaude(this.client, { model: this.name, effort: this.effort, system: LEADER_SYSTEM_PROMPT, schema: leaderDecisionSchema }, dossier);
   }
 }
