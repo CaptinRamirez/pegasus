@@ -218,6 +218,7 @@ export class TraderService extends EventEmitter<{ change: [TraderView] }> {
       return;
     }
     this.state = loaded.state;
+    if (loaded.note !== undefined) this.log.info({ file: this.config.stateFile }, loaded.note);
     if (this.config.guardrails.maxConsecutiveLosses === 0 && this.state.cooldownUntil !== null) {
       // a pause set under an earlier rule: the rule now has none, and the last decision's next look was chosen around it
       this.log.info({ cooldownUntil: this.state.cooldownUntil }, 'pause after losses dropped: the guardrails have none; asked again at the next close');

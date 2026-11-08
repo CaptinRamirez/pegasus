@@ -83,6 +83,8 @@ export const LEADER_STATE_VERSION = 2;
 const DAY_MS = 24 * 3_600_000;
 const FIFTEEN_MS = 15 * 60_000;
 export const LEADER_WATCH_COOLDOWN_MS = 5 * 60_000;
+/** A lot just bought: how long the exchange has to report the position before its absence is a result */
+const LOT_GRACE_MS = 60_000;
 const money = (v: Decimal): string => v.toDecimalPlaces(8).toFixed();
 
 export interface LeaderCoinState {
@@ -108,6 +110,8 @@ export interface LeaderState {
   lastBarTs: number | null;
   /** UTC day of the counters */
   date: string;
+  /** The equity at the day's first look (absent in files written before it was kept) */
+  equityAtDayStart?: string | null;
   lotsToday: number;
   pnlToday: string;
   coins: LeaderCoinState[];
@@ -120,7 +124,7 @@ const emptyCoin = (instId: string): LeaderCoinState => ({ instId, lots: [], wake
 
 export function emptyLeaderState(now: number, instIds: readonly string[] = LEADER_INSTRUMENTS): LeaderState {
   const date = utcDate(now);
-  return { version: LEADER_STATE_VERSION, style: 'leader', startedAt: now, startEquity: null, halted: null, lastBarTs: null, date, lotsToday: 0, pnlToday: '0', coins: instIds.map(emptyCoin), recent: [], usage: { date, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 } };
+  return { version: LEADER_STATE_VERSION, style: 'leader', startedAt: now, startEquity: null, halted: null, lastBarTs: null, date, equityAtDayStart: null, lotsToday: 0, pnlToday: '0', coins: instIds.map(emptyCoin), recent: [], usage: { date, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 } };
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -150,7 +154,11 @@ export function loadLeaderState(file: string, now: number, instIds: readonly str
   if (problem === null && isObject(parsed) && parsed['version'] === 1) {
     if (parsed['position'] !== null || parsed['pendingLimit'] !== null) return { ok: false, error: `${file} is the stops style's and holds a position or a resting order: close it first (restart with TRADER_STYLE=stops), or move the file away` };
     const archived = `${file}.stops-v1`;
-    renameSync(file, archived);
+    try {
+      renameSync(file, archived);
+    } catch (err) {
+      return { ok: false, error: `${file} is the stops style's flat state and could not be moved to ${archived} (${(err as Error).message}); move it away by hand` };
+    }
     return { ok: true, state: emptyLeaderState(now, instIds), note: `the stops style's flat state was moved to ${archived}` };
   }
   if (problem === null && (!isObject(parsed) || parsed['version'] !== LEADER_STATE_VERSION || parsed['style'] !== 'leader' || !Array.isArray(parsed['coins']) || !Array.isArray(parsed['recent']) || !isObject(parsed['usage']))) {
@@ -260,9 +268,10 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     const now = this.now();
     const equity = this.equity();
     if (!this.deps.account.ready || equity === null) return;
-    this.rollDay(now);
-    if (this.state.startEquity === null) {
-      this.state.startEquity = equity;
+    this.rollDay(now, equity);
+    if (this.state.startEquity === null || (this.state.equityAtDayStart ?? null) === null) {
+      this.state.startEquity ??= equity;
+      this.state.equityAtDayStart = equity;
       this.save();
     }
     const bar = fifteenCloseAtOrBefore(now);
@@ -278,7 +287,9 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     const daily = bar % DAY_MS === 0;
     for (const coin of this.state.coins) {
       const mark = this.mark(coin.instId);
-      const due = daily ? ['daily close'] : coin.wake !== null && bar >= coin.wake.at ? ['scheduled recheck'] : [];
+      // a day the coin has not been asked in yet: the daily close, or the first close after a restart across midnight
+      const unasked = coin.lastCallAt === null || utcDate(coin.lastCallAt) !== utcDate(bar);
+      const due = daily ? ['daily close'] : unasked ? ['first look of the day'] : coin.wake !== null && bar >= coin.wake.at ? ['scheduled recheck'] : [];
       const reasons = [...due, ...(mark === null ? [] : this.priceReasons(coin, mark))];
       if (reasons.length === 0) continue;
       if (this.foreignPosition(coin)) {
@@ -372,12 +383,16 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     }
     this.addUsage(answer.usage);
     const decision = answer.decision;
+    // judged on the mark of this moment: the dossier's is as old as the model's thinking
+    const mark = this.mark(instId) ?? dossier.mark;
     coin.wake = wakeOf(decision, bar, { min: this.rules.recheckMinMinutes, max: this.rules.recheckMaxMinutes });
+    // a wake level the mark has already passed would fire at every look until the model named another: dropped
+    const reached = [coin.wake.above !== null && D(mark).gte(coin.wake.above) ? 'above' : null, coin.wake.below !== null && D(mark).lte(coin.wake.below) ? 'below' : null].filter((s): s is 'above' | 'below' => s !== null);
+    for (const side of reached) coin.wake = { ...coin.wake, [side]: null };
+    if (reached.length > 0) this.log.info({ instId, mark, wake: decision ? { above: decision.wakeAbove, below: decision.wakeBelow } : null }, 'trader wake level already reached by the mark: dropped');
     let verdictText = answer.problem ?? 'no decision';
     let executed = false;
     if (decision) {
-      // judged on the mark of this moment: the dossier's is as old as the model's thinking
-      const mark = this.mark(instId) ?? dossier.mark;
       const verdict = checkLeaderDecision(decision, { mark, equity, coin: this.coinView(coin, mark), exposure: this.exposure(), atr, inst: this.deps.market.requireInstrument(instId), rules: this.rules, blocked: this.buyBlocked(coin) });
       if (!verdict.ok) verdictText = `not carried out: ${verdict.reason}`;
       else {
@@ -423,6 +438,11 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     return null;
   }
 
+  /** The side of the orders in long/short position mode (the lots are longs); none in net mode. */
+  private posSide(): { posSide: 'long' } | Record<string, never> {
+    return this.deps.account.config?.posMode === 'long_short_mode' ? { posSide: 'long' } : {};
+  }
+
   private async execute(coin: LeaderCoinState, verdict: LeaderVerdict & { ok: true }, mark: string, now: number): Promise<{ executed: boolean; note: string }> {
     const { instId } = coin;
     if (verdict.action === 'hold') return { executed: false, note: 'hold' };
@@ -431,7 +451,7 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     if (verdict.action === 'sell') {
       const live = this.livePosition(instId);
       if (!live) return { executed: false, note: 'the position is already gone' };
-      await this.deps.orders.closePosition({ instId, mgnMode: 'cross' });
+      await this.deps.orders.closePosition({ instId, mgnMode: 'cross', ...this.posSide() });
       coin.closing = 'close';
       const contracts = D(live.pos).abs().toFixed();
       this.record({ ts: now, kind: 'execution', instId, lot: { clOrdId: '', side: 'sell', contracts, px: mark, lots: coin.lots.length, notional: notionalOf(contracts, mark) } });
@@ -440,7 +460,7 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     // buy: one lot at the market, cross margin, no stop
     const before = this.livePosition(instId);
     const clOrdId = generateClOrdId(now, CL_ORD_PREFIXES.trader);
-    const req: PlaceOrderRequest = { instId, side: 'buy', ordType: 'market', tdMode: 'cross', size: { unit: 'contracts', value: verdict.contracts }, clOrdId };
+    const req: PlaceOrderRequest = { instId, side: 'buy', ordType: 'market', tdMode: 'cross', ...this.posSide(), size: { unit: 'contracts', value: verdict.contracts }, clOrdId };
     const { order } = await this.deps.orders.place(req);
     // Booked at the fill: the order's average, or the lot's share of the position's average once the exchange reports
     // the larger position; the mark stands in when neither has come within two seconds.
@@ -469,13 +489,16 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
 
   /**
    * A coin whose lots are gone from the exchange is a result: the lots against the mark, less the taker fee on both
-   * legs, ended by the model's sale, the breaker, or an outside event (a close by hand). True when something changed.
+   * legs, ended by the model's sale, the breaker, or an outside event (a close by hand). A lot booked within the last
+   * LOT_GRACE_MS is given that long for the exchange to report its position before its absence counts. True when
+   * something changed.
    */
   private async reconcile(coin: LeaderCoinState, bar: number, now: number): Promise<boolean> {
     const { instId } = coin;
     const live = this.livePosition(instId);
     const first = coin.lots[0];
-    if (first !== undefined && !live) {
+    const last = coin.lots[coin.lots.length - 1];
+    if (first !== undefined && last !== undefined && !live && now - last.openedAt >= LOT_GRACE_MS) {
       const inst = this.deps.market.requireInstrument(instId);
       const contracts = coin.lots.reduce((s, l) => s.plus(l.contracts), ZERO);
       const cost = coin.lots.reduce((s, l) => s.plus(D(l.contracts).mul(l.entryPx)), ZERO);
@@ -521,9 +544,10 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
       this.log.error({ equity, floor: floor.toFixed(2), start }, 'trader breaker: everything is sold, the trader has stopped');
     }
     for (const coin of this.state.coins) {
-      if (!this.livePosition(coin.instId) || coin.closing === 'breaker') continue;
+      // only the coins the trader holds lots of: a position it did not open is not its to close
+      if (coin.lots.length === 0 || !this.livePosition(coin.instId) || coin.closing === 'breaker') continue;
       try {
-        await this.deps.orders.closePosition({ instId: coin.instId, mgnMode: 'cross' });
+        await this.deps.orders.closePosition({ instId: coin.instId, mgnMode: 'cross', ...this.posSide() });
         coin.closing = 'breaker';
       } catch (err) {
         this.log.error({ instId: coin.instId, err: (err as Error).message }, 'the breaker could not close the position; tried again at the next look');
@@ -619,10 +643,10 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     return this.config.calendar.filter((e) => e.date === date).map((e) => e.name);
   }
 
-  private rollDay(now: number): void {
+  private rollDay(now: number, equity: string): void {
     const date = utcDate(now);
     if (this.state.date === date) return;
-    this.state = { ...this.state, date, lotsToday: 0, pnlToday: '0', usage: { date, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 } };
+    this.state = { ...this.state, date, equityAtDayStart: equity, lotsToday: 0, pnlToday: '0', usage: { date, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 } };
     this.save();
   }
 
@@ -674,15 +698,16 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     if (this.model === null) return { status: 'blocked', reason: { code: 'NO_MODEL_CREDENTIALS', message: 'no ANTHROPIC_API_KEY in the environment: put one in .env and restart the stack' } };
     if (!this.deps.account.ready || this.equity() === null) return { status: 'blocked', reason: { code: 'ACCOUNT_UNAVAILABLE', message: 'the paper account has not been read yet' } };
     if (this.state.halted !== null) return { status: 'blocked', reason: { code: 'BREAKER', message: this.state.halted } };
+    // a position the trader did not open stops one coin, not the trader: said beside the status
     const foreign = this.state.coins.filter((c) => this.foreignPosition(c)).map((c) => c.instId);
-    if (foreign.length > 0) return { status: 'blocked', reason: { code: 'FOREIGN_POSITION', message: `the paper account holds a position of ${foreign.join(', ')} that the trader did not open: it asks nothing about that coin and buys nothing until that position is closed` } };
-    if (this.state.coins.some((c) => c.lots.length > 0)) return { status: 'holding', reason: null };
-    return { status: 'in-session', reason: null };
+    const reason: TraderStatusReason | null = foreign.length > 0 ? { code: 'FOREIGN_POSITION', message: `the paper account holds a position of ${foreign.join(', ')} that the trader did not open: it asks nothing about that coin and buys nothing until that position is closed` } : null;
+    return { status: this.state.coins.some((c) => c.lots.length > 0) ? 'holding' : 'in-session', reason };
   }
 
-  /** The next instant the model is called at the latest: the next daily close, or a coin's recheck time if earlier. */
+  /** The next instant the model is called at the latest: the next close while a coin has not been asked today, else the next daily close or a coin's recheck time if earlier. */
   nextCallAt(now: number): number {
     const nextFifteen = Math.floor(now / FIFTEEN_MS) * FIFTEEN_MS + FIFTEEN_MS;
+    if (this.state.coins.some((c) => !this.foreignPosition(c) && (c.lastCallAt === null || utcDate(c.lastCallAt) !== utcDate(now)))) return nextFifteen;
     const nextDaily = Math.floor(now / DAY_MS) * DAY_MS + DAY_MS;
     const wakes = this.state.coins.map((c) => c.wake?.at ?? null).filter((t): t is number => t !== null).map((t) => Math.max(t, nextFifteen));
     return Math.min(nextDaily, ...wakes);
@@ -711,7 +736,7 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
       nextCallAt: status === 'blocked' ? null : this.nextCallAt(now),
       last: this.lastDecision,
       position: null,
-      today: { date: this.state.date, trades: this.state.lotsToday, pnl: this.state.pnlToday, consecutiveLosses: 0, cooldownUntil: null, equityAtStart: this.state.startEquity },
+      today: { date: this.state.date, trades: this.state.lotsToday, pnl: this.state.pnlToday, consecutiveLosses: 0, cooldownUntil: null, equityAtStart: this.state.equityAtDayStart ?? null },
       usageToday: { calls: usage.calls, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, estimatedUsd: estimateUsd(this.config.model, usage).toDecimalPlaces(4).toFixed() },
       control: null,
       recent: this.state.recent,

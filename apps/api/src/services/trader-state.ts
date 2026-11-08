@@ -104,8 +104,12 @@ function problemOf(v: unknown): string | null {
   return null;
 }
 
-export type TraderStateLoad = { ok: true; state: TraderState } | { ok: false; error: string };
+export type TraderStateLoad = { ok: true; state: TraderState; note?: string } | { ok: false; error: string };
 
+/**
+ * The state file: this version's, or none. A file of the lead-trader style (version 2, services/trader-leader.ts) that
+ * holds no lot is moved to `<file>.leader-v2` and the record begins empty; one holding lots blocks the trader.
+ */
 export function loadTraderState(file: string, now: number): TraderStateLoad {
   let text: string;
   try {
@@ -118,6 +122,18 @@ export function loadTraderState(file: string, now: number): TraderStateLoad {
   let problem: string | null;
   try {
     parsed = JSON.parse(text);
+    if (isObject(parsed) && parsed['version'] === 2 && parsed['style'] === 'leader') {
+      const coins = Array.isArray(parsed['coins']) ? parsed['coins'] : [];
+      const flat = coins.every((c: unknown) => isObject(c) && Array.isArray(c['lots']) && c['lots'].length === 0);
+      if (!flat) return { ok: false, error: `${file} is the lead-trader style's and holds lots: sell them first (restart with TRADER_STYLE=leader), or move the file away` };
+      const archived = `${file}.leader-v2`;
+      try {
+        renameSync(file, archived);
+      } catch (err) {
+        return { ok: false, error: `${file} is the lead-trader style's flat state and could not be moved to ${archived} (${(err as Error).message}); move it away by hand` };
+      }
+      return { ok: true, state: emptyTraderState(now), note: `the lead-trader style's flat state was moved to ${archived}` };
+    }
     problem = problemOf(parsed);
   } catch (err) {
     problem = (err as Error).message;

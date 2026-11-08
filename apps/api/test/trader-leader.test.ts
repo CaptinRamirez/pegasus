@@ -7,6 +7,7 @@ import type { TraderConfig } from '../src/config.js';
 import type { TraderDossierSources } from '../src/services/trader-dossier.js';
 import { LeaderTraderService, loadLeaderState } from '../src/services/trader-leader.js';
 import type { LeaderModel } from '../src/services/trader-model.js';
+import { loadTraderState } from '../src/services/trader-state.js';
 import type { TraderServiceDeps } from '../src/services/trader.js';
 
 const DAY = 24 * 3_600_000;
@@ -33,7 +34,7 @@ interface World {
   placed: Array<Record<string, unknown>>;
   closed: string[];
   asked: TraderDossier[];
-  script: Array<LeaderDecision['action']>;
+  script: Array<LeaderDecision['action'] | LeaderDecision>;
 }
 
 function build(dir: string): { service: LeaderTraderService; world: World; config: TraderConfig } {
@@ -76,7 +77,8 @@ function build(dir: string): { service: LeaderTraderService; world: World; confi
     name: 'fake',
     async decide(dossier) {
       world.asked.push(dossier);
-      return { decision: answer(world.script.shift() ?? 'hold'), usage, problem: null };
+      const next = world.script.shift() ?? 'hold';
+      return { decision: typeof next === 'string' ? answer(next) : next, usage, problem: null };
     },
   };
   const service = new LeaderTraderService(config, deps, { now: () => world.now, sleep: async () => {}, model, sources, checkEveryMs: 0, pollMs: 0, pollAttempts: 1 });
@@ -134,6 +136,41 @@ describe('the lead-trader style service', () => {
     MARKS['ETH-USDT-SWAP'] = '2240';
   });
 
+  it('asks a coin not yet asked today at the first close after a restart, drops a wake level the mark has passed, and leaves a coin with a foreign position alone without blocking the rest', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pegasus-leader-'));
+    const { service, world } = build(dir);
+    // restarted at 00:20 UTC: the daily close was missed, both coins are asked at the first close
+    world.now = Date.UTC(2026, 10, 9, 0, 20, 5);
+    world.script = ['hold', { ...answer('hold'), wakeAbove: '2250', wakeBelow: '2300' }];
+    await service.start();
+    expect(world.asked.map((d) => [d.instId, d.triggers])).toEqual([['BTC-USDT-SWAP', ['first look of the day']], ['ETH-USDT-SWAP', ['first look of the day']]]);
+    // the mark 2,240 is already under 2,300: that level is dropped, the one above stays
+    expect(service.stateCopy().coins.find((c) => c.instId === 'ETH-USDT-SWAP')?.wake).toMatchObject({ above: '2250', below: null });
+    world.now = Date.UTC(2026, 10, 9, 0, 35, 5);
+    await service.tick();
+    expect(world.asked).toHaveLength(2);
+    MARKS['ETH-USDT-SWAP'] = '2260';
+    world.now = Date.UTC(2026, 10, 9, 0, 50, 5);
+    await service.tick();
+    expect(world.asked.at(-1)).toMatchObject({ instId: 'ETH-USDT-SWAP', triggers: ['price reached 2250'] });
+    MARKS['ETH-USDT-SWAP'] = '2240';
+    // a BTC position opened by hand: that coin is skipped and said in the reason; the trader is not blocked
+    world.positions.push({ instId: 'BTC-USDT-SWAP', posSide: 'net', mgnMode: 'cross', pos: '1', avgPx: '76000', markPx: '76000', upl: '0' } as unknown as Position);
+    world.script = ['buy'];
+    world.now = Date.UTC(2026, 10, 10, 0, 0, 5);
+    await service.tick();
+    expect(world.asked.slice(3).map((d) => d.instId)).toEqual(['ETH-USDT-SWAP']);
+    const view = service.view();
+    expect(view).toMatchObject({ status: 'holding', reason: { code: 'FOREIGN_POSITION' } });
+    expect(view.nextCallAt).not.toBeNull();
+    expect(view.today.equityAtStart).toBe('1124');
+    // the breaker leaves the foreign position alone
+    world.equity = '600';
+    world.now = Date.UTC(2026, 10, 10, 0, 15, 5);
+    await service.tick();
+    expect(world.closed).toEqual(['ETH-USDT-SWAP']);
+  });
+
   it('moves a flat state of the stops style aside, blocks on one holding a position, and reads its own', () => {
     const dir = mkdtempSync(join(tmpdir(), 'pegasus-leader-'));
     const file = join(dir, 'trader-state.json');
@@ -149,5 +186,12 @@ describe('the lead-trader style service', () => {
     expect(own.ok && own.state.coins.map((c) => c.instId)).toEqual(['BTC-USDT-SWAP', 'ETH-USDT-SWAP']);
     writeFileSync(file, '{"version": 3}');
     expect(loadLeaderState(file, 0)).toMatchObject({ ok: false, error: expect.stringContaining('.corrupt') });
+    // and the other way: the stops style moves a flat leader file aside, and refuses one holding lots
+    const flat = { version: 2, style: 'leader', coins: [{ instId: 'BTC-USDT-SWAP', lots: [] }] };
+    writeFileSync(file, JSON.stringify(flat));
+    expect(loadTraderState(file, 0)).toMatchObject({ ok: true, note: expect.stringContaining('.leader-v2') });
+    expect(JSON.parse(readFileSync(`${file}.leader-v2`, 'utf8'))).toEqual(flat);
+    writeFileSync(file, JSON.stringify({ ...flat, coins: [{ instId: 'BTC-USDT-SWAP', lots: [{ contracts: '1' }] }] }));
+    expect(loadTraderState(file, 0)).toMatchObject({ ok: false, error: expect.stringContaining('holds lots') });
   });
 });

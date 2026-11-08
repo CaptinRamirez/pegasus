@@ -173,9 +173,9 @@ What the code does with the decision (a decision outside these is discarded and 
 - Fees: about 0.05% of the notional each way (costs). Funding is paid or received every eight hours on the position.
 
 When you are asked:
-- At every daily close, 00:00 UTC, every day of the week, once per coin.
+- At every daily close, 00:00 UTC, every day of the week, once per coin; after a restart, at the first 15-minute close of a UTC day you have not been asked in yet.
 - At the 15-minute close recheckMinutes after this call (rules.recheckMinMinutes to rules.recheckMaxMinutes).
-- As soon as the mark reaches wakeAbove or wakeBelow (the mark is checked every 15 seconds; at most one call per 5 minutes per coin from this).
+- As soon as the mark reaches wakeAbove or wakeBelow (the mark is checked every 15 seconds; at most one call per 5 minutes per coin from this). A wake level the mark has already passed when you set it is dropped.
 
 The answer:
 - confidence: your probability, 0 to 1, that the ladder as it stands after this decision is sold in profit.
