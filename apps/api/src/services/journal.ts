@@ -107,6 +107,8 @@ export class JournalService extends EventEmitter<{ change: [JournalUpdate] }> {
   private retryTimer: NodeJS.Timeout | null = null;
   private wake: (() => void) | null = null;
   private dirty = false;
+  /** What the file holds, as the last save returned it */
+  private saved: string | undefined;
   private stopped = false;
   private subscribed = false;
   private readonly now: () => number;
@@ -522,7 +524,7 @@ export class JournalService extends EventEmitter<{ change: [JournalUpdate] }> {
     if (this.dirty) {
       this.dirty = false;
       try {
-        saveJournal(this.opts.file, book.data);
+        this.saved = saveJournal(this.opts.file, book.data, this.saved);
       } catch (err) {
         this.dirty = true;
         this.deps.log.error({ file: this.opts.file, err: (err as Error).message }, 'trade journal: the file could not be written');

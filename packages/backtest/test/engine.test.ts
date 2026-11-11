@@ -1,8 +1,11 @@
 import { atr, buildSignalReport, D, dailyBarsFromHalfDays, Decimal, DEFAULT_SIZING, DEFAULT_TREND_PARAMS, type Candle, type FundingRecord } from '@pegasus/shared';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { blockingGate, oiInputs, phaseSizing, runBacktest, trimContracts, type GateLot } from '../src/engine.js';
 import type { EngineConfig, OiLevel, Trade } from '../src/types.js';
 import { bar, barsFromCloses, config, DAY, HALF_DAY, HOUR, instrument, instrumentData, T0, trendBars, trendCloses } from './helpers.js';
+
+// the replays here take seconds each; with the three stacks running one of them passed the default 5 s
+vi.setConfig({ testTimeout: 30_000 });
 
 /** Index of the first bar the indicators can be computed on: its close is the first decision. */
 const SIGNAL = 100;

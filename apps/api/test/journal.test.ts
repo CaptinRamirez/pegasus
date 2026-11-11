@@ -4,7 +4,7 @@
  * the time the API was not running, adopts the positions it did not see open and closes the ones that are gone.
  */
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -123,10 +123,15 @@ describe('the journal file', () => {
     expect(loadJournal(file)).toEqual({ ok: true, data: emptyJournal(), existed: false });
     const b = new JournalBook(emptyJournal(), { specOf: () => BTC, now: () => T0 });
     b.fill({ tradeId: '1', ordId: 'o1', clOrdId: 'pgw1', instId: 'BTC-USDT-SWAP', side: 'buy', posSide: 'net', fillPx: '60000', fillSz: '1', fee: '-0.3', feeCcy: 'USDT', execType: 'T', ts: T0 }, { ordId: 'o1', clOrdId: 'pgw1', tdMode: 'cross', reduceOnly: false, lever: '3' });
-    saveJournal(file, b.data);
+    const held = saveJournal(file, b.data);
     const read = loadJournal(file);
     expect(read).toEqual({ ok: true, data: b.data, existed: true });
     expect(existsSync(`${file}.tmp`)).toBe(false);
+    // a save of what the file already holds writes nothing: the file, removed here, stays away
+    rmSync(file);
+    expect(saveJournal(file, b.data, held)).toBe(held);
+    expect(existsSync(file)).toBe(false);
+    saveJournal(file, b.data);
     expect((JSON.parse(readFileSync(file, 'utf8')) as { version: number }).version).toBe(JOURNAL_VERSION);
     // a book over what was read goes on where it stopped
     if (!read.ok) throw new Error(read.error);

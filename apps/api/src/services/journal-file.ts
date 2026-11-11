@@ -195,13 +195,20 @@ export function loadJournal(file: string): JournalLoad {
   return { ok: true, data: parsed as JournalData, existed: true };
 }
 
-/** Trims what is kept (the oldest closed trades, timelines, fill keys, pending orders), then writes the journal whole through a temporary file. */
-export function saveJournal(file: string, data: JournalData): void {
+/**
+ * Trims what is kept (the oldest closed trades, timelines, fill keys, pending orders), then writes the journal whole through a
+ * temporary file. Returns what the file holds; nothing is written when that is `held`, what the last call returned: the service
+ * saves after every push of the account, most of which change nothing, and a rename every second fails now and then on Windows.
+ */
+export function saveJournal(file: string, data: JournalData, held?: string): string {
   trimJournal(data);
+  const text = `${JSON.stringify(data)}\n`;
+  if (text === held) return text;
   const tmp = `${file}.tmp`;
   mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(tmp, `${JSON.stringify(data)}\n`);
+  writeFileSync(tmp, text);
   renameSync(tmp, file);
+  return text;
 }
 
 export function trimJournal(data: JournalData): void {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { D } from '../src/decimal.js';
-import { applyFunding, applyInterest, bookEquity, bookView, carryNegPlan, closePosition, hourlyBorrowRate, ladderPlan, newBook, openPosition, regimeRead, type BookPosition, type BookPrices, type BookQuote } from '../src/books.js';
+import { applyFunding, applyInterest, bookEquity, bookView, carryNegPlan, closePosition, hourlyBorrowRate, ladderPlan, mixVolatility, newBook, openPosition, planTarget, regimeRead, resizeSpot, type BookPosition, type BookPrices, type BookQuote } from '../src/books.js';
 import type { MtfBar } from '../src/mtf-features.js';
 
 const pricesOf = (quotes: Record<string, BookQuote>, marks: Record<string, string> = {}): BookPrices => ({ quote: (id) => quotes[id], mark: (id) => marks[id] });
@@ -92,5 +92,60 @@ describe('the paper books', () => {
     expect(ladderPlan(bounce, d1, [lot('110', 0), lot('105', 1)])?.action).not.toBe('close');
     // too little history
     expect(ladderPlan(h1Of([100, 99]), d1, [])).toBeNull();
+  });
+});
+
+describe('the plan', () => {
+  it('measures the volatility of the equal-weight mix over the last 30 daily returns, annualised over 365 days', () => {
+    const a = Array.from({ length: 40 }, (_, i) => 100 * (1 + 0.03 * Math.sin(i)) + i);
+    const b = Array.from({ length: 40 }, (_, i) => 50 * (1 + 0.05 * Math.cos(2 * i)) + i / 2);
+    const rets = Array.from({ length: 30 }, (_, k) => {
+      const i = 10 + k;
+      return ((a[i] as number) / (a[i - 1] as number) - 1 + (b[i] as number) / (b[i - 1] as number) - 1) / 2;
+    });
+    const mean = rets.reduce((x, y) => x + y, 0) / 30;
+    const expected = Math.sqrt((rets.reduce((x, y) => x + (y - mean) ** 2, 0) / 29) * 365);
+    expect(Number(mixVolatility([a, b]))).toBeCloseTo(expected, 10);
+    // thirty returns need thirty-one closes of every coin
+    expect(mixVolatility([a.slice(0, 30), b])).toBeNull();
+    expect(mixVolatility([])).toBeNull();
+  });
+
+  it('wants nothing when not bull, the target volatility over the measured one when bull, never more than the whole book', () => {
+    expect(planTarget(false, '0.5')?.toFixed()).toBe('0');
+    expect(planTarget(false, null)?.toFixed()).toBe('0');
+    expect(planTarget(true, '0.9')?.toFixed()).toBe('0.5');
+    expect(planTarget(true, '0.3')?.toFixed()).toBe('1');
+    // bull with no volatility yet: no opinion, the holding stays as it is
+    expect(planTarget(true, null)).toBeNull();
+    expect(planTarget(true, '0')).toBeNull();
+  });
+
+  it('trades a spot holding to a target value: buys with the fee inside the sum, averages the entry, sells a part, then all', () => {
+    const b = newBook('plan', '10000', 0);
+    let px = pricesOf({ 'BTC-USDT': { bid: '100', ask: '100' } });
+    // 5,005 buys 50 coins at 100 and pays their 0.1% fee
+    expect(resizeSpot(b, 'BTC', 'BTC-USDT', '5005', px, 1, 'to 50%').toFixed()).toBe('50');
+    expect(b.cash).toBe('4995');
+    px = pricesOf({ 'BTC-USDT': { bid: '110', ask: '110' } });
+    // the 50 coins are worth 5,500: 1,101.1 more buys 10 coins at 110
+    expect(resizeSpot(b, 'BTC', 'BTC-USDT', '6601.1', px, 2, 'to 60%').toFixed()).toBe('10');
+    expect(b.positions).toHaveLength(1);
+    expect(b.positions[0]?.legs[0]).toMatchObject({ kind: 'spot', instId: 'BTC-USDT', qty: '60' });
+    expect(D(b.positions[0]?.legs[0]?.entryPx ?? 0).toFixed(4)).toBe('101.6667');
+    expect(b.cash).toBe('3893.9');
+    // half sold at the bid, its fee taken from the proceeds; the entry stays
+    expect(resizeSpot(b, 'BTC', 'BTC-USDT', '3300', px, 3, 'to 30%').toFixed()).toBe('-30');
+    expect(b.cash).toBe('7190.6');
+    expect(b.positions[0]?.legs[0]?.qty).toBe('30');
+    // nothing to do within a coin's worth of rounding; a target of zero sells the rest
+    expect(resizeSpot(b, 'BTC', 'BTC-USDT', '3300', px, 4, 'again').toFixed()).toBe('0');
+    expect(resizeSpot(b, 'BTC', 'BTC-USDT', '0', px, 5, 'not bull').toFixed()).toBe('-30');
+    expect(b.positions).toEqual([]);
+    // 10,000 + 50 coins x 10 of gain - fees of 5 + 1.1 + 3.3 + 3.3
+    expect(b.cash).toBe('10487.3');
+    expect(b.events.map((e) => e.kind)).toEqual(['open', 'open', 'close', 'close']);
+    expect(resizeSpot(b, 'BTC', 'BTC-USDT', '0', px, 6, 'flat already').toFixed()).toBe('0');
+    expect(() => resizeSpot(b, 'ETH', 'ETH-USDT', '100', px, 7, 'no price')).toThrow('no quote for ETH-USDT');
   });
 });

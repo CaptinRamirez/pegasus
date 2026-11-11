@@ -1,16 +1,18 @@
-import { D, ZERO, type Decimal, type DecimalInput } from './decimal.js';
+import { D, ZERO, floorToStep, type Decimal, type DecimalInput } from './decimal.js';
 import { atrSeq, emaSeq, rsiSeq, type MtfBar } from './mtf-features.js';
 
 /**
- * The six paper books of docs/proposals/paper-books-2026-11.md: each a ledger of its own, settled on OKX's live public
- * data (tickers for the fills, OKX's funding settlements, OKX's borrow rates) rather than on the paper exchange, which
- * has no spot and no borrowing. Market orders fill at the ask (buys) and the bid (sells) at OKX's taker fees; the
- * hedged legs are not margined, so nothing is liquidated. Pure arithmetic; the service in apps/api/src/services/books.ts
- * fetches the data and keeps the file.
+ * The six paper books of docs/proposals/paper-books-2026-11.md and the plan of docs/proposals/complete-strategy-2026-11.md
+ * with its control: each a ledger of its own, settled on OKX's live public data (tickers for the fills, OKX's funding
+ * settlements, OKX's borrow rates) rather than on the paper exchange, which has no spot and no borrowing. Market orders
+ * fill at the ask (buys) and the bid (sells) at OKX's taker fees; the hedged legs are not margined, so nothing is
+ * liquidated. Pure arithmetic; the service in apps/api/src/services/books.ts fetches the data and keeps the file.
  */
 
-export const BOOK_KEYS = ['regime', 'hold', 'carryPos', 'carryNeg', 'dipLong', 'ladder'] as const;
+export const BOOK_KEYS = ['regime', 'hold', 'carryPos', 'carryNeg', 'dipLong', 'ladder', 'plan', 'planHold'] as const;
 export type BookKey = (typeof BOOK_KEYS)[number];
+/** The plan and its control: they have the PLAN tab to themselves, the other six the STRATEGIES tab. */
+export const PLAN_KEYS: readonly BookKey[] = ['plan', 'planHold'];
 
 export const BOOK_SPOT_FEE = '0.001';
 export const BOOK_SWAP_FEE = '0.0005';
@@ -39,6 +41,19 @@ export const LADDER_ADD_ATR = '1';
 export const LADDER_POS_MAX = '0.35';
 export const LADDER_RSI_IN = 45;
 export const LADDER_RSI_OUT = 50;
+/**
+ * The plan (docs/proposals/complete-strategy-2026-11.md): BTC and ETH spot, half each, held only while the two lines read
+ * bull, at an exposure of PLAN_TARGET_VOL over the mix's volatility of the last PLAN_VOL_DAYS closed days, at most
+ * PLAN_MAX_EXPOSURE of the book (no leverage); the holding is traded only when it is off the target by more than PLAN_BAND
+ * of the book, and sold whole when the two lines stop reading bull. Its control, planHold, buys half of each at the start
+ * and keeps them. PLAN_TARGET_VOL is the dial: the replay of 2017-09 to 2026-11 at 0.30, 0.45 and 0.60 is in the proposal.
+ */
+// shortcut: spot only, and idle USDT earns nothing; the proposal's dials above 1x (perps for the excess) and Simple Earn interest on the cash are built when the owner asks
+export const PLAN_COINS = ['BTC', 'ETH'] as const;
+export const PLAN_TARGET_VOL = '0.45';
+export const PLAN_MAX_EXPOSURE = '1';
+export const PLAN_BAND = '0.1';
+export const PLAN_VOL_DAYS = 30;
 export const BOOKS_VERSION = 1;
 
 /** One leg: coins, signed (+ long, − short); a spot short is borrowed coins sold. */
@@ -95,6 +110,21 @@ export interface BooksState {
   regime: RegimeReading | null;
   /** The hour (its start, ms) the ladder last decided on */
   ladderHour: number | null;
+  /** The plan as last decided (absent in files written before it) */
+  plan?: PlanReading | null;
+}
+
+/** What the plan read at its last daily decision; shares of the book as decimals (0.85 = 85%). */
+export interface PlanReading {
+  ts: number;
+  /** The mix's annualised volatility; null with too little history */
+  vol: string | null;
+  /** The exposure it wants now: 0 while the two lines do not read bull; null when the volatility is unknown */
+  target: string | null;
+  /** The exposure it would want if the two lines read bull */
+  targetIfBull: string | null;
+  /** The exposure it held before the decision's trades */
+  exposure: string;
 }
 
 export interface RegimeReading {
@@ -136,6 +166,8 @@ export interface BooksView {
   books: BookView[];
   /** The regime rule as last read: bull, the close and its two averages */
   regime: RegimeReading | null;
+  /** The plan as last decided */
+  plan: PlanReading | null;
   nextDecisionAt: number | null;
   serverTime: number;
 }
@@ -153,7 +185,7 @@ export function newBook(key: BookKey, start: DecimalInput, ts: number): Book {
 }
 
 export function newBooksState(start: DecimalInput, ts: number): BooksState {
-  return { version: BOOKS_VERSION, books: BOOK_KEYS.map((k) => newBook(k, start, ts)), fundingSeen: {}, interestUntil: null, lastDecisionDay: null, regime: null, ladderHour: null };
+  return { version: BOOKS_VERSION, books: BOOK_KEYS.map((k) => newBook(k, start, ts)), fundingSeen: {}, interestUntil: null, lastDecisionDay: null, regime: null, ladderHour: null, plan: null };
 }
 
 /** The value of one leg at the market: a perp its unrealized PnL at the mark (the mid without one), a spot long what its bid sells it for, a spot short minus what its ask buys it back for. */
@@ -237,6 +269,55 @@ export function closePosition(book: Book, p: BookPosition, prices: BookPrices, t
 }
 
 /**
+ * Trades the book's spot holding of one coin to `targetValue` USDT at the market: what is missing is bought at the ask, its
+ * fee paid out of the same sum; what is over is sold at the bid; a target of zero sells the holding whole. One position per
+ * coin, its entry the average of the buys. Returns the coins traded (bought positive, sold negative). Throws on a missing price.
+ */
+export function resizeSpot(book: Book, coin: string, instId: string, targetValue: DecimalInput, prices: BookPrices, ts: number, why: string): Decimal {
+  const q = prices.quote(instId);
+  if (!q) throw new Error(`no quote for ${instId}`);
+  const held = book.positions.find((p) => p.coin === coin && p.legs.length === 1 && p.legs[0]?.kind === 'spot' && p.legs[0].instId === instId);
+  const leg = held?.legs[0];
+  const have = leg ? D(leg.qty) : ZERO;
+  const target = D(targetValue);
+  if (!target.gt(0)) {
+    if (held) closePosition(book, held, prices, ts, why);
+    return have.neg();
+  }
+  const diff = target.minus(have.mul(q.bid));
+  if (diff.gt(0)) {
+    const qty = floorToStep(diff.div(D(q.ask).mul(D(1).plus(BOOK_SPOT_FEE))), '0.00000001');
+    if (!qty.gt(0)) return ZERO;
+    if (!held || !leg) {
+      openPosition(book, coin, [{ kind: 'spot', instId, qty }], prices, ts, why);
+      return qty;
+    }
+    const cost = qty.mul(q.ask);
+    const fee = cost.mul(BOOK_SPOT_FEE);
+    leg.entryPx = have.mul(leg.entryPx).plus(cost).div(have.plus(qty)).toFixed();
+    leg.qty = have.plus(qty).toFixed();
+    held.fees = D(held.fees).plus(fee).toFixed();
+    book.cash = D(book.cash).minus(cost).minus(fee).toFixed();
+    addBookEvent(book, { ts, kind: 'open', coin, amount: cost.plus(fee).neg().toFixed(), text: `${why}: spot ${instId} +${qty.toFixed()} @ ${q.ask}` });
+    return qty;
+  }
+  if (!held || !leg) return ZERO;
+  const qty = floorToStep(diff.neg().div(q.bid), '0.00000001');
+  if (!qty.gt(0)) return ZERO;
+  if (qty.gte(have)) {
+    closePosition(book, held, prices, ts, why);
+    return have.neg();
+  }
+  const proceeds = qty.mul(q.bid);
+  const fee = proceeds.mul(BOOK_SPOT_FEE);
+  leg.qty = have.minus(qty).toFixed();
+  held.fees = D(held.fees).plus(fee).toFixed();
+  book.cash = D(book.cash).plus(proceeds).minus(fee).toFixed();
+  addBookEvent(book, { ts, kind: 'close', coin, amount: proceeds.minus(fee).toFixed(), text: `${why}: spot ${instId} -${qty.toFixed()} @ ${q.bid}` });
+  return qty.neg();
+}
+
+/**
  * A funding settlement of a perp at `ts`: a long pays a positive rate on its value at the mark, a short receives it;
  * only positions opened before the settlement take part. Returns the cash moved.
  */
@@ -297,6 +378,34 @@ export function regimeRead(dailyCloses: readonly DecimalInput[], weeklyCloses: r
   const s200 = sma(dailyCloses.slice(-200));
   const s50 = sma(weeklyCloses.slice(-50));
   return { bull: close.gt(s200) && close.gt(s50), close: close.toFixed(), sma200: s200.toFixed(), sma50w: s50.toFixed() };
+}
+
+/**
+ * The annualised (365 days) standard deviation of the daily returns of the equal-weight mix of the coins over the last
+ * `days` closed days. Each list is one coin's daily closes, oldest first, all ending on the same day. null with too little history.
+ */
+export function mixVolatility(closes: readonly (readonly DecimalInput[])[], days = PLAN_VOL_DAYS): Decimal | null {
+  if (closes.length === 0 || closes.some((c) => c.length < days + 1)) return null;
+  const rets: Decimal[] = [];
+  for (let k = days; k >= 1; k--) {
+    let r = ZERO;
+    for (const c of closes) r = r.plus(D(c[c.length - k] as DecimalInput).div(c[c.length - k - 1] as DecimalInput).minus(1));
+    rets.push(r.div(closes.length));
+  }
+  const mean = rets.reduce((s, x) => s.plus(x), ZERO).div(days);
+  const variance = rets.reduce((s, x) => s.plus(x.minus(mean).pow(2)), ZERO).div(days - 1);
+  return variance.mul(365).sqrt();
+}
+
+/**
+ * The share of the book the plan wants in the market: nothing while the two lines do not read bull; otherwise PLAN_TARGET_VOL
+ * over the mix's volatility, at most PLAN_MAX_EXPOSURE. null while bull with the volatility unknown (or zero): the holding is then left as it is.
+ */
+export function planTarget(bull: boolean, vol: DecimalInput | null): Decimal | null {
+  if (!bull) return ZERO;
+  if (vol === null || !D(vol).gt(0)) return null;
+  const x = D(PLAN_TARGET_VOL).div(vol);
+  return x.gt(PLAN_MAX_EXPOSURE) ? D(PLAN_MAX_EXPOSURE) : x;
 }
 
 export interface CarryCandidate {

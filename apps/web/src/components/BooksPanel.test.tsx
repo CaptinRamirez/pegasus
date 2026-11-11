@@ -37,6 +37,7 @@ const view: BooksView = {
   error: null,
   books: [book('regime', '10010'), book('hold', '10010'), book('carryPos', '9990'), book('carryNeg', '10005')],
   regime: { ts: NOW, bull: true, close: '80466.1', sma200: '73197.5', sma50w: '75739.4' },
+  plan: null,
   nextDecisionAt: NOW + 12 * 3_600_000,
   serverTime: NOW,
 };

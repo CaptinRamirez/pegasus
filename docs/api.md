@@ -637,7 +637,7 @@ at 10x on a hard-capped pot. Settings (`.env`):
 | `CAMPAIGN_MIN_STAKE` | `5.6` | the smallest stake; one above `CAMPAIGN_POT_START` is refused |
 | `CAMPAIGN_STRUCTURE` | `pyramid` | `pyramid` (a campaign that works adds to itself) or `noadd` |
 | `CAMPAIGN_CUT_HOUR` | `0` | UTC hour the campaign's daily bars close at: `0` (OKX's own `1Dutc` / `12Hutc` bars) or `4`, `8`, `12`, `16`, `20` (bars built from its `4H` candles; the 12-hour closes are at it and 12 hours later). Followed by the campaign, `GET /api/campaign/signals`, channel trailing and the replay beside the pot; a pot keeps the cut it was started with (another setting blocks it with `LEDGER_UNREADABLE`). `20` adopted on 2026-10-18 |
-| `BOOKS_ENABLED` | `0` | `1` keeps the six paper books (`docs/proposals/paper-books-2026-11.md`) on OKX's public data; the launcher sets it on the plain paper stack and turns it off on the campaign and trader stacks |
+| `BOOKS_ENABLED` | `0` | `1` keeps the six paper books (`docs/proposals/paper-books-2026-11.md`) and the plan with its control (`docs/proposals/complete-strategy-2026-11.md`) on OKX's public data; the launcher sets it on the plain paper stack and turns it off on the campaign and trader stacks |
 | `BOOKS_FILE` | `data/books.json` | the books' ledger |
 | `BOOKS_START` | `10000` | what each book starts with, USDT |
 | `WHALES_FILE` | `data/hyperliquid-whales.jsonl` | with `BOOKS_ENABLED=1`: every 4 hours, the Hyperliquid leaderboard's 100 largest accounts and their open positions, one JSON line per snapshot (`services/whales.ts`) |
@@ -1129,9 +1129,16 @@ the positive carry (BTC and ETH spot long, perp short), the negative carry (perp
 the dip long (5-day perp longs on 30 coins whose 1H/4H/1D/1W features meet one of 20 trained rules, `packages/shared/src/mtf-features.ts`)
 and the ladder (ETH and BTC perps bought in lots of 10% of the start on the way down, up to 5 a coin, never stopped, sold
 together on the bounce when in profit; decided every hour once the 1H bars are confirmed).
-Fills at the ask and the bid of OKX's tickers at its taker fees (spot 0.1%, swap 0.05%); funding as OKX settles it;
-borrow interest hourly at the higher of OKX's posted base rate and its latest Simple Earn lending rate; the hedged legs
-are not margined. The route answers on every stack; where the books do not run, `enabled` is false.
+With them, in the same file and on the PLAN tab of the page, the plan of `docs/proposals/complete-strategy-2026-11.md`
+(`plan`: BTC-USDT and ETH-USDT spot, half each, held only while the two lines read bull, at `PLAN_TARGET_VOL` (0.45) over
+the annualised volatility of the two coins' mix over the last 30 closed days and at most the whole book, traded at the
+daily decision only when the holding is more than 10 points of the book off that target, all sold when not bull) and its
+control (`planHold`: half the book in each coin at the start, kept).
+Fills at the ask and the bid of OKX's tickers at its taker fees (spot 0.1%, swap 0.05%); funding as OKX settles it,
+booked before any decision that may close a position; borrow interest hourly at the higher of OKX's posted base rate
+and its latest Simple Earn lending rate; the hedged legs are not margined. A position whose coin has no quote waits
+for one; a ledger file that is there and cannot be read is never written over (the look fails and is tried again).
+The route answers on every stack; where the books do not run, `enabled` is false.
 
 ```
 GET /api/books -> BooksView (packages/shared/src/books.ts)
@@ -1139,8 +1146,9 @@ GET /api/books -> BooksView (packages/shared/src/books.ts)
   enabled: boolean;
   status: 'disabled' | 'starting' | 'running';
   error: string | null;                                // the last look's failure; tried again every minute
-  books: BookView[];                                   // regime, hold, carryPos, carryNeg, dipLong, ladder: equity, returnPct, maxDrawdownPct, positions (legs, funding, interest, fees, value), hourly curve, the last 60 events
+  books: BookView[];                                   // regime, hold, carryPos, carryNeg, dipLong, ladder, plan, planHold: equity, returnPct, maxDrawdownPct, positions (legs, funding, interest, fees, value), hourly curve, the last 60 events
   regime: { ts; bull; close; sma200; sma50w } | null;  // the two lines as last read
+  plan: { ts; vol; target; targetIfBull; exposure } | null; // the plan's last daily decision, shares of the book as decimals: the mix's volatility, the exposure wanted (0 while not bull; null with the volatility unknown), the one it would want if bull, the one held before the day's trades
   nextDecisionAt: number | null;                       // 00:05 UTC of the next day
   serverTime: number;
 }

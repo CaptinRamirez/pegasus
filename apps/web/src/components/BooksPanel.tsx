@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState, type ReactNode } from 'react';
-import { BOOK_KEYS, type BookEvent, type BookKey, type BooksView, type BookView } from '@pegasus/shared';
+import { BOOK_KEYS, PLAN_KEYS, type BookEvent, type BookKey, type BooksView, type BookView } from '@pegasus/shared';
 import { useBooks } from '../hooks/useBooks';
 import { useLineChart, type LineChartSeries } from '../hooks/useLineChart';
 import { labelOf, useT } from '../i18n';
@@ -7,12 +7,15 @@ import { DASH, fmtLocalMinute, fmtNum, fmtSigned, fmtUtcMinute, signOf } from '.
 import { Countdown } from './campaign/CampaignSummary';
 import { LoadFailed } from './LoadFailed';
 
-/** One line colour per book, in this order (blue, orange, violet, yellow, magenta, teal): checked for colour-blind separation as a set; the legend names each line. */
-export const BOOK_COLOR: Record<BookKey, string> = { regime: '#2a78d6', hold: '#eb6834', carryPos: '#6250d6', carryNeg: '#eda100', dipLong: '#e87ba4', ladder: '#139a8c' };
+/**
+ * One line colour per book, in this order (blue, orange, violet, yellow, magenta, teal): checked for colour-blind separation as a
+ * set; the legend names each line. The plan and its control are drawn on a page of their own, in the first two colours.
+ */
+export const BOOK_COLOR: Record<BookKey, string> = { regime: '#2a78d6', hold: '#eb6834', carryPos: '#6250d6', carryNeg: '#eda100', dipLong: '#e87ba4', ladder: '#139a8c', plan: '#2a78d6', planHold: '#eb6834' };
 
-const when = (ts: number): string => `${fmtLocalMinute(ts)} · ${fmtUtcMinute(ts)}`;
+export const when = (ts: number): string => `${fmtLocalMinute(ts)} · ${fmtUtcMinute(ts)}`;
 
-function Signed({ v, dp = 2, unit = '' }: { v: string | null; dp?: number; unit?: string }) {
+export function Signed({ v, dp = 2, unit = '' }: { v: string | null; dp?: number; unit?: string }) {
   if (v === null) return <>{DASH}</>;
   const s = signOf(v);
   return (
@@ -23,7 +26,7 @@ function Signed({ v, dp = 2, unit = '' }: { v: string | null; dp?: number; unit?
   );
 }
 
-function Field({ k, children }: { k: string; children: ReactNode }) {
+export function Field({ k, children }: { k: string; children: ReactNode }) {
   return (
     <div className="campaign-field">
       <span className="k">{k}</span>
@@ -32,7 +35,7 @@ function Field({ k, children }: { k: string; children: ReactNode }) {
   );
 }
 
-function BookCard({ book }: { book: BookView }) {
+export function BookCard({ book }: { book: BookView }) {
   const t = useT();
   return (
     <section className="campaign-card books-card">
@@ -51,7 +54,7 @@ function BookCard({ book }: { book: BookView }) {
   );
 }
 
-function Curves({ books }: { books: BookView[] }) {
+export function Curves({ books }: { books: BookView[] }) {
   const t = useT();
   const series = useMemo<LineChartSeries[]>(() => books.map((b) => ({ id: b.key, color: BOOK_COLOR[b.key], dashed: false, points: b.curve.map(([ts, value]) => ({ ts, value })) })), [books]);
   const [hoverTs, setHoverTs] = useState<number | null>(null);
@@ -86,7 +89,7 @@ function Curves({ books }: { books: BookView[] }) {
   );
 }
 
-function Positions({ books }: { books: BookView[] }) {
+export function Positions({ books }: { books: BookView[] }) {
   const t = useT();
   const rows = books.flatMap((b) => b.positions.map((p) => ({ b, p })));
   return (
@@ -138,7 +141,7 @@ function Positions({ books }: { books: BookView[] }) {
   );
 }
 
-function Ledger({ books }: { books: BookView[] }) {
+export function Ledger({ books }: { books: BookView[] }) {
   const t = useT();
   const events = books.flatMap((b) => b.events.map((e) => ({ key: b.key, e }))).sort((x, y) => y.e.ts - x.e.ts).slice(0, 60);
   const amount = (e: BookEvent) => (e.amount === null ? DASH : <Signed v={e.amount} />);
@@ -174,7 +177,7 @@ export function BooksBody({ view }: { view: BooksView }) {
       </div>
     );
   }
-  const books = BOOK_KEYS.map((k) => view.books.find((b) => b.key === k)).filter((b): b is BookView => b !== undefined);
+  const books = BOOK_KEYS.filter((k) => !PLAN_KEYS.includes(k)).map((k) => view.books.find((b) => b.key === k)).filter((b): b is BookView => b !== undefined);
   return (
     <div className="campaign books">
       <div className="campaign-note">{t.books.intro}</div>

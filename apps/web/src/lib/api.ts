@@ -174,7 +174,7 @@ export const api = {
   campaign: () => http<CampaignView>('/api/campaign'),
   /** The Claude trader's state. */
   trader: () => http<TraderView>('/api/trader'),
-  /** The four paper books. */
+  /** The paper books: the six strategies, the plan and its control. */
   books: () => http<BooksView>('/api/books'),
   /** The trader's decision log, newest first, without the dossiers. */
   traderLog: (limit: number) => http<{ records: TraderLogRecord[] }>('/api/trader/log', { query: { limit } }),
