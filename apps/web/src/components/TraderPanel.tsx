@@ -63,13 +63,7 @@ function StatusCard({ view }: { view: TraderView }) {
       <Field k={t.trader.model}>{view.model}</Field>
       <div className="campaign-note trader-guardrails" title={t.trader.guardrails}>
         {view.leader !== undefined
-          ? t.trader.leaderRulesLine({
-              lot: fmtPct(view.leader.rules.lotShare, 0),
-              maxLots: view.leader.rules.maxLots,
-              addAtr: view.leader.rules.addAtr,
-              exposure: fmtPct(view.leader.rules.maxExposure, 0),
-              breaker: fmtPct(view.leader.rules.breakerPct, 0),
-            })
+          ? t.trader.leaderRulesLine({ exposure: view.leader.rules.maxExposure, maintenance: fmtPct(view.leader.rules.maintenance, 1) })
           : t.trader.guardrailsLine({
               risk: fmtPct(g.riskPct, 2),
               trades: g.maxTradesPerDay,
@@ -174,7 +168,7 @@ function PositionCard({ position }: { position: NonNullable<TraderView['position
   );
 }
 
-/** The lead-trader style: the ladders of the coins, the exposure and the breaker. */
+/** The lead-trader style: the positions of the coins, the exposure and the liquidation line. */
 function LeaderCard({ leader }: { leader: LeaderInfo }) {
   const t = useT();
   const coin = (instId: string): string => instId.split('-')[0] ?? instId;
@@ -188,7 +182,7 @@ function LeaderCard({ leader }: { leader: LeaderInfo }) {
         </div>
       )}
       <Field k={t.trader.startEquity}>{fmtNum(leader.startEquity, 2)}</Field>
-      <Field k={t.trader.breakerEquity}>{fmtNum(leader.breakerEquity, 2)}</Field>
+      <Field k={t.trader.liquidationEquity}>{fmtNum(leader.liquidationEquity, 2)}</Field>
       <Field k={t.trader.exposure}>
         {fmtNum(leader.exposure, 2)} <span className="dim">({fmtPct(leader.exposurePct, 0)})</span>
       </Field>
@@ -197,11 +191,11 @@ function LeaderCard({ leader }: { leader: LeaderInfo }) {
           <thead>
             <tr>
               <th className="left">{t.trader.coin}</th>
+              <th className="left">{t.trader.sideLabel}</th>
               <th>{t.trader.lots}</th>
               <th>{t.trader.contracts}</th>
               <th>{t.trader.avgEntry}</th>
               <th>{t.trader.lastLot}</th>
-              <th>{t.trader.nextAddBelow}</th>
               <th>{t.trader.notional}</th>
               <th>{t.trader.unrealized}</th>
               <th className="left">{t.trader.nextLookAt}</th>
@@ -211,11 +205,11 @@ function LeaderCard({ leader }: { leader: LeaderInfo }) {
             {leader.coins.map((c) => (
               <tr key={c.instId}>
                 <td className="left">{coin(c.instId)}</td>
+                <td className="left">{c.side === null ? DASH : labelOf(t.trader.side, c.side)}</td>
                 <td>{c.lots.length === 0 ? <span className="dim">{t.trader.noLots}</span> : c.lots.length}</td>
                 <td>{fmtContracts(c.contracts)}</td>
                 <td>{c.avgPx === null ? DASH : fmtPx(c.avgPx)}</td>
                 <td>{c.lastLotPx === null ? DASH : fmtPx(c.lastLotPx)}</td>
-                <td>{c.nextAddBelow === null ? DASH : fmtPx(c.nextAddBelow)}</td>
                 <td>{fmtNum(c.notional, 2)}</td>
                 <td>
                   <Pnl v={c.unrealizedPnl} />

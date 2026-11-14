@@ -143,7 +143,9 @@ export const TRADER_INSTRUMENTS = 'BTC-USDT-SWAP,ETH-USDT-SWAP';
  * paper trading on the trader's own paper account, data/paper-trader.json, opened with `balance` USDT, BTC and ETH, the
  * trader enabled and the campaign off, its own state, journal, log directory and ports, so that it runs beside the
  * other stacks, and the risk engine's limits in the account's own scale: one order or position at most the account at
- * 10x, the loss limit the account itself (the trader's own guardrails are the binding ones). It wins over .env;
+ * 10x, the loss limit the account itself (the trader's own guardrails are the binding ones). The paper exchange gives a
+ * new position 10x (PAPER_LEVERAGE), so that the lead-trader style's cross positions have the margin for three times the
+ * equity (LEADER_RULES.maxExposure; a position opened at the earlier 3x keeps it until it is closed). It wins over .env;
  * ANTHROPIC_API_KEY stays .env's.
  */
 export function traderEnv(port = TRADER_PORTS.paper, balance = TRADER_BALANCE, ports = TRADER_PORTS, instId = 'BTC-USDT-SWAP') {
@@ -165,6 +167,7 @@ export function traderEnv(port = TRADER_PORTS.paper, balance = TRADER_BALANCE, p
     PAPER_STATE_FILE: 'data/paper-trader.json',
     PAPER_INSTRUMENTS: TRADER_INSTRUMENTS,
     PAPER_BALANCE: balance,
+    PAPER_LEVERAGE: '10',
     RISK_MAX_LEVERAGE: '10',
     RISK_MAX_ORDER_NOTIONAL: maxNotional,
     RISK_MAX_POSITION_NOTIONAL_PER_INSTRUMENT: maxNotional,

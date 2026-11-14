@@ -642,7 +642,7 @@ at 10x on a hard-capped pot. Settings (`.env`):
 | `BOOKS_START` | `10000` | what each book starts with, USDT |
 | `WHALES_FILE` | `data/hyperliquid-whales.jsonl` | with `BOOKS_ENABLED=1`: every 4 hours, the Hyperliquid leaderboard's 100 largest accounts and their open positions, one JSON line per snapshot (`services/whales.ts`) |
 | `TRADER_ENABLED` | `0` | `1` runs the Claude auto trader (`docs/proposals/claude-auto-trader.md`); paper only, refused with `CAMPAIGN_ENABLED=1` on the same stack (`pnpm start --trader` sets everything) |
-| `TRADER_STYLE` | `leader` | `leader` (since 2026-11-08): the lead-trader style of `services/trader-leader.ts`, BTC and ETH long only in lots of 10% of the equity, the next lot a daily ATR14 under the last, 5 lots a coin, all positions at most 1x the equity, cross margin, no stop, the breaker selling everything at a 40% loss from the start (`LEADER_RULES`, `checkLeaderDecision` in `packages/shared/src/trader.ts`); asked at every daily close, at its recheck time and at the levels it names, every day (after a restart, at the first close of a UTC day it has not been asked in; a wake level the mark has already passed is dropped). `stops`: the earlier style of `services/trader.ts` below (one position of `TRADER_INSTRUMENT` with a stop and a target, weekdays). The styles keep separate state files: a flat file of the other style is moved aside (`.stops-v1` / `.leader-v2`), one holding a position or lots blocks the trader |
+| `TRADER_STYLE` | `leader` | `leader` (since 2026-11-08; freed on 2026-11-14): the lead-trader style of `services/trader-leader.ts`, BTC and ETH long or short, one side a coin at a time, in lots of the size the model names (`lotShare`, a multiple of the equity), all positions at most 3x the equity, cross margin, no stop order, no breaker; the paper exchange never liquidates a cross position, so the trader closes everything and stops when the equity is at or under 0.5% of the positions' notional (`LEADER_RULES`, `checkLeaderDecision` in `packages/shared/src/trader.ts`; the launcher gives the trader's paper exchange `PAPER_LEVERAGE=10` so that the margin allows 3x); asked at every daily close, at its recheck time and at the levels it names, every day (after a restart, at the first close of a UTC day it has not been asked in; a wake level the mark has already passed is dropped). `stops`: the earlier style of `services/trader.ts` below (one position of `TRADER_INSTRUMENT` with a stop and a target, weekdays). The styles keep separate state files: a flat file of the other style is moved aside (`.stops-v1` / `.leader-v2`), one holding a position or lots blocks the trader |
 | `TRADER_INSTRUMENT` | `BTC-USDT-SWAP` | the one USDT swap the `stops` style trades; the `leader` style trades `LEADER_INSTRUMENTS` (BTC and ETH), tracked while the trader is enabled |
 | `TRADER_SESSION` | `0-24` | UTC hours in which it is asked and opens positions, Monday to Friday (by default the whole weekday, Asia to America, for the owner's daily-level trades; `13-21` is the US session); there is none on the weekend, and a position is left to its stop outside it |
 | `TRADER_RISK_PCT` | `0.05` | loss accepted per trade, fraction of the equity (0.10 from the owner's "all out" of 2026-10-27 until the owner lowered it on 2026-11-05; at 10x a stop closer than 0.5% cannot use all of it) |
@@ -1086,29 +1086,29 @@ GET /api/trader -> TraderView (packages/shared/src/trader.ts)
 {
   enabled: boolean;
   style: 'stops' | 'leader';
-  leader?: {                                          // the leader style: its rules, ladders and breaker
-    rules: { lotShare; maxLots; addAtr; maxExposure; breakerPct; recheckMinMinutes; recheckMaxMinutes };
-    startEquity: string; breakerEquity: string;       // the equity the record began with, and (1 - breakerPct) of it
-    exposure: string; exposurePct: string;            // every position at the marks, and as a fraction of the equity
-    halted: string | null;                            // why the trader stopped (the breaker); status blocked, reason BREAKER
-    coins: Array<{ instId; lots: Array<{ contracts; entryPx; openedAt; clOrdId }>; contracts; avgPx; lastLotPx; notional; unrealizedPnl; atr; nextAddBelow; wake }>;
+  leader?: {                                          // the leader style: its rules and positions
+    rules: { maxExposure; maintenance; recheckMinMinutes; recheckMaxMinutes };
+    startEquity: string; liquidationEquity: string;   // the equity the record began with, and the equity at or under which the positions are liquidated (rules.maintenance of their notional)
+    exposure: string; exposurePct: string;            // every position at the marks, long and short added, and as a multiple of the equity
+    halted: string | null;                            // why the trader stopped (the liquidation); status blocked, reason LIQUIDATED
+    coins: Array<{ instId; side: 'long' | 'short' | null; lots: Array<{ contracts; entryPx; openedAt; clOrdId }>; contracts; avgPx; lastLotPx; notional; unrealizedPnl; atr; wake }>;
   };
   cadence: 'model' | 'hourly' | '15m';
   wake: { at: number; above: string | null; below: string | null; setAt: number } | null;   // the next look the model asked for
   upcoming: TraderMacroEvent[];                      // releases still to come in the next day
   status: 'disabled' | 'blocked' | 'idle' | 'in-session' | 'holding';
-  reason: { code: string; message: string } | null;   // blocked: STATE_UNREADABLE, NO_MODEL_CREDENTIALS, ACCOUNT_UNAVAILABLE, FOREIGN_POSITION (a position on its account it did not open: it asks and opens nothing until it is closed), BREAKER (the leader style stopped); in the leader style FOREIGN_POSITION comes with status holding or in-session: only that coin is left alone
+  reason: { code: string; message: string } | null;   // blocked: STATE_UNREADABLE, NO_MODEL_CREDENTIALS, ACCOUNT_UNAVAILABLE, FOREIGN_POSITION (a position on its account it did not open: it asks and opens nothing until it is closed), LIQUIDATED (the leader style stopped); in the leader style FOREIGN_POSITION comes with status holding or in-session: only that coin is left alone
   instId: string;
   session: { startHour: number; endHour: number; inSession: boolean };   // UTC
   guardrails: TraderGuardrails;                        // riskPct, maxTradesPerDay, dailyLossPct, maxConsecutiveLosses, cooldownMs, session hours, maxLeverage, maxLimitDistancePct (a stop closer to the entry than one daily ATR14 is widened to it; the dossier's `holds` names why every entry is refused at the moment: no weekly trend, the day of and after a big US release or election, the last 24 hours' range beyond 1.5 daily ATR), counterRiskPct / counterMaxLeverage / counterMaxHoldMs (an entry against the weekly trend of the dossier's `trend`: 2%, 3x, closed at the market after 12 hours; position.closeAt)
   model: string;
   nextCallAt: number | null;                           // the next hourly close in session (every 15 minutes with TRADER_CADENCE=15m); Monday's open over the weekend
-  last: { ts; decision: TraderDecision | LeaderDecision | null; verdict: string; executed: boolean; usage; triggers: string[]; error: string | null } | null;   // LeaderDecision: action buy | sell | hold, confidence, reasons, invalidation, oneLiner, recheckMinutes, wakeAbove, wakeBelow
+  last: { ts; decision: TraderDecision | LeaderDecision | null; verdict: string; executed: boolean; usage; triggers: string[]; error: string | null } | null;   // LeaderDecision: action buy | short | close | hold (sell in the records before 2026-11-14), lotShare, confidence, reasons, invalidation, oneLiner, recheckMinutes, wakeAbove, wakeBelow
   position: TraderPosition & { unrealizedPnl: string | null } | null;   // null in the leader style (see leader.coins)
   today: { date; trades; pnl; consecutiveLosses; cooldownUntil; equityAtStart };
   usageToday: { calls; inputTokens; outputTokens; estimatedUsd };
   control: { position; trades; pnlTotal; wins; losses } | null;   // the coin-flip control (TRADER_CONTROL=1); its position carries tp1Px until the ladder's first leg fills, then banked
-  recent: TraderTradeResult[];                         // newest first, at most 50; in the leader style each carries instId and ends by close (the model's sale), breaker or external, its pnl the lots against the mark less taker fees (funding not in it; the journal has the exact trade)
+  recent: TraderTradeResult[];                         // newest first, at most 50; in the leader style each carries instId and its side and ends by close (the model's), liquidation, external or, before 2026-11-14, breaker, its pnl the lots against the mark less taker fees (funding not in it; the journal has the exact trade)
   serverTime: number;
 }
 

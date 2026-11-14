@@ -103,8 +103,9 @@ const envSchema = z.object({
   /** '1' runs the Claude auto trader (docs/proposals/claude-auto-trader.md): paper trading only, on a stack of its own (never with CAMPAIGN_ENABLED=1). */
   TRADER_ENABLED: z.enum(['0', '1']).default('0'),
   /**
-   * leader (the default since 2026-11-08): the lead-trader style of services/trader-leader.ts, BTC and ETH long only in lots,
-   * cross margin, no stop, the breaker at 40% (LEADER_RULES in @pegasus/shared). stops: the earlier style of services/trader.ts,
+   * leader (the default since 2026-11-08, freed on 2026-11-14): the lead-trader style of services/trader-leader.ts, BTC and ETH
+   * long or short in lots of the size the model names, at most three times the equity, cross margin, no stop order, no
+   * breaker (LEADER_RULES in @pegasus/shared). stops: the earlier style of services/trader.ts,
    * one position of TRADER_INSTRUMENT with a stop and a target. The two keep separate state files: a flat file of the other
    * style is moved aside, one with a position blocks the trader.
    */

@@ -25,7 +25,7 @@ function candles(instId: string, step: number, end: number, n = 30): Candle[] {
 }
 
 const usage = { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, ms: 1, model: 'fake' };
-const answer = (action: LeaderDecision['action']): LeaderDecision => ({ action, confidence: 0.6, reasons: ['r'], invalidation: 'i', oneLiner: 'o', recheckMinutes: 240, wakeAbove: null, wakeBelow: null });
+const answer = (action: LeaderDecision['action'], lotShare = 0.1): LeaderDecision => ({ action, lotShare, confidence: 0.6, reasons: ['r'], invalidation: 'i', oneLiner: 'o', recheckMinutes: 240, wakeAbove: null, wakeBelow: null });
 
 interface World {
   positions: Position[];
@@ -48,15 +48,17 @@ function build(dir: string): { service: LeaderTraderService; world: World; confi
     account: { get ready() { return true; }, get balance() { return { totalEq: world.equity }; }, positionList: () => world.positions, config: { posMode: 'net_mode' } },
     risk: { state: { killSwitch: false } },
     orders: {
-      async place(req: Record<string, unknown> & { instId: string; size: { value: string } }) {
+      async place(req: Record<string, unknown> & { instId: string; side: string; size: { value: string } }) {
         world.placed.push(req);
         const held = world.positions.find((p) => p.instId === req.instId);
         const px = MARKS[req.instId] ?? '0';
+        // net mode: a short is a negative position
+        const sign = req.side === 'sell' ? -1 : 1;
         if (held) {
-          const qty = Number(held.pos) + Number(req.size.value);
-          held.avgPx = String((Number(held.avgPx) * Number(held.pos) + Number(px) * Number(req.size.value)) / qty);
-          held.pos = String(qty);
-        } else world.positions.push(position(req.instId, req.size.value, px));
+          const qty = Math.abs(Number(held.pos)) + Number(req.size.value);
+          held.avgPx = String((Number(held.avgPx) * Math.abs(Number(held.pos)) + Number(px) * Number(req.size.value)) / qty);
+          held.pos = String(sign * qty);
+        } else world.positions.push(position(req.instId, String(sign * Number(req.size.value)), px));
         return { order: { avgPx: px } };
       },
       async closePosition(req: { instId: string }) {
@@ -86,22 +88,22 @@ function build(dir: string): { service: LeaderTraderService; world: World; confi
 }
 
 describe('the lead-trader style service', () => {
-  it('asks each coin at the daily close, buys a lot where the model says buy, books a position gone as a result, and the breaker stops it', async () => {
+  it('asks each coin at the daily close, buys a lot where the model says buy, books a position gone as a result, and the liquidation stops it', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'pegasus-leader-'));
     const { service, world, config } = build(dir);
     world.script = ['hold', 'buy'];
     await service.start();
     expect(world.asked.map((d) => d.instId)).toEqual(['BTC-USDT-SWAP', 'ETH-USDT-SWAP']);
     const eth = world.asked[1] as TraderDossier;
-    expect(eth.leader).toMatchObject({ coin: { instId: 'ETH-USDT-SWAP', lots: [] }, lotNow: { contracts: '0.5', notional: '112' }, buyRefused: null, startEquity: '1124', breakerEquity: '674.4', exposure: '0' });
+    expect(eth.leader).toMatchObject({ coin: { instId: 'ETH-USDT-SWAP', side: null, lots: [] }, room: '3372', openRefused: null, startEquity: '1124', liquidationEquity: '0', exposure: '0' });
     expect(eth.triggers).toEqual(['daily close']);
     expect(world.placed).toHaveLength(1);
     expect(world.placed[0]).toMatchObject({ instId: 'ETH-USDT-SWAP', side: 'buy', ordType: 'market', tdMode: 'cross', size: { unit: 'contracts', value: '0.5' } });
     let state = service.stateCopy();
-    expect(state.coins.find((c) => c.instId === 'ETH-USDT-SWAP')).toMatchObject({ lots: [{ contracts: '0.5', entryPx: '2240' }], lastCallAt: Date.UTC(2026, 10, 9) });
+    expect(state.coins.find((c) => c.instId === 'ETH-USDT-SWAP')).toMatchObject({ side: 'long', lots: [{ contracts: '0.5', entryPx: '2240' }], lastCallAt: Date.UTC(2026, 10, 9) });
     expect(state.lotsToday).toBe(1);
     const view = service.view();
-    expect(view).toMatchObject({ style: 'leader', status: 'holding', leader: { exposure: '112', coins: [{ instId: 'BTC-USDT-SWAP', lots: [] }, { instId: 'ETH-USDT-SWAP', contracts: '0.5', avgPx: '2240', nextAddBelow: expect.any(String) }] } });
+    expect(view).toMatchObject({ style: 'leader', status: 'holding', leader: { exposure: '112', coins: [{ instId: 'BTC-USDT-SWAP', lots: [] }, { instId: 'ETH-USDT-SWAP', side: 'long', contracts: '0.5', avgPx: '2240' }] } });
     expect(view.last?.verdict).toMatch(/^lot 1: 0.5 contracts bought at 2240/);
     // the wake is four hours away: the next close asks nothing
     world.now = Date.UTC(2026, 10, 9, 0, 15, 5);
@@ -116,19 +118,25 @@ describe('the lead-trader style service', () => {
     expect(state.coins.find((c) => c.instId === 'ETH-USDT-SWAP')?.lots).toEqual([]);
     // 0.5 contracts of 0.1 ETH, 60 up: 3, less the taker fee on 112 + 115
     expect(state.recent[0]).toMatchObject({ instId: 'ETH-USDT-SWAP', side: 'long', entryPx: '2240', exitPx: '2300', contracts: '0.5', pnl: '2.8865', end: 'external' });
-    // the breaker: the equity at 60% of the start sells everything and stops the trader
+    // the liquidation: the equity at 0.5% of the 106.4 held closes everything and stops the trader; a 40% loss does not
     world.script = ['buy'];
     world.now = Date.UTC(2026, 10, 10, 0, 0, 5);
     await service.tick();
     expect(world.positions).toHaveLength(1);
-    world.equity = '674';
+    world.equity = '600';
     world.now = Date.UTC(2026, 10, 10, 0, 15, 5);
     await service.tick();
+    expect(world.closed).toEqual([]);
+    expect(service.view()).toMatchObject({ status: 'holding', leader: { liquidationEquity: '0.53', halted: null } });
+    // between two closes too: the liquidation is looked at at every look
+    world.equity = '0.5';
+    world.now = Date.UTC(2026, 10, 10, 0, 16, 5);
+    await service.tick();
     expect(world.closed).toEqual(['BTC-USDT-SWAP']);
-    expect(service.view()).toMatchObject({ status: 'blocked', reason: { code: 'BREAKER' } });
+    expect(service.view()).toMatchObject({ status: 'blocked', reason: { code: 'LIQUIDATED' } });
     world.now = Date.UTC(2026, 10, 10, 0, 30, 5);
     await service.tick();
-    expect(service.stateCopy().recent[0]).toMatchObject({ instId: 'BTC-USDT-SWAP', end: 'breaker' });
+    expect(service.stateCopy().recent[0]).toMatchObject({ instId: 'BTC-USDT-SWAP', end: 'liquidation' });
     const log = readFileSync(config.logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { kind: string; lot?: { side: string; lots: number } });
     expect(log.filter((r) => r.kind === 'decision')).toHaveLength(4);
     expect(log.filter((r) => r.kind === 'execution').map((r) => r.lot)).toEqual([{ clOrdId: expect.any(String), side: 'buy', contracts: '0.5', px: '2240', lots: 1, notional: '112' }, { clOrdId: expect.any(String), side: 'buy', contracts: '0.14', px: '76000', lots: 1, notional: '106.4' }]);
@@ -164,11 +172,43 @@ describe('the lead-trader style service', () => {
     expect(view).toMatchObject({ status: 'holding', reason: { code: 'FOREIGN_POSITION' } });
     expect(view.nextCallAt).not.toBeNull();
     expect(view.today.equityAtStart).toBe('1124');
-    // the breaker leaves the foreign position alone
-    world.equity = '600';
+    // the liquidation (0.5% of the 760 + 112 at the marks) leaves the foreign position alone
+    world.equity = '4';
     world.now = Date.UTC(2026, 10, 10, 0, 15, 5);
     await service.tick();
     expect(world.closed).toEqual(['ETH-USDT-SWAP']);
+  });
+
+  it('opens a short of the size the model names, refuses the other side while it is held, and closes it at a loss when the model says close', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pegasus-leader-'));
+    const { service, world } = build(dir);
+    // 1.5 times the equity short on BTC: 1,686 USDT at 76,000 = 2.21 contracts of 0.01 BTC
+    world.script = [answer('short', 1.5), 'hold'];
+    await service.start();
+    expect(world.placed).toEqual([expect.objectContaining({ instId: 'BTC-USDT-SWAP', side: 'sell', ordType: 'market', tdMode: 'cross', size: { unit: 'contracts', value: '2.21' } })]);
+    expect(service.stateCopy().coins[0]).toMatchObject({ side: 'short', lots: [{ contracts: '2.21', entryPx: '76000' }] });
+    expect(service.view().last?.verdict).toBe('hold');
+    // the recheck four hours later: a buy against the short lots is refused, and the dossier shows the side and the room left
+    world.script = ['buy', 'hold'];
+    world.now = Date.UTC(2026, 10, 9, 4, 0, 5);
+    await service.tick();
+    expect(world.asked[2]?.leader).toMatchObject({ coin: { side: 'short', contracts: '2.21' }, exposure: '1679.6', room: '1692.4', liquidationEquity: '8.4' });
+    expect(service.stateCopy().coins[0]?.recentDecisions[0]).toMatchObject({ action: 'buy', verdict: expect.stringContaining('close them before opening a long lot') });
+    expect(world.placed).toHaveLength(1);
+    // the mark goes 1,000 against the short; the model closes at a loss
+    MARKS['BTC-USDT-SWAP'] = '77000';
+    world.script = ['close', 'hold'];
+    world.now = Date.UTC(2026, 10, 9, 8, 0, 5);
+    await service.tick();
+    expect(world.closed).toEqual(['BTC-USDT-SWAP']);
+    expect(service.stateCopy().coins[0]?.recentDecisions[0]).toMatchObject({ action: 'close', verdict: '1 lots, 2.21 contracts short, closed at the market (mark 77000)' });
+    world.now = Date.UTC(2026, 10, 9, 8, 15, 5);
+    await service.tick();
+    // 2.21 contracts of 0.01 BTC, 1,000 against: -22.1, less the taker fee on 1,679.6 + 1,701.7
+    expect(service.stateCopy().recent[0]).toMatchObject({ instId: 'BTC-USDT-SWAP', side: 'short', entryPx: '76000', exitPx: '77000', contracts: '2.21', pnl: '-23.79065', end: 'close' });
+    expect(service.stateCopy().coins[0]).toMatchObject({ lots: [] });
+    expect(service.stateCopy().coins[0]?.side).toBeUndefined();
+    MARKS['BTC-USDT-SWAP'] = '76000';
   });
 
   it('moves a flat state of the stops style aside, blocks on one holding a position, and reads its own', () => {

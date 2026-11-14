@@ -398,7 +398,8 @@ export interface TraderPreviousDecision {
   ts: number;
   /** Why it was asked then */
   triggers: string[];
-  action: TraderAction | LeaderAction;
+  /** sell: a close of the lead-trader style in the states written before 2026-11-14 */
+  action: TraderAction | LeaderAction | 'sell';
   oneLiner: string;
   invalidation: string;
   wakeAbove: string | null;
@@ -631,39 +632,36 @@ export function traderSize(input: { equity: DecimalInput; entryPx: DecimalInput;
   return { contracts: contracts.toFixed(), notional: notional.toFixed(), leverage: leverage.toFixed(0), riskQuote: riskQuote.toFixed() };
 }
 
-// ---- the lead-trader style (the owner, 2026-11-08) ----
+// ---- the lead-trader style (the owner, 2026-11-08; freed on 2026-11-14) ----
 
 /**
  * The owner, 2026-11-08, after the study of five OKX lead traders (data/leader-scripts/, docs/proposals/paper-books-
- * 2026-11.md, the sixth book): 「我原来得设想是让opus交易员以这几位欧意交易员为榜样」, then 「改吧」. The traders' way, as the
- * record showed it: long, in lots, a lot more each leg down, no stop, sold together on the bounce; what ruined the losers
- * was 50x on BTC and ETH, and giving up at the bottom. The code keeps the structure (LEADER_RULES, checkLeaderDecision):
- * LEADER_INSTRUMENTS long only, a lot of lotShare of the equity, the next lot at least addAtr daily ATR14 under the
- * last, maxLots a coin, all lots at most maxExposure of the equity (cross margin: nothing is liquidated at that
- * exposure), no stop, and the account's breaker: the equity under (1 - breakerPct) of the start closes everything and
- * stops the trader. The model chooses the coin, the first lot, the adds within the rule, and the sale.
+ * 2026-11.md, the sixth book): 「我原来得设想是让opus交易员以这几位欧意交易员为榜样」, then 「改吧」. The first rules kept the
+ * traders' structure tight: long only, a lot of a tenth of the equity, the next lot a daily ATR under the last, five lots
+ * a coin, all lots at most the equity, no sale at a loss in practice, a breaker at a 40% loss. The owner, 2026-11-13:
+ * 「你这交易员有问题，这不是属于抗大单赚小钱么？」 and 「现在的交易员太死板了，做法不像是他们的风格」; 2026-11-14, to the proposal
+ * to free it: 「那就放开吧，熔断线就去他妈的。」 What the code keeps now (LEADER_RULES, checkLeaderDecision): LEADER_INSTRUMENTS,
+ * either side, one side a coin at a time, a lot of the size the model names, all positions at most maxExposure of the
+ * equity, cross margin, no stop order, no breaker. The paper exchange never liquidates a cross position, so the trader
+ * does what the exchange would: the equity at or under `maintenance` of the positions' notional closes everything and
+ * stops the trader. The model chooses the coin, the side, the size, the adds, and the close, in profit or at a loss.
  */
 export const LEADER_INSTRUMENTS: readonly string[] = ['BTC-USDT-SWAP', 'ETH-USDT-SWAP'];
 
 export interface LeaderRules {
-  /** A lot's notional, fraction of the equity */
-  lotShare: string;
-  /** Lots a coin at most */
-  maxLots: number;
-  /** A lot is added only at or under the last lot's fill less this many daily ATR14 */
-  addAtr: string;
-  /** All lots of all coins at the marks, fraction of the equity, at most */
+  /** All positions of all coins at the marks, long and short added, as a multiple of the equity, at most */
   maxExposure: string;
-  /** The equity under (1 - breakerPct) of the start: everything is closed and the trader stops */
-  breakerPct: string;
+  /** The equity at or under this share of the positions' notional: liquidated, everything is closed and the trader stops */
+  maintenance: string;
   /** The model's recheck time is kept within these minutes */
   recheckMinMinutes: number;
   recheckMaxMinutes: number;
 }
 
-export const LEADER_RULES: LeaderRules = { lotShare: '0.1', maxLots: 5, addAtr: '1', maxExposure: '1', breakerPct: '0.4', recheckMinMinutes: 60, recheckMaxMinutes: 1440 };
+// shortcut: one maintenance rate for both coins (OKX tier 1: BTC 0.4%, ETH 0.5%, plus the liquidation fee), upgrade when the paper exchange liquidates cross positions itself
+export const LEADER_RULES: LeaderRules = { maxExposure: '3', maintenance: '0.005', recheckMinMinutes: 60, recheckMaxMinutes: 1440 };
 
-/** One lot of a coin's ladder, as the trader booked it. */
+/** One lot of a coin's position, as the trader booked it. */
 export interface LeaderLot {
   contracts: string;
   /** The fill */
@@ -672,31 +670,32 @@ export interface LeaderLot {
   clOrdId: string;
 }
 
-/** One coin's ladder as the model and the screen see it. */
+/** One coin's position as the model and the screen see it. */
 export interface LeaderCoinView {
   instId: string;
+  /** The side of the lots; null without lots */
+  side: 'long' | 'short' | null;
   lots: LeaderLot[];
-  /** The exchange's position (the lots' sum when it reports none) */
+  /** The exchange's position, unsigned (the lots' sum when it reports none) */
   contracts: string;
   avgPx: string | null;
   lastLotPx: string | null;
   /** The position at the mark */
   notional: string;
   unrealizedPnl: string | null;
-  /** The 1D ATR14 the lots are spaced by */
+  /** The 1D ATR14 */
   atr: string | null;
-  /** A lot may be added at or under this mark; null without lots or without an ATR */
-  nextAddBelow: string | null;
   /** The next look the model asked for on this coin */
   wake: TraderWake | null;
 }
 
 export interface LeaderInfo {
   rules: LeaderRules;
-  /** The equity the record began with; the breaker measures from it */
+  /** The equity the record began with */
   startEquity: string;
-  breakerEquity: string;
-  /** All positions at the marks, and as a fraction of the equity */
+  /** The equity at or under which the positions as they stand are liquidated: rules.maintenance of their notional */
+  liquidationEquity: string;
+  /** All positions at the marks, and as a multiple of the equity */
   exposure: string;
   exposurePct: string;
   /** Why the trader stopped; null while it trades */
@@ -704,21 +703,23 @@ export interface LeaderInfo {
   coins: LeaderCoinView[];
 }
 
-/** The leader block of a coin's dossier: the account's ladders, this coin's, and what a buy would do or why it is refused now. */
+/** The leader block of a coin's dossier: the account's positions, this coin's, and how much may still be opened or why nothing may. */
 export interface LeaderDossier extends LeaderInfo {
   coin: LeaderCoinView;
-  /** What a lot buys at the mark now; null under the minimum order */
-  lotNow: { contracts: string; notional: string } | null;
-  /** Why a buy would be refused at this moment; null when one would pass */
-  buyRefused: string | null;
+  /** The notional that may still be opened under rules.maxExposure, USDT */
+  room: string;
+  /** Why a lot of any size would be refused at this moment; null when one may be opened */
+  openRefused: string | null;
 }
 
-export const LEADER_ACTIONS = ['buy', 'sell', 'hold'] as const;
+export const LEADER_ACTIONS = ['buy', 'short', 'close', 'hold'] as const;
 export type LeaderAction = (typeof LEADER_ACTIONS)[number];
 
-/** What the model answers in the lead-trader style: buy a lot, sell the coin's lots, or hold. */
+/** What the model answers in the lead-trader style: a long lot, a short lot, the coin's position closed, or hold. */
 export const leaderDecisionSchema = z.object({
   action: z.enum(LEADER_ACTIONS),
+  /** buy and short: the lot's notional as a multiple of the equity (0.1 = a tenth of the account); 0 otherwise */
+  lotShare: z.number(),
   /** 0 to 1 */
   confidence: z.number(),
   reasons: z.array(z.string()),
@@ -732,42 +733,39 @@ export const leaderDecisionSchema = z.object({
 export type LeaderDecision = z.infer<typeof leaderDecisionSchema>;
 export type AnyTraderDecision = TraderDecision | LeaderDecision;
 
-export type LeaderVerdict = { ok: true; action: 'hold' } | { ok: true; action: 'sell' } | { ok: true; action: 'buy'; contracts: string; notional: string } | { ok: false; action: LeaderAction; reason: string };
+export type LeaderVerdict = { ok: true; action: 'hold' } | { ok: true; action: 'close' } | { ok: true; action: 'buy' | 'short'; contracts: string; notional: string } | { ok: false; action: LeaderAction; reason: string };
 
-/** What a lot buys: lotShare of the equity at the mark, in whole lots; null under the minimum order. Linear contracts. */
-export function leaderLotSize(equity: DecimalInput, mark: DecimalInput, inst: Instrument, rules: Pick<LeaderRules, 'lotShare'> = LEADER_RULES): { contracts: string; notional: string } | null {
+/** What a lot of `share` of the equity is at the mark, in whole lots; null under the minimum order. Linear contracts. */
+export function leaderLotSize(equity: DecimalInput, mark: DecimalInput, inst: Instrument, share: DecimalInput): { contracts: string; notional: string } | null {
   if (inst.ctType !== 'linear') throw new SignalError('BAD_INPUT', 'the trader sizes linear contracts only');
   const px = D(mark);
-  if (!D(equity).gt(0) || !px.gt(0)) return null;
-  const contracts = floorToStep(coinToContracts(D(equity).mul(rules.lotShare).div(px), inst), inst.lotSz);
+  if (!D(equity).gt(0) || !px.gt(0) || !D(share).gt(0)) return null;
+  const contracts = floorToStep(coinToContracts(D(equity).mul(share).div(px), inst), inst.lotSz);
   if (contracts.lt(inst.minSz) || !contracts.gt(0)) return null;
   return { contracts: contracts.toFixed(), notional: notionalQuote(contracts, px, inst).toFixed() };
 }
 
 /**
- * Whether a decision of the lead-trader style may be carried out. hold always; sell with a lot held; buy only while
- * `blocked` is null (the breaker, the kill switch, a position the trader did not open), under maxLots, with a lot held
- * only at or under the last lot's fill less addAtr daily ATR14s (`atr`, the 1D ATR14; none: refused), at a size above
- * the minimum order, and while all positions (`exposure`, at the marks) plus this lot stay within maxExposure of the equity.
+ * Whether a decision of the lead-trader style may be carried out. hold always; close with a lot held, in profit or at a
+ * loss; buy and short only while `blocked` is null (the trader stopped, the kill switch, a position the trader did not
+ * open, a close under way), not against lots of the other side (they are closed first), at a size above the minimum
+ * order, and while all positions (`exposure`, at the marks) plus this lot stay within maxExposure of the equity.
  */
-export function checkLeaderDecision(d: LeaderDecision, input: { mark: string; equity: string; coin: Pick<LeaderCoinView, 'lots' | 'lastLotPx'>; exposure: string; atr: string | null; inst: Instrument; rules?: LeaderRules; blocked: string | null }): LeaderVerdict {
+export function checkLeaderDecision(d: LeaderDecision, input: { mark: string; equity: string; coin: Pick<LeaderCoinView, 'lots' | 'side'>; exposure: string; inst: Instrument; rules?: LeaderRules; blocked: string | null }): LeaderVerdict {
   const rules = input.rules ?? LEADER_RULES;
   const lots = input.coin.lots.length;
   if (d.action === 'hold') return { ok: true, action: 'hold' };
-  if (d.action === 'sell') return lots > 0 ? { ok: true, action: 'sell' } : { ok: false, action: d.action, reason: 'sell without a lot' };
+  if (d.action === 'close') return lots > 0 ? { ok: true, action: 'close' } : { ok: false, action: d.action, reason: 'close without a lot' };
   if (input.blocked !== null) return { ok: false, action: d.action, reason: input.blocked };
-  if (lots >= rules.maxLots) return { ok: false, action: d.action, reason: `${lots} lots held: the most a coin may have` };
-  if (lots > 0) {
-    if (input.atr === null || !D(input.atr).gt(0)) return { ok: false, action: d.action, reason: 'no daily ATR to space the lots by' };
-    const under = D(input.coin.lastLotPx ?? 0).minus(D(input.atr).mul(rules.addAtr));
-    if (D(input.mark).gt(under)) return { ok: false, action: d.action, reason: `the mark ${input.mark} is not ${rules.addAtr} daily ATR (${input.atr}) under the last lot ${input.coin.lastLotPx ?? ''}: a lot is added at or under ${under.toFixed()}` };
-  }
-  const size = leaderLotSize(input.equity, input.mark, input.inst, rules);
-  if (size === null) return { ok: false, action: d.action, reason: `${D(rules.lotShare).mul(100).toFixed()}% of the equity ${input.equity} buys less than the minimum order` };
+  const side = d.action === 'buy' ? 'long' : 'short';
+  if (lots > 0 && input.coin.side !== side) return { ok: false, action: d.action, reason: `the coin holds ${input.coin.side ?? 'other'} lots: close them before opening a ${side} lot` };
+  if (!Number.isFinite(d.lotShare) || !(d.lotShare > 0)) return { ok: false, action: d.action, reason: `lotShare ${d.lotShare}: a lot needs a size above 0` };
+  const size = leaderLotSize(input.equity, input.mark, input.inst, d.lotShare);
+  if (size === null) return { ok: false, action: d.action, reason: `${D(d.lotShare).mul(100).toFixed()}% of the equity ${input.equity} is less than the minimum order` };
   const cap = D(input.equity).mul(rules.maxExposure);
   const after = D(input.exposure).plus(size.notional);
-  if (after.gt(cap)) return { ok: false, action: d.action, reason: `the positions would be ${after.toFixed(2)} at the marks, above ${D(rules.maxExposure).mul(100).toFixed()}% of the equity (${cap.toFixed(2)})` };
-  return { ok: true, action: 'buy', contracts: size.contracts, notional: size.notional };
+  if (after.gt(cap)) return { ok: false, action: d.action, reason: `the positions would be ${after.toFixed(2)} at the marks, above ${rules.maxExposure} times the equity (${cap.toFixed(2)}); ${Decimal.max(cap.minus(input.exposure), 0).toFixed(2)} may still be opened` };
+  return { ok: true, action: d.action, contracts: size.contracts, notional: size.notional };
 }
 
 // ---- time ----
@@ -832,8 +830,8 @@ export interface TraderTradeResult {
   exitPx: string | null;
   contracts: string;
   pnl: string;
-  /** How it ended: the stop, the target, the model's close, the session's end, an outside event, or the account's breaker (the lead-trader style) */
-  end: 'stop' | 'target' | 'close' | 'external' | 'breaker';
+  /** How it ended: the stop, the target, the model's close, the session's end, an outside event, or in the lead-trader style the account's liquidation (breaker: the 40% breaker of the records before 2026-11-14) */
+  end: 'stop' | 'target' | 'close' | 'external' | 'breaker' | 'liquidation';
   /** The stop and the target it held when it ended (absent in results booked before they were kept) */
   stopPx?: string;
   targetPx?: string | null;
@@ -889,7 +887,7 @@ export interface TraderView {
   enabled: boolean;
   /** stops: one position with a stop and a target (services/trader.ts); leader: the lead-trader style's ladders (services/trader-leader.ts) */
   style: 'stops' | 'leader';
-  /** The lead-trader style's rules, ladders and breaker */
+  /** The lead-trader style's rules and positions */
   leader?: LeaderInfo;
   /** model: the model sets its next look; hourly: hourly closes and level events; 15m: every 15-minute close */
   cadence: 'model' | 'hourly' | '15m';
@@ -926,8 +924,8 @@ export interface TraderLogRecord {
   verdict?: string;
   usage?: TraderUsage;
   order?: { clOrdId: string; side: 'buy' | 'sell'; entryType: 'market' | 'limit'; contracts: string; entryPx: string; stopPx: string; targetPx: string | null; leverage: string };
-  /** The lead-trader style's execution: a lot bought (lots: how many the coin then holds) or every lot sold */
-  lot?: { clOrdId: string; side: 'buy' | 'sell'; contracts: string; px: string; lots: number; notional: string };
+  /** The lead-trader style's execution: a long lot (buy) or a short lot (short), lots: how many the coin then holds; or every lot closed (close; sell in the records before 2026-11-14) */
+  lot?: { clOrdId: string; side: 'buy' | 'short' | 'close' | 'sell'; contracts: string; px: string; lots: number; notional: string };
   result?: TraderTradeResult;
   control?: { direction: 'long' | 'short'; entryPx: string; stopPx: string; targetPx: string | null } | TraderTradeResult;
   error?: string;

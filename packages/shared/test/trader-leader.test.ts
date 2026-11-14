@@ -22,36 +22,43 @@ const eth: Instrument = {
   state: 'live',
 };
 
-const decision = (action: LeaderDecision['action']): LeaderDecision => ({ action, confidence: 0.5, reasons: ['r'], invalidation: 'i', oneLiner: 'o', recheckMinutes: 240, wakeAbove: null, wakeBelow: null });
+const decision = (action: LeaderDecision['action'], lotShare = 0.1): LeaderDecision => ({ action, lotShare, confidence: 0.5, reasons: ['r'], invalidation: 'i', oneLiner: 'o', recheckMinutes: 240, wakeAbove: null, wakeBelow: null });
 const lot = (entryPx: string) => ({ contracts: '0.5', entryPx, openedAt: 0, clOrdId: 'pt1' });
+const flat = { lots: [], side: null };
 
 describe('the lead-trader style', () => {
-  it('sizes a lot at a tenth of the equity in whole lots, none under the minimum order', () => {
+  it('sizes a lot at the share of the equity the model names, in whole lots, none under the minimum order', () => {
     // 1,124 x 10% = 112.4 USDT at 2,240 = 0.0502 ETH = 0.502 contracts of 0.1 ETH, floored to the 0.01 lot: 112 USDT
-    expect(leaderLotSize('1124', '2240', eth)).toEqual({ contracts: '0.5', notional: '112' });
-    expect(leaderLotSize('20', '2240', eth)).toBeNull();
+    expect(leaderLotSize('1124', '2240', eth, '0.1')).toEqual({ contracts: '0.5', notional: '112' });
+    expect(leaderLotSize('1124', '2240', eth, 1.5)).toEqual({ contracts: '7.52', notional: '1684.48' });
+    expect(leaderLotSize('20', '2240', eth, '0.1')).toBeNull();
+    expect(leaderLotSize('1124', '2240', eth, 0)).toBeNull();
   });
 
-  it('buys a first lot, adds only a daily ATR under the last lot, and stops at five lots or the exposure cap', () => {
-    const base = { mark: '2240', equity: '1124', exposure: '0', atr: '60', inst: eth, blocked: null };
-    expect(checkLeaderDecision(decision('buy'), { ...base, coin: { lots: [], lastLotPx: null } })).toEqual({ ok: true, action: 'buy', contracts: '0.5', notional: '112' });
-    // the last lot at 2,240: a lot is added at or under 2,180
-    const one = { lots: [lot('2240')], lastLotPx: '2240' };
-    expect(checkLeaderDecision(decision('buy'), { ...base, mark: '2200', coin: one })).toMatchObject({ ok: false, reason: expect.stringContaining('at or under 2180') });
-    expect(checkLeaderDecision(decision('buy'), { ...base, mark: '2180', exposure: '109', coin: one })).toMatchObject({ ok: true, action: 'buy' });
-    expect(checkLeaderDecision(decision('buy'), { ...base, mark: '2180', atr: null, coin: one })).toMatchObject({ ok: false, reason: expect.stringContaining('no daily ATR') });
-    const five = { lots: [lot('2400'), lot('2300'), lot('2200'), lot('2100'), lot('2000')], lastLotPx: '2000' };
-    expect(checkLeaderDecision(decision('buy'), { ...base, mark: '1900', coin: five })).toMatchObject({ ok: false, reason: '5 lots held: the most a coin may have' });
-    // all positions at the marks plus this lot may not pass the equity
-    expect(checkLeaderDecision(decision('buy'), { ...base, exposure: '1100', coin: { lots: [], lastLotPx: null } })).toMatchObject({ ok: false, reason: expect.stringContaining('above 100% of the equity') });
-    expect(checkLeaderDecision(decision('buy'), { ...base, blocked: 'the kill switch is on', coin: { lots: [], lastLotPx: null } })).toMatchObject({ ok: false, reason: 'the kill switch is on' });
+  it('opens a long or a short lot of any size within three times the equity, on one side a coin at a time', () => {
+    const base = { mark: '2240', equity: '1124', exposure: '0', inst: eth, blocked: null };
+    expect(checkLeaderDecision(decision('buy'), { ...base, coin: flat })).toEqual({ ok: true, action: 'buy', contracts: '0.5', notional: '112' });
+    expect(checkLeaderDecision(decision('short', 1.5), { ...base, coin: flat })).toEqual({ ok: true, action: 'short', contracts: '7.52', notional: '1684.48' });
+    // a lot is added wherever the model says, on the side held; the other side is refused until the lots are closed
+    const long = { lots: [lot('2240')], side: 'long' as const };
+    expect(checkLeaderDecision(decision('buy'), { ...base, mark: '2250', exposure: '112', coin: long })).toMatchObject({ ok: true, action: 'buy' });
+    expect(checkLeaderDecision(decision('short'), { ...base, exposure: '112', coin: long })).toMatchObject({ ok: false, reason: expect.stringContaining('close them before opening a short lot') });
+    expect(checkLeaderDecision(decision('buy'), { ...base, coin: { lots: [lot('2240')], side: 'short' } })).toMatchObject({ ok: false, reason: expect.stringContaining('close them before opening a long lot') });
+    // all positions at the marks plus this lot may not pass three times the equity: 3,372
+    expect(LEADER_RULES.maxExposure).toBe('3');
+    expect(checkLeaderDecision(decision('buy', 1), { ...base, exposure: '2200', coin: flat })).toMatchObject({ ok: true });
+    expect(checkLeaderDecision(decision('buy', 1), { ...base, exposure: '2300', coin: flat })).toMatchObject({ ok: false, reason: expect.stringContaining('above 3 times the equity (3372.00); 1072.00 may still be opened') });
+    expect(checkLeaderDecision(decision('short', 0), { ...base, coin: flat })).toMatchObject({ ok: false, reason: expect.stringContaining('a size above 0') });
+    expect(checkLeaderDecision(decision('buy', 0.001), { ...base, coin: flat })).toMatchObject({ ok: false, reason: expect.stringContaining('less than the minimum order') });
+    expect(checkLeaderDecision(decision('short'), { ...base, blocked: 'the kill switch is on', coin: flat })).toMatchObject({ ok: false, reason: 'the kill switch is on' });
   });
 
-  it('sells only with a lot, holds always', () => {
-    const base = { mark: '2240', equity: '1124', exposure: '0', atr: '60', inst: eth, blocked: 'halted' };
-    expect(checkLeaderDecision(decision('sell'), { ...base, coin: { lots: [], lastLotPx: null } })).toEqual({ ok: false, action: 'sell', reason: 'sell without a lot' });
-    expect(checkLeaderDecision(decision('sell'), { ...base, coin: { lots: [lot('2300')], lastLotPx: '2300' } })).toEqual({ ok: true, action: 'sell' });
-    expect(checkLeaderDecision(decision('hold'), { ...base, coin: { lots: [], lastLotPx: null } })).toEqual({ ok: true, action: 'hold' });
+  it('closes only with a lot, in profit or at a loss and while blocked; holds always', () => {
+    const base = { mark: '2240', equity: '1124', exposure: '0', inst: eth, blocked: 'halted' };
+    expect(checkLeaderDecision(decision('close'), { ...base, coin: flat })).toEqual({ ok: false, action: 'close', reason: 'close without a lot' });
+    expect(checkLeaderDecision(decision('close'), { ...base, coin: { lots: [lot('2300')], side: 'long' } })).toEqual({ ok: true, action: 'close' });
+    expect(checkLeaderDecision(decision('close'), { ...base, coin: { lots: [lot('2100')], side: 'short' } })).toEqual({ ok: true, action: 'close' });
+    expect(checkLeaderDecision(decision('hold'), { ...base, coin: flat })).toEqual({ ok: true, action: 'hold' });
   });
 
   it('keeps the recheck within the style s bounds, on a 15-minute close', () => {

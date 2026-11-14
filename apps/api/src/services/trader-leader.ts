@@ -9,7 +9,6 @@ import {
   estimateUsd,
   LEADER_INSTRUMENTS,
   LEADER_RULES,
-  leaderLotSize,
   recentTradesOf,
   TRADER_TAKER_FEE,
   wakeOf,
@@ -47,22 +46,24 @@ import type { TraderServiceDeps } from './trader.js';
 
 /**
  * The Claude auto trader in the lead-trader style (TRADER_STYLE=leader, the default since 2026-11-08; the owner:
- * 「我原来得设想是让opus交易员以这几位欧意交易员为榜样」, 「改吧」; the rules in packages/shared/src/trader.ts, LEADER_RULES
- * and checkLeaderDecision; docs/proposals/claude-auto-trader.md). On the trader's own paper stack it trades
- * LEADER_INSTRUMENTS long only, in lots, cross margin, no stop: at every daily close (00:00 UTC, every day), at the
- * recheck time the model named and as soon as the mark reaches a level it named, each coin's dossier (trader-dossier.ts,
- * with the `leader` block: the rules, every coin's ladder, this coin's, what a lot buys now and why a buy would be
- * refused) is put to the model, which answers buy, sell or hold for that coin. A buy that passes the rules is one lot at
- * the market; a sell closes the coin's position. The breaker: the equity at or under (1 - breakerPct) of the equity the
- * record began with sells everything and stops the trader for good (the state file is moved away to begin again).
+ * 「我原来得设想是让opus交易员以这几位欧意交易员为榜样」, 「改吧」; freed on 2026-11-14: 「那就放开吧，熔断线就去他妈的。」; the rules in
+ * packages/shared/src/trader.ts, LEADER_RULES and checkLeaderDecision; docs/proposals/claude-auto-trader.md). On the
+ * trader's own paper stack it trades LEADER_INSTRUMENTS long or short, in lots, cross margin, no stop order: at every
+ * daily close (00:00 UTC, every day), at the recheck time the model named and as soon as the mark reaches a level it
+ * named, each coin's dossier (trader-dossier.ts, with the `leader` block: the rules, every coin's position, this coin's,
+ * how much may still be opened and why nothing may) is put to the model, which answers buy, short, close or hold for
+ * that coin. A buy or a short that passes the rules is one lot of the size it named at the market; a close closes the
+ * coin's position, in profit or at a loss. There is no breaker. The paper exchange never liquidates a cross position,
+ * so the trader does it: the equity at or under rules.maintenance of the positions' notional closes everything and
+ * stops the trader for good (the state file is moved away to begin again).
  *
  * The clock is looked at every checkEveryMs; a 15-minute close that has not been processed reconciles every coin (a
  * position gone from the exchange is a result, measured from the lots and the mark; one the trader did not open blocks
- * that coin), runs the breaker, and asks what is due. Between closes the marks are held against the wake levels, at most
- * one call per coin per WATCH_COOLDOWN_MS. Every decision goes to TRADER_LOG_FILE with its dossier; the lots, the wakes
- * and the counters to TRADER_STATE_FILE (version 2; a flat file of the stops style is moved aside, one with a position
- * blocks the trader). The control of this style is the mechanical ladder book of the plain paper stack (the STRATEGIES
- * tab), not a coin flip: TRADER_CONTROL is ignored here.
+ * that coin), and asks what is due. Between closes the marks are held against the wake levels, at most one call per
+ * coin per WATCH_COOLDOWN_MS; the liquidation is looked at at every look. Every decision goes to TRADER_LOG_FILE with
+ * its dossier; the lots, the wakes and the counters to TRADER_STATE_FILE (version 2; a flat file of the stops style is
+ * moved aside, one with a position blocks the trader). The control of this style is the mechanical ladder book of the
+ * plain paper stack (the STRATEGIES tab), not a coin flip: TRADER_CONTROL is ignored here.
  */
 
 export interface LeaderServiceOptions {
@@ -89,20 +90,22 @@ const money = (v: Decimal): string => v.toDecimalPlaces(8).toFixed();
 
 export interface LeaderCoinState {
   instId: string;
+  /** The side of the lots; absent: long (the files written before 2026-11-14, when the style was long only) */
+  side?: 'long' | 'short';
   lots: LeaderLot[];
   wake: TraderWake | null;
   lastCallAt: number | null;
   /** Newest first, at most five: shown to the model at its next call on the coin */
   recentDecisions: TraderPreviousDecision[];
-  /** The trader is closing the coin's position (the model's sale or the breaker) until the exchange reports it gone */
-  closing: 'close' | 'breaker' | null;
+  /** The trader is closing the coin's position (the model's close or the liquidation) until the exchange reports it gone */
+  closing: 'close' | 'liquidation' | null;
 }
 
 export interface LeaderState {
   version: typeof LEADER_STATE_VERSION;
   style: 'leader';
   startedAt: number;
-  /** The equity at the first look: the breaker measures from it */
+  /** The equity at the first look */
   startEquity: string | null;
   /** Why the trader stopped; null while it trades */
   halted: string | null;
@@ -120,6 +123,8 @@ export interface LeaderState {
   usage: TraderUsageDay;
 }
 
+/** The side of a coin's lots; null without lots. */
+const sideOf = (coin: Pick<LeaderCoinState, 'lots' | 'side'>): 'long' | 'short' | null => (coin.lots.length === 0 ? null : (coin.side ?? 'long'));
 const emptyCoin = (instId: string): LeaderCoinState => ({ instId, lots: [], wake: null, lastCallAt: null, recentDecisions: [], closing: null });
 
 export function emptyLeaderState(now: number, instIds: readonly string[] = LEADER_INSTRUMENTS): LeaderState {
@@ -277,7 +282,7 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     const bar = fifteenCloseAtOrBefore(now);
     if (this.state.lastBarTs !== null && bar <= this.state.lastBarTs) return this.watch(now, equity);
     for (const coin of this.state.coins) await this.reconcile(coin, bar, now);
-    await this.breaker(now, equity);
+    await this.liquidation(now, equity);
     const done = (): void => {
       this.state.lastBarTs = bar;
       this.save();
@@ -293,7 +298,7 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
       const reasons = [...due, ...(mark === null ? [] : this.priceReasons(coin, mark))];
       if (reasons.length === 0) continue;
       if (this.foreignPosition(coin)) {
-        if (!this.foreignWarned.has(coin.instId)) this.log.warn({ instId: coin.instId }, 'the exchange holds a position the trader did not open: the coin is not asked about and nothing is bought until that position is closed');
+        if (!this.foreignWarned.has(coin.instId)) this.log.warn({ instId: coin.instId }, 'the exchange holds a position the trader did not open: the coin is not asked about and nothing is opened until that position is closed');
         this.foreignWarned.add(coin.instId);
         continue;
       }
@@ -323,7 +328,9 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
   private async watch(now: number, equity: string): Promise<void> {
     let changed = false;
     for (const coin of this.state.coins) if (await this.reconcile(coin, now, now)) changed = true;
-    if (changed) {
+    const stopped = this.state.halted;
+    await this.liquidation(now, equity);
+    if (changed || this.state.halted !== stopped) {
       this.save();
       this.emitChange();
     }
@@ -393,7 +400,7 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     let verdictText = answer.problem ?? 'no decision';
     let executed = false;
     if (decision) {
-      const verdict = checkLeaderDecision(decision, { mark, equity, coin: this.coinView(coin, mark), exposure: this.exposure(), atr, inst: this.deps.market.requireInstrument(instId), rules: this.rules, blocked: this.buyBlocked(coin) });
+      const verdict = checkLeaderDecision(decision, { mark, equity, coin: this.coinView(coin, mark), exposure: this.exposure(), inst: this.deps.market.requireInstrument(instId), rules: this.rules, blocked: this.openBlocked(coin) });
       if (!verdict.ok) verdictText = `not carried out: ${verdict.reason}`;
       else {
         try {
@@ -429,18 +436,18 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     this.lastDecision = { ts: rec.ts, decision: rec.decision ?? null, verdict, executed: /^(lot \d+:|\d+ lots?,)/.test(verdict), usage: rec.usage ?? null, triggers: rec.triggers ?? [], error: null };
   }
 
-  /** Why nothing may be bought on the coin now; null when a lot may. */
-  private buyBlocked(coin: LeaderCoinState): string | null {
+  /** Why no lot may be opened on the coin now; null when one may. */
+  private openBlocked(coin: LeaderCoinState): string | null {
     if (this.state.halted !== null) return `the trader has stopped: ${this.state.halted}`;
     if (this.deps.risk.state.killSwitch) return 'the kill switch is on';
     if (this.foreignPosition(coin)) return 'the exchange holds a position of the coin the trader did not open';
-    if (coin.closing !== null) return 'the coin is being sold';
+    if (coin.closing !== null) return 'the coin is being closed';
     return null;
   }
 
-  /** The side of the orders in long/short position mode (the lots are longs); none in net mode. */
-  private posSide(): { posSide: 'long' } | Record<string, never> {
-    return this.deps.account.config?.posMode === 'long_short_mode' ? { posSide: 'long' } : {};
+  /** The side of the orders in long/short position mode; none in net mode. */
+  private posSide(side: 'long' | 'short'): { posSide: 'long' | 'short' } | Record<string, never> {
+    return this.deps.account.config?.posMode === 'long_short_mode' ? { posSide: side } : {};
   }
 
   private async execute(coin: LeaderCoinState, verdict: LeaderVerdict & { ok: true }, mark: string, now: number): Promise<{ executed: boolean; note: string }> {
@@ -448,19 +455,21 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     if (verdict.action === 'hold') return { executed: false, note: 'hold' };
     const inst = this.deps.market.requireInstrument(instId);
     const notionalOf = (contracts: string, px: string): string => D(contracts).mul(inst.ctVal).mul(px).toDecimalPlaces(2).toFixed();
-    if (verdict.action === 'sell') {
+    if (verdict.action === 'close') {
       const live = this.livePosition(instId);
       if (!live) return { executed: false, note: 'the position is already gone' };
-      await this.deps.orders.closePosition({ instId, mgnMode: 'cross', ...this.posSide() });
+      const held = sideOf(coin) ?? 'long';
+      await this.deps.orders.closePosition({ instId, mgnMode: 'cross', ...this.posSide(held) });
       coin.closing = 'close';
       const contracts = D(live.pos).abs().toFixed();
-      this.record({ ts: now, kind: 'execution', instId, lot: { clOrdId: '', side: 'sell', contracts, px: mark, lots: coin.lots.length, notional: notionalOf(contracts, mark) } });
-      return { executed: true, note: `${coin.lots.length} lots, ${contracts} contracts, sold at the market (mark ${mark})` };
+      this.record({ ts: now, kind: 'execution', instId, lot: { clOrdId: '', side: 'close', contracts, px: mark, lots: coin.lots.length, notional: notionalOf(contracts, mark) } });
+      return { executed: true, note: `${coin.lots.length} lots, ${contracts} contracts ${held}, closed at the market (mark ${mark})` };
     }
-    // buy: one lot at the market, cross margin, no stop
+    // buy or short: one lot at the market, cross margin, no stop
+    const side = verdict.action === 'buy' ? 'long' : 'short';
     const before = this.livePosition(instId);
     const clOrdId = generateClOrdId(now, CL_ORD_PREFIXES.trader);
-    const req: PlaceOrderRequest = { instId, side: 'buy', ordType: 'market', tdMode: 'cross', ...this.posSide(), size: { unit: 'contracts', value: verdict.contracts }, clOrdId };
+    const req: PlaceOrderRequest = { instId, side: side === 'long' ? 'buy' : 'sell', ordType: 'market', tdMode: 'cross', ...this.posSide(side), size: { unit: 'contracts', value: verdict.contracts }, clOrdId };
     const { order } = await this.deps.orders.place(req);
     // Booked at the fill: the order's average, or the lot's share of the position's average once the exchange reports
     // the larger position; the mark stands in when neither has come within two seconds.
@@ -479,17 +488,18 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
       px = mark;
       this.log.warn({ instId, clOrdId, contracts: verdict.contracts, mark }, 'no fill reported within two seconds of the market order: the lot is booked at the mark');
     }
+    coin.side = side;
     coin.lots.push({ contracts: verdict.contracts, entryPx: px, openedAt: now, clOrdId });
     this.state.lotsToday += 1;
-    this.record({ ts: now, kind: 'execution', instId, lot: { clOrdId, side: 'buy', contracts: verdict.contracts, px, lots: coin.lots.length, notional: notionalOf(verdict.contracts, px) } });
-    return { executed: true, note: `lot ${coin.lots.length}: ${verdict.contracts} contracts bought at ${px}${filled ? '' : ' (the mark: no fill reported within 2 s)'}, ${notionalOf(verdict.contracts, px)} USDT` };
+    this.record({ ts: now, kind: 'execution', instId, lot: { clOrdId, side: verdict.action, contracts: verdict.contracts, px, lots: coin.lots.length, notional: notionalOf(verdict.contracts, px) } });
+    return { executed: true, note: `lot ${coin.lots.length}: ${verdict.contracts} contracts ${side === 'long' ? 'bought' : 'sold short'} at ${px}${filled ? '' : ' (the mark: no fill reported within 2 s)'}, ${notionalOf(verdict.contracts, px)} USDT` };
   }
 
   // ---- the positions on the exchange ----
 
   /**
    * A coin whose lots are gone from the exchange is a result: the lots against the mark, less the taker fee on both
-   * legs, ended by the model's sale, the breaker, or an outside event (a close by hand). A lot booked within the last
+   * legs, ended by the model's close, the liquidation, or an outside event (a close by hand). A lot booked within the last
    * LOT_GRACE_MS is given that long for the exchange to report its position before its absence counts. True when
    * something changed.
    */
@@ -505,14 +515,16 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
       const avg = cost.div(contracts);
       const mark = this.mark(instId) ?? avg.toFixed();
       // shortcut: the funding paid or received on the lots is not in the result (the journal has the exact trade), upgrade when the record is compared with the journal
-      const gross = D(mark).minus(avg).mul(contracts).mul(inst.ctVal);
+      const side = sideOf(coin) ?? 'long';
+      const gross = D(mark).minus(avg).mul(contracts).mul(inst.ctVal).mul(side === 'long' ? 1 : -1);
       const fees = cost.plus(D(mark).mul(contracts)).mul(inst.ctVal).mul(TRADER_TAKER_FEE);
       const pnl = gross.minus(fees);
-      const result: TraderTradeResult = { side: 'long', openedAt: first.openedAt, closedAt: bar, entryPx: avg.toDecimalPlaces(2).toFixed(), exitPx: mark, contracts: contracts.toFixed(), pnl: money(pnl), end: coin.closing ?? 'external', instId };
+      const result: TraderTradeResult = { side, openedAt: first.openedAt, closedAt: bar, entryPx: avg.toDecimalPlaces(2).toFixed(), exitPx: mark, contracts: contracts.toFixed(), pnl: money(pnl), end: coin.closing ?? 'external', instId };
       this.state.recent = [result, ...this.state.recent].slice(0, RECENT_KEPT);
       this.state.pnlToday = money(D(this.state.pnlToday).plus(pnl));
-      this.log.info({ instId, lots: coin.lots.length, pnl: result.pnl, end: result.end }, 'trader ladder ended');
+      this.log.info({ instId, side, lots: coin.lots.length, pnl: result.pnl, end: result.end }, 'trader position ended');
       coin.lots = [];
+      delete coin.side;
       coin.closing = null;
       this.record({ ts: now, kind: 'result', instId, result });
       return true;
@@ -523,34 +535,35 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
       const key = `${held.toFixed()}/${sum.toFixed()}`;
       if (!held.eq(sum) && this.mismatchWarned.get(instId) !== key) {
         this.mismatchWarned.set(instId, key);
-        this.log.warn({ instId, exchange: held.toFixed(), lots: sum.toFixed() }, 'the exchange holds a different size than the lots say: the exchange counts for the exposure, the lots for the spacing');
+        this.log.warn({ instId, exchange: held.toFixed(), lots: sum.toFixed() }, 'the exchange holds a different size than the lots say: the exchange counts for the exposure');
       }
     }
     return false;
   }
 
   /**
-   * The breaker (the owner, 2026-11-08): the equity at or under (1 - breakerPct) of the start sells every position and
-   * stops the trader for good. A close that failed is tried again at every look while the trader is halted.
+   * The liquidation. The owner dropped the breaker on 2026-11-14 (「熔断线就去他妈的」), and the paper exchange never
+   * liquidates a cross position, so the account could go on under zero: the trader does what OKX would at a margin level
+   * of 100%. The equity at or under rules.maintenance of the positions' notional closes every position and stops the
+   * trader for good. A close that failed is tried again at every look while the trader is halted.
    */
-  private async breaker(now: number, equity: string): Promise<void> {
-    const start = this.state.startEquity;
-    if (start === null) return;
-    const floor = D(start).mul(D(1).minus(this.rules.breakerPct));
+  private async liquidation(now: number, equity: string): Promise<void> {
     if (this.state.halted === null) {
-      if (D(equity).gt(floor)) return;
-      this.state.halted = `the equity ${equity} fell to ${floor.toFixed(2)} or under, ${D(1).minus(this.rules.breakerPct).mul(100).toFixed()}% of the start ${start}: every position is sold and the trader has stopped (the owner, 2026-11-08). Move the state file away to begin a new record`;
+      const exposure = this.exposure();
+      const floor = D(exposure).mul(this.rules.maintenance);
+      if (!D(exposure).gt(0) || D(equity).gt(floor)) return;
+      this.state.halted = `liquidated: the equity ${equity} fell to ${floor.toFixed(2)} or under, ${D(this.rules.maintenance).mul(100).toFixed()}% of the positions' ${exposure} at the marks; every position is closed and the trader has stopped. Move the state file away to begin a new record`;
       this.record({ ts: now, kind: 'error', instId: LEADER_INSTRUMENTS.join(','), error: this.state.halted });
-      this.log.error({ equity, floor: floor.toFixed(2), start }, 'trader breaker: everything is sold, the trader has stopped');
+      this.log.error({ equity, floor: floor.toFixed(2), exposure }, 'trader liquidated: everything is closed, the trader has stopped');
     }
     for (const coin of this.state.coins) {
       // only the coins the trader holds lots of: a position it did not open is not its to close
-      if (coin.lots.length === 0 || !this.livePosition(coin.instId) || coin.closing === 'breaker') continue;
+      if (coin.lots.length === 0 || !this.livePosition(coin.instId) || coin.closing === 'liquidation') continue;
       try {
-        await this.deps.orders.closePosition({ instId: coin.instId, mgnMode: 'cross', ...this.posSide() });
-        coin.closing = 'breaker';
+        await this.deps.orders.closePosition({ instId: coin.instId, mgnMode: 'cross', ...this.posSide(sideOf(coin) ?? 'long') });
+        coin.closing = 'liquidation';
       } catch (err) {
-        this.log.error({ instId: coin.instId, err: (err as Error).message }, 'the breaker could not close the position; tried again at the next look');
+        this.log.error({ instId: coin.instId, err: (err as Error).message }, 'the liquidation could not close the position; tried again at the next look');
       }
     }
   }
@@ -591,6 +604,7 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     const ctVal = this.deps.market.requireInstrument(coin.instId).ctVal;
     return {
       instId: coin.instId,
+      side: sideOf(coin),
       // a copy: the dossier is logged after the execution, and must show the lots the model saw
       lots: coin.lots.map((l) => ({ ...l })),
       contracts: contracts.toFixed(),
@@ -599,7 +613,6 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
       notional: px === null ? '0' : contracts.mul(ctVal).mul(px).toDecimalPlaces(2).toFixed(),
       unrealizedPnl: live && live.upl !== '' ? live.upl : null,
       atr,
-      nextAddBelow: last !== undefined && atr !== null ? D(last.entryPx).minus(D(atr).mul(this.rules.addAtr)).toFixed() : null,
       wake: coin.wake,
     };
   }
@@ -610,7 +623,7 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     return {
       rules: this.rules,
       startEquity: start,
-      breakerEquity: D(start).mul(D(1).minus(this.rules.breakerPct)).toDecimalPlaces(2).toFixed(),
+      liquidationEquity: D(exposure).mul(this.rules.maintenance).toDecimalPlaces(2).toFixed(),
       exposure,
       exposurePct: D(equity).gt(0) ? D(exposure).div(equity).toDecimalPlaces(4).toFixed() : '0',
       halted: this.state.halted,
@@ -621,10 +634,8 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
   private leaderDossier(coin: LeaderCoinState, equity: string, mark: string): LeaderDossier {
     const info = this.leaderInfo(equity);
     const view = this.coinView(coin, mark);
-    const inst = this.deps.market.requireInstrument(coin.instId);
-    const probe: LeaderDecision = { action: 'buy', confidence: 0, reasons: [], invalidation: '', oneLiner: '', recheckMinutes: 0, wakeAbove: null, wakeBelow: null };
-    const verdict = checkLeaderDecision(probe, { mark, equity, coin: view, exposure: info.exposure, atr: view.atr, inst, rules: this.rules, blocked: this.buyBlocked(coin) });
-    return { ...info, coin: view, lotNow: leaderLotSize(equity, mark, inst, this.rules), buyRefused: verdict.ok ? null : verdict.reason };
+    const room = Decimal.max(D(equity).mul(this.rules.maxExposure).minus(info.exposure), 0);
+    return { ...info, coin: view, room: room.toDecimalPlaces(2).toFixed(), openRefused: this.openBlocked(coin) ?? (room.gt(0) ? null : `the positions are at ${this.rules.maxExposure} times the equity: nothing more may be opened`) };
   }
 
   // ---- the account ----
@@ -697,10 +708,10 @@ export class LeaderTraderService extends EventEmitter<{ change: [TraderView] }> 
     if (this.stateError !== null) return { status: 'blocked', reason: { code: 'STATE_UNREADABLE', message: `${this.stateError}: the trader does not trade until the file is repaired or moved away` } };
     if (this.model === null) return { status: 'blocked', reason: { code: 'NO_MODEL_CREDENTIALS', message: 'no ANTHROPIC_API_KEY in the environment: put one in .env and restart the stack' } };
     if (!this.deps.account.ready || this.equity() === null) return { status: 'blocked', reason: { code: 'ACCOUNT_UNAVAILABLE', message: 'the paper account has not been read yet' } };
-    if (this.state.halted !== null) return { status: 'blocked', reason: { code: 'BREAKER', message: this.state.halted } };
+    if (this.state.halted !== null) return { status: 'blocked', reason: { code: 'LIQUIDATED', message: this.state.halted } };
     // a position the trader did not open stops one coin, not the trader: said beside the status
     const foreign = this.state.coins.filter((c) => this.foreignPosition(c)).map((c) => c.instId);
-    const reason: TraderStatusReason | null = foreign.length > 0 ? { code: 'FOREIGN_POSITION', message: `the paper account holds a position of ${foreign.join(', ')} that the trader did not open: it asks nothing about that coin and buys nothing until that position is closed` } : null;
+    const reason: TraderStatusReason | null = foreign.length > 0 ? { code: 'FOREIGN_POSITION', message: `the paper account holds a position of ${foreign.join(', ')} that the trader did not open: it asks nothing about that coin and opens nothing until that position is closed` } : null;
     return { status: this.state.coins.some((c) => c.lots.length > 0) ? 'holding' : 'in-session', reason };
   }
 
